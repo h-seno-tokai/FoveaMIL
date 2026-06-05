@@ -229,8 +229,9 @@ def _canonicalize_conditional(
 
     ``instance_loss`` は単一倍率のみ有効（多倍率では既定の無効へ畳み単一倍率では真偽値へ
     正規化する）ズーム系（``k_sample`` / ``k_sigma`` / ``topk_method``）は多倍率のみ有効
-    （単一倍率では畳む）DPP 系（``dpp_similarity`` / ``dpp_temperature`` /
-    ``dpp_diversity_weight``）は ``selector=="dpp"`` かつ多倍率時のみ意味を持つ（他では畳む）
+    （単一倍率では畳む）``selector`` と DPP 系（``dpp_similarity`` / ``dpp_temperature`` /
+    ``dpp_diversity_weight``）は多倍率時のみ意味を持ち，DPP 系はさらに ``selector=="dpp"``
+    時のみ意味を持つ（単一倍率や非 DPP では畳む）
     instance 系（``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は ``instance_loss`` 有効時
     のみ意味を持つ（無効時は畳む）畳んだキーは ``axis_values`` から落とし集計・表に載せない
     明示値を捨てたキー集合を返す（警告用）
@@ -251,6 +252,8 @@ def _canonicalize_conditional(
         for key in ZOOM_PARAM_KEYS:
             if _disable_param(config, axis_values, defaults, key):
                 discarded.add(key)
+        if _disable_param(config, axis_values, defaults, SELECTOR_KEY):
+            discarded.add(SELECTOR_KEY)
     dpp_on = config.get(SELECTOR_KEY, defaults[SELECTOR_KEY]) == SELECTOR_DPP
     if single_mag or not dpp_on:
         for key in DPP_PARAM_KEYS:

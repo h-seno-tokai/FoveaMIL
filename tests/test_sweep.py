@@ -263,6 +263,24 @@ def test_dpp_params_collapse_for_single_magnification():
         assert c.config["dpp_diversity_weight"] == 0.0  # DEFAULT_DPP_DIVERSITY_WEIGHT
 
 
+def test_selector_collapses_for_single_magnification():
+    # 単一倍率では選択が走らず topk/dpp は挙動同一なので selector 軸を畳む
+    sweep = _base_sweep(magnifications=[[40]], selector=["topk", "dpp"])
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10
+    assert "selector" not in varying_axis_keys(combos)
+    for c in combos:
+        assert c.config["selector"] == "topk"  # DEFAULT_SELECTOR
+
+
+def test_selector_kept_as_axis_for_multi_magnification():
+    # 多倍率では selector を on/off 軸として保持する
+    sweep = _base_sweep(magnifications=[[1.25, 2.5]], selector=["topk", "dpp"])
+    combos = expand_combos(sweep, {}, _resolved())
+    assert {c.config["selector"] for c in combos} == {"topk", "dpp"}
+    assert "selector" in varying_axis_keys(combos)
+
+
 def _write_fold(combo_dir, fold, val_auc, test_auc):
     fold_dir = os.path.join(combo_dir, f"fold{fold}")
     os.makedirs(fold_dir, exist_ok=True)
