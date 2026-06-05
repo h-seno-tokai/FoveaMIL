@@ -27,7 +27,13 @@
 アテンションスコア `[B, N]` を最終軸で正規化する部品群．補助アテンションの正規化を差し替え，密な softmax から温度付き・スパース系（sparsemax / entmax 等）へ拡張できるようにする．
 
 - 公開 API：`build_attention_norm(name, **kwargs) -> Callable[[Tensor], Tensor]`．レジストリ `ATTENTION_NORMS` から構築する．未登録名は `KeyError`．
-- 登録済み：`"softmax"`（密な既定 `F.softmax(scores, dim=-1)`，パラメータなし）．
+- 登録済み：
+  - `"softmax"`：密な既定 `F.softmax(scores, dim=-1)`（パラメータなし）．
+  - `"temperature"`：`softmax(scores / temperature)`（`temperature` を引数に取る．`temperature=1` で `"softmax"` と一致し，小さいほど鋭く大きいほど平坦になる）．
+  - `"sparsemax"`：確率単体への Euclidean 射影（Martins and Astudillo, 2016）．ソート・累積和の閾値で求め，非負・和 1 で鋭い入力に対し厳密に 0 を含むスパースな分布を返す．
+  - `"entmax"`：α-entmax（Peters et al., 2019）．Tsallis α-エントロピー正則化下の単体射影を二分探索で解く（`alpha` を引数に取り `(1, 2]`，既定 1.5）．閾値は `torch.no_grad` 下で解き，逆伝播は α-entmax の解析 Jacobian-vector 積を `torch.autograd.Function` で与える（二分探索を貫いて微分しない）．`alpha=1` は `"softmax"` へ落とし，`alpha=2` は `"sparsemax"` の極限に一致する．`alpha=1`（softmax）/ `alpha=2`（sparsemax）が両端の極限を覆うため，それ以外は `(1, 2]` の範囲外を `ValueError` とする．
+- いずれもパラメータを持たず（`nn.Parameter` なし）checkpoint 互換を保つ．`temperature` / `alpha` はモデル構築時に固定する定数．
+- スパース系（`sparsemax` / `entmax`）は台の外で厳密に 0 を出力するため，摂動 top-k（`sigma` が小さいとき）と組み合わせると選択の勾配は生き残った台の上に集中する．`k` は想定される台のサイズと整合させて選ぶ．
 - 追加方法：`attention_norm/` に新ファイルを作り，`@register_attention_norm("name")` でファクトリを登録する（パッケージ自動探索で読み込まれるため共有リストの編集は不要）．
 
 ## topk/（微分可能 top-k）

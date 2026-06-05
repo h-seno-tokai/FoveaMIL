@@ -38,6 +38,10 @@ DEFAULT_K_SIGMA = 0.002
 DEFAULT_TOPK_METHOD = "perturbed"
 # 既定の補助アテンション正規化器名
 DEFAULT_AUX_NORM = "softmax"
+# 既定の温度付き softmax の温度（aux_norm="temperature" のときのみ有効）
+DEFAULT_AUX_NORM_TEMPERATURE = 1.0
+# 既定の α-entmax の α（aux_norm="entmax" のときのみ有効）
+DEFAULT_AUX_NORM_ALPHA = 1.5
 # 既定の選択コントローラ名
 DEFAULT_SELECTOR = "topk"
 # 既定の融合名
@@ -88,6 +92,8 @@ class TrainConfig:
         k_sigma: top-k 平滑化パラメータ（単一倍率では無効）
         topk_method: top-k 手法名（単一倍率では無効）
         aux_norm: 補助アテンション正規化器名（単一倍率では無効）
+        aux_norm_temperature: 温度付き softmax の温度（``aux_norm="temperature"`` のときのみ有効）
+        aux_norm_alpha: α-entmax の α（``aux_norm="entmax"`` のときのみ有効）
         selector: 選択コントローラ名（単一倍率では無効）
         fusion: 融合名
         instance_loss: インスタンス補助損失を加えるか（単一倍率のみ）
@@ -127,6 +133,8 @@ class TrainConfig:
     k_sigma: float = DEFAULT_K_SIGMA
     topk_method: str = DEFAULT_TOPK_METHOD
     aux_norm: str = DEFAULT_AUX_NORM
+    aux_norm_temperature: float = DEFAULT_AUX_NORM_TEMPERATURE
+    aux_norm_alpha: float = DEFAULT_AUX_NORM_ALPHA
     selector: str = DEFAULT_SELECTOR
     fusion: str = DEFAULT_FUSION
     instance_loss: bool = DEFAULT_INSTANCE_LOSS

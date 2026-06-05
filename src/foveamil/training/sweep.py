@@ -55,8 +55,17 @@ FEATURE_TYPE_KEY = "feature_type"
 MAGNIFICATIONS_KEY = "magnifications"
 # インスタンス補助損失の有効化キー（単一倍率のみ有効）
 INSTANCE_LOSS_KEY = "instance_loss"
+# 補助アテンション正規化器名のキー（多倍率のみ有効）
+AUX_NORM_KEY = "aux_norm"
 # 多倍率（ズーム）でのみ意味を持つキー（単一倍率では学習に無関係）
-ZOOM_PARAM_KEYS = ("k_sample", "k_sigma", "topk_method")
+ZOOM_PARAM_KEYS = ("k_sample", "k_sigma", "topk_method", "aux_norm")
+# aux_norm の値ごとにのみ意味を持つキー（他の値や単一倍率では無関係）
+AUX_NORM_TEMPERATURE = "temperature"
+AUX_NORM_ENTMAX = "entmax"
+AUX_NORM_PARAM_KEYS = {
+    "aux_norm_temperature": AUX_NORM_TEMPERATURE,
+    "aux_norm_alpha": AUX_NORM_ENTMAX,
+}
 # instance_loss 有効時のみ意味を持つキー（無効時は無関係）
 INSTANCE_PARAM_KEYS = ("bag_weight", "inst_k", "inst_subtyping")
 # 倍率間冗長性罰則の重みキー（多倍率のみ有効）
@@ -226,12 +235,13 @@ def _canonicalize_conditional(
     """構成に無関係な条件付きパラメータを既定値へ畳む
 
     ``instance_loss`` は単一倍率のみ有効（多倍率では既定の無効へ畳み単一倍率では真偽値へ
-    正規化する）ズーム系（``k_sample`` / ``k_sigma`` / ``topk_method``）は多倍率のみ有効
-    （単一倍率では畳む）instance 系（``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は
-    ``instance_loss`` 有効時のみ意味を持つ（無効時は畳む）``decorrelation_weight`` は多倍率の
-    み有効（単一倍率では畳む）``decorrelation_method`` は ``decorrelation_weight`` が正の
-    ときのみ意味を持つ（0 では畳む）畳んだキーは ``axis_values`` から落とし集計・表に
-    載せない明示値を捨てたキー集合を返す（警告用）
+    正規化する）ズーム系（``k_sample`` / ``k_sigma`` / ``topk_method`` / ``aux_norm``）は
+    多倍率のみ有効（単一倍率では畳む）``aux_norm_temperature`` / ``aux_norm_alpha`` は対応する
+    ``aux_norm`` 値（``temperature`` / ``entmax``）かつ多倍率のときのみ意味を持つ（他では畳む）
+    instance 系（``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は ``instance_loss`` 有効時の
+    み意味を持つ（無効時は畳む）``decorrelation_weight`` は多倍率のみ有効（単一倍率では畳む）
+    ``decorrelation_method`` は ``decorrelation_weight`` が正のときのみ意味を持つ（0 では畳む）
+    畳んだキーは ``axis_values`` から落とし集計・表に載せない明示値を捨てたキー集合を返す（警告用）
     """
     discarded: set = set()
     single_mag = len(config[MAGNIFICATIONS_KEY]) == SINGLE_MAG
@@ -245,12 +255,17 @@ def _canonicalize_conditional(
         if INSTANCE_LOSS_KEY in axis_values:
             axis_values[INSTANCE_LOSS_KEY] = instance_on
 
+    aux_norm = config.get(AUX_NORM_KEY, defaults[AUX_NORM_KEY])
     if single_mag:
         for key in ZOOM_PARAM_KEYS:
             if _disable_param(config, axis_values, defaults, key):
                 discarded.add(key)
         if _disable_param(config, axis_values, defaults, DECORRELATION_WEIGHT_KEY):
             discarded.add(DECORRELATION_WEIGHT_KEY)
+    for key, required_aux_norm in AUX_NORM_PARAM_KEYS.items():
+        if single_mag or aux_norm != required_aux_norm:
+            if _disable_param(config, axis_values, defaults, key):
+                discarded.add(key)
     if not instance_on:
         for key in INSTANCE_PARAM_KEYS:
             if _disable_param(config, axis_values, defaults, key):
