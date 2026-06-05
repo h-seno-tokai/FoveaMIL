@@ -19,10 +19,11 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from foveamil.models.attention import GatedAttention
+from foveamil.models.attention_norm import build_attention_norm
 from foveamil.models.fusion import build_fusion
 from foveamil.models.heads import LinearClassifierHead
 from foveamil.models.instance import InstanceClusteringLoss
-from foveamil.models.topk import build_topk
+from foveamil.models.selection import build_selection_controller
 
 # 既定の中間アテンション次元
 DEFAULT_HIDDEN_DIM = 256
@@ -36,6 +37,10 @@ DEFAULT_N_CLS = 3
 DEFAULT_NUM_LAYERS = 4
 # 既定の top-k 手法名
 DEFAULT_TOPK_METHOD = "perturbed"
+# 既定の補助アテンション正規化器名
+DEFAULT_AUX_NORM = "softmax"
+# 既定の選択コントローラ名
+DEFAULT_SELECTOR = "topk"
 # 既定の融合名
 DEFAULT_FUSION = "sum"
 # 既定のインスタンス補助損失の pos/neg パッチ数
@@ -73,6 +78,10 @@ class FoveaMIL(nn.Module):
         num_layers: 倍率数
         topk_method: top-k 手法名（``build_topk`` のレジストリ）
         topk_kwargs: top-k セレクタへ渡す追加引数
+        aux_norm: 補助アテンション正規化器名（``build_attention_norm`` のレジストリ）
+        aux_norm_kwargs: 正規化器へ渡す追加引数
+        selector: 選択コントローラ名（``build_selection_controller`` のレジストリ）
+        selector_kwargs: 選択コントローラへ渡す追加引数
         fusion: 融合名（``build_fusion`` のレジストリ）
         instance_loss: インスタンス補助損失を持たせるか（単一倍率のみ）
         inst_k: インスタンス補助損失の pos/neg パッチ数
@@ -93,6 +102,10 @@ class FoveaMIL(nn.Module):
         num_layers: int = DEFAULT_NUM_LAYERS,
         topk_method: str = DEFAULT_TOPK_METHOD,
         topk_kwargs: Optional[dict] = None,
+        aux_norm: str = DEFAULT_AUX_NORM,
+        aux_norm_kwargs: Optional[dict] = None,
+        selector: str = DEFAULT_SELECTOR,
+        selector_kwargs: Optional[dict] = None,
         fusion: str = DEFAULT_FUSION,
         instance_loss: bool = False,
         inst_k: int = DEFAULT_INST_K,
@@ -122,7 +135,14 @@ class FoveaMIL(nn.Module):
             for _ in range(num_layers - 1)
         )
 
-        self.topk = build_topk(topk_method, k_sample, **(topk_kwargs or {}))
+        self.aux_norm = build_attention_norm(aux_norm, **(aux_norm_kwargs or {}))
+        self.selector = build_selection_controller(
+            selector,
+            k=k_sample,
+            topk_method=topk_method,
+            topk_kwargs=topk_kwargs,
+            **(selector_kwargs or {}),
+        )
         self.fusion = build_fusion(fusion, out_feat_dim, num_layers)
         self.head = LinearClassifierHead(self.fusion.out_dim, n_cls)
         self.instance_module = (
@@ -148,41 +168,42 @@ class FoveaMIL(nn.Module):
 
     def forward_layer(
         self, x: Tensor, layer_idx: int
-    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
         """1 倍率分の特徴を処理しプーリング表現と次倍率の選択を返す
 
         主アテンションで softmax 重み付き和を取りプーリング表現 ``M`` を作る最終層
         以外は補助アテンションのスコアから top-k セレクタで選択行列 ``[B, k, N]`` を
         作り，その argmax を index 昇順に並べ，選択行列から各選択 index の重み
-        （学習時 soft / 推論時 hard）を ``select_weight`` として取り出す
+        （学習時 soft / 推論時 hard）を ``select_weight`` として取り出す選択に使った
+        正規化済み補助アテンション ``A_aux`` も併せて返す
 
         Args:
             x: 現倍率の特徴 ``[B, N, in_feat_dim]``
             layer_idx: 現倍率の添字
 
         Returns:
-            ``(M, select_indices, select_weight)``M は ``[B, 1, out_dim]``最終層
-            では ``select_indices`` / ``select_weight`` は ``None``それ以外は
-            ``select_indices`` が ``[B, k]``（index 昇順, 勾配なし），
-            ``select_weight`` が ``[B, k]``（学習時は勾配を保持）
+            ``(M, select_indices, select_weight, A_aux)``M は ``[B, 1, out_dim]``
+            最終層では ``select_indices`` / ``select_weight`` / ``A_aux`` は ``None``
+            それ以外は ``select_indices`` が ``[B, k]``（index 昇順, 勾配なし），
+            ``select_weight`` が ``[B, k]``（学習時は勾配を保持），``A_aux`` が
+            正規化済み補助アテンション ``[B, N]``
         """
         M, x_fc, _ = self._project_and_pool(x, layer_idx)
 
         if layer_idx >= self.num_layers - 1:
-            return M, None, None
+            return M, None, None, None
 
         A_aux, _ = self.aux_attentions[layer_idx](x_fc)
-        A_aux = A_aux.squeeze(dim=-1)
-        A_aux = F.softmax(A_aux, dim=-1)
+        A_aux = self.aux_norm(A_aux.squeeze(dim=-1))
 
-        selection = self.topk(A_aux)
+        selection = self.selector.select(A_aux, x_fc)
         with torch.no_grad():
             select_indices = selection.argmax(dim=-1)
             select_indices = torch.sort(select_indices, dim=-1).values
         select_weight = selection.gather(
             -1, select_indices.unsqueeze(-1)
         ).squeeze(-1)
-        return M, select_indices, select_weight
+        return M, select_indices, select_weight, A_aux
 
     def layer_attention(
         self, x: Tensor, layer_idx: int
@@ -207,7 +228,7 @@ class FoveaMIL(nn.Module):
         if layer_idx >= self.num_layers - 1:
             return A_primary, None
         A_aux, _ = self.aux_attentions[layer_idx](x_fc)
-        A_aux = F.softmax(A_aux.squeeze(dim=-1), dim=-1)
+        A_aux = self.aux_norm(A_aux.squeeze(dim=-1))
         return A_primary, A_aux
 
     def forward_with_instance_loss(

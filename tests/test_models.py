@@ -147,10 +147,13 @@ def _build_model(num_layers, n_cls=3, k_sample=4, out_feat_dim=12):
 def test_forward_layer_non_final_returns_selection():
     model = _build_model(num_layers=2, k_sample=4, out_feat_dim=12)
     model.eval()
-    M, idx, weight = model.forward_layer(torch.randn(2, 10, 8), layer_idx=0)
+    M, idx, weight, aux = model.forward_layer(torch.randn(2, 10, 8), layer_idx=0)
     assert M.shape == (2, 1, 12)
     assert idx.shape == (2, 4)
     assert weight.shape == (2, 4)
+    # 補助アテンションは正規化済みで和 1
+    assert aux.shape == (2, 10)
+    assert torch.allclose(aux.sum(dim=-1), torch.ones(2), atol=1e-6)
     # 選択 index は昇順
     assert (idx[:, 1:] >= idx[:, :-1]).all()
 
@@ -158,16 +161,16 @@ def test_forward_layer_non_final_returns_selection():
 def test_forward_layer_final_has_no_selection():
     model = _build_model(num_layers=2)
     model.eval()
-    M, idx, weight = model.forward_layer(torch.randn(2, 7, 8), layer_idx=1)
+    M, idx, weight, aux = model.forward_layer(torch.randn(2, 7, 8), layer_idx=1)
     assert M.shape == (2, 1, 12)
-    assert idx is None and weight is None
+    assert idx is None and weight is None and aux is None
 
 
 def test_forward_final_outputs():
     model = _build_model(num_layers=2, n_cls=3, out_feat_dim=12)
     model.eval()
-    M0, _, _ = model.forward_layer(torch.randn(2, 10, 8), layer_idx=0)
-    M1, _, _ = model.forward_layer(torch.randn(2, 7, 8), layer_idx=1)
+    M0, _, _, _ = model.forward_layer(torch.randn(2, 10, 8), layer_idx=0)
+    M1, _, _, _ = model.forward_layer(torch.randn(2, 7, 8), layer_idx=1)
     logits, Y_hat, Y_prob = model.forward_final([M0, M1])
     assert logits.shape == (2, 3)
     assert Y_hat.shape == (2, 1)
@@ -184,8 +187,8 @@ def test_single_magnification_is_final_only():
     # 単一倍率（ズーム無し ABMIL 相当）は補助アテンション・選択を持たない
     model = _build_model(num_layers=1, n_cls=3)
     model.eval()
-    M, idx, weight = model.forward_layer(torch.randn(2, 10, 8), layer_idx=0)
-    assert idx is None and weight is None
+    M, idx, weight, aux = model.forward_layer(torch.randn(2, 10, 8), layer_idx=0)
+    assert idx is None and weight is None and aux is None
     logits, _, Y_prob = model.forward_final([M])
     assert logits.shape == (2, 3)
     assert torch.allclose(Y_prob.sum(dim=-1), torch.ones(2), atol=1e-6)
@@ -254,7 +257,7 @@ def test_forward_with_instance_loss_shares_one_forward():
     x = torch.randn(1, 40, 8)
     logits, _, _, inst = model.forward_with_instance_loss(x, torch.tensor([0]))
     # forward_layer のプーリングと同じ M から logits が出る（dropout=None なので決定的）
-    M, _, _ = model.forward_layer(x, 0)
+    M, _, _, _ = model.forward_layer(x, 0)
     ref_logits, _, _ = model.forward_final([M])
     assert torch.allclose(logits, ref_logits, atol=1e-6)
     # 結合損失の backward が bag ヘッドと instance 分類器の双方へ勾配を流す

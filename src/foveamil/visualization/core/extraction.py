@@ -115,7 +115,7 @@ def extract_attention_trace(
 
                 A_primary, A_aux = model.layer_attention(x, layer_idx)
                 primary = A_primary[_BATCH, 0].cpu().numpy()
-                M, select_indices, select_weight = model.forward_layer(x, layer_idx)
+                M, select_indices, select_weight, _ = model.forward_layer(x, layer_idx)
                 m_list.append(M)
 
                 if layer_idx < num_layers - 1:
