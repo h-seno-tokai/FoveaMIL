@@ -65,6 +65,12 @@ TOPK_SPARSE_KEY = "epsilon"
 # top-k 手法名
 TOPK_PERTURBED = "perturbed"
 TOPK_FAST_SPARSE = "fast_sparse"
+# 補助アテンション正規化器名（追加引数を取るもの）
+AUX_NORM_TEMPERATURE = "temperature"
+AUX_NORM_ENTMAX = "entmax"
+# 各正規化器が取る追加引数のキー
+AUX_NORM_TEMPERATURE_KEY = "temperature"
+AUX_NORM_ALPHA_KEY = "alpha"
 # last モデルの接尾辞
 LAST_SUFFIX = "last"
 # 評価する split 名
@@ -101,7 +107,15 @@ def _topk_kwargs(config: TrainConfig) -> dict:
 
 
 def _aux_norm_kwargs(config: TrainConfig) -> dict:
-    """補助アテンション正規化器へ渡す追加引数を設定から組み立てる（既定は空）"""
+    """``aux_norm`` に応じて温度 / α を追加引数へ写像する
+
+    ``temperature`` なら ``{"temperature": aux_norm_temperature}``，``entmax`` なら
+    ``{"alpha": aux_norm_alpha}``それ以外は空辞書を返す
+    """
+    if config.aux_norm == AUX_NORM_TEMPERATURE:
+        return {AUX_NORM_TEMPERATURE_KEY: config.aux_norm_temperature}
+    if config.aux_norm == AUX_NORM_ENTMAX:
+        return {AUX_NORM_ALPHA_KEY: config.aux_norm_alpha}
     return {}
 
 

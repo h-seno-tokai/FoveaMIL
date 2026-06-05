@@ -224,6 +224,91 @@ def test_mixed_single_and_multi_mag_with_zoom_axis():
     assert {c.config["k_sample"] for c in multi} == {8, 25}
 
 
+def test_single_mag_collapses_aux_norm_params():
+    # 単一倍率では補助アテンションを持たないため aux_norm 系は無関係で畳む
+    sweep = _base_sweep(
+        magnifications=[[40]],
+        aux_norm=["softmax", "temperature", "entmax"],
+        aux_norm_temperature=[0.5, 2.0],
+        aux_norm_alpha=[1.2, 1.8],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs のみ aux_norm 系は畳まれる
+    keys = varying_axis_keys(combos)
+    for key in ("aux_norm", "aux_norm_temperature", "aux_norm_alpha"):
+        assert key not in keys
+    for c in combos:
+        assert c.config["aux_norm"] == "softmax"  # DEFAULT_AUX_NORM
+        assert c.config["aux_norm_temperature"] == 1.0
+        assert c.config["aux_norm_alpha"] == 1.5
+
+
+def test_aux_norm_temperature_relevant_only_for_temperature():
+    # aux_norm=temperature のときのみ aux_norm_temperature が軸として残る
+    sweep = {
+        "encoder": ["ResNet50"],
+        "feature_type": ["mean"],
+        "magnifications": [[1.25, 2.5]],
+        "aux_norm": ["softmax", "temperature"],
+        "aux_norm_temperature": [0.5, 2.0],
+    }
+    combos = expand_combos(sweep, {}, _resolved())
+    # softmax: temp 畳んで 1，temperature: temp 2 値で 2 -> 計 3
+    assert len(combos) == 3
+    soft = [c for c in combos if c.config["aux_norm"] == "softmax"]
+    temp = [c for c in combos if c.config["aux_norm"] == "temperature"]
+    assert len(soft) == 1 and soft[0].config["aux_norm_temperature"] == 1.0
+    assert {c.config["aux_norm_temperature"] for c in temp} == {0.5, 2.0}
+
+
+def test_aux_norm_alpha_relevant_only_for_entmax():
+    # aux_norm=entmax のときのみ aux_norm_alpha が軸として残る
+    sweep = {
+        "encoder": ["ResNet50"],
+        "feature_type": ["mean"],
+        "magnifications": [[1.25, 2.5]],
+        "aux_norm": ["softmax", "entmax"],
+        "aux_norm_alpha": [1.2, 1.8],
+    }
+    combos = expand_combos(sweep, {}, _resolved())
+    # softmax: alpha 畳んで 1，entmax: alpha 2 値で 2 -> 計 3
+    assert len(combos) == 3
+    soft = [c for c in combos if c.config["aux_norm"] == "softmax"]
+    ent = [c for c in combos if c.config["aux_norm"] == "entmax"]
+    assert len(soft) == 1 and soft[0].config["aux_norm_alpha"] == 1.5
+    assert {c.config["aux_norm_alpha"] for c in ent} == {1.2, 1.8}
+
+
+def test_temperature_alpha_dont_cross_contaminate():
+    # temperature 値は alpha 軸を，entmax 値は temperature 軸を増やさない
+    sweep = {
+        "encoder": ["ResNet50"],
+        "feature_type": ["mean"],
+        "magnifications": [[1.25, 2.5]],
+        "aux_norm": ["temperature", "entmax"],
+        "aux_norm_temperature": [0.5, 2.0],
+        "aux_norm_alpha": [1.2, 1.8],
+    }
+    combos = expand_combos(sweep, {}, _resolved())
+    # temperature: temp 2 値 * alpha 畳む = 2，entmax: alpha 2 値 * temp 畳む = 2 -> 計 4
+    assert len(combos) == 4
+    temp = [c for c in combos if c.config["aux_norm"] == "temperature"]
+    ent = [c for c in combos if c.config["aux_norm"] == "entmax"]
+    assert {c.config["aux_norm_temperature"] for c in temp} == {0.5, 2.0}
+    assert all(c.config["aux_norm_alpha"] == 1.5 for c in temp)
+    assert {c.config["aux_norm_alpha"] for c in ent} == {1.2, 1.8}
+    assert all(c.config["aux_norm_temperature"] == 1.0 for c in ent)
+
+
+def test_multi_mag_keeps_aux_norm_axis():
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]], aux_norm=["softmax", "sparsemax"]
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert {c.config["aux_norm"] for c in combos} == {"softmax", "sparsemax"}
+    assert "aux_norm" in varying_axis_keys(combos)
+
+
 def _write_fold(combo_dir, fold, val_auc, test_auc):
     fold_dir = os.path.join(combo_dir, f"fold{fold}")
     os.makedirs(fold_dir, exist_ok=True)

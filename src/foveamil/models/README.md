@@ -27,7 +27,12 @@
 アテンションスコア `[B, N]` を最終軸で正規化する部品群．補助アテンションの正規化を差し替え，密な softmax から温度付き・スパース系（sparsemax / entmax 等）へ拡張できるようにする．
 
 - 公開 API：`build_attention_norm(name, **kwargs) -> Callable[[Tensor], Tensor]`．レジストリ `ATTENTION_NORMS` から構築する．未登録名は `KeyError`．
-- 登録済み：`"softmax"`（密な既定 `F.softmax(scores, dim=-1)`，パラメータなし）．
+- 登録済み：
+  - `"softmax"`：密な既定 `F.softmax(scores, dim=-1)`（パラメータなし）．
+  - `"temperature"`：`softmax(scores / temperature)`（`temperature` を引数に取る．`temperature=1` で `"softmax"` と一致し，小さいほど鋭く大きいほど平坦になる）．
+  - `"sparsemax"`：確率単体への Euclidean 射影（Martins and Astudillo, 2016）．ソート・累積和の閾値で求め，非負・和 1 で鋭い入力に対し厳密に 0 を含むスパースな分布を返す．
+  - `"entmax"`：α-entmax（Peters et al., 2019）．Tsallis α-エントロピー正則化下の単体射影を二分探索で解く（`alpha` を引数に取る）．`alpha=1` で `"softmax"`，`alpha=2` で `"sparsemax"` に一致し，`1<alpha<2`（既定 1.5）でその中間のスパース性を取る．
+- いずれもパラメータを持たず（`nn.Parameter` なし）checkpoint 互換を保つ．`temperature` / `alpha` はモデル構築時に固定する定数．
 - 追加方法：`attention_norm/` に新ファイルを作り，`@register_attention_norm("name")` でファクトリを登録する（パッケージ自動探索で読み込まれるため共有リストの編集は不要）．
 
 ## topk/（微分可能 top-k）
