@@ -1,5 +1,7 @@
 # FoveaMIL
 
+[![tests](https://github.com/h-seno-tokai/FoveaMIL/actions/workflows/tests.yml/badge.svg)](https://github.com/h-seno-tokai/FoveaMIL/actions/workflows/tests.yml)
+
 病理 WSI（Whole Slide Image）向けの多重解像度 Multiple Instance Learning．低倍率で広く薄く見て，
 注視すべき少数パッチだけを高倍率で精査する中心窩（fovea）型のパッチ選定を核にする
 （病理医の弱拡大 → 強拡大に対応）．実装は多解像度のアテンション pooling と，次の倍率へズームする

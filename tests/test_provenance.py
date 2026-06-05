@@ -48,7 +48,8 @@ def test_collect_run_meta_structure(tmp_path):
         version="0.1.0",
     )
     assert meta["schema_version"] == META_SCHEMA_VERSION
-    assert meta["code"]["git_sha"] is None  # repo 未初期化
+    # git 管理下なら SHA 文字列, 管理外なら None（環境に依存しない検証）
+    assert meta["code"]["git_sha"] is None or isinstance(meta["code"]["git_sha"], str)
     assert meta["code"]["foveamil_version"] == "0.1.0"
     assert meta["data"]["labels_csv_sha256"] is not None
     assert meta["data"]["split_csv_sha256"] is None
