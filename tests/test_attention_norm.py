@@ -118,6 +118,29 @@ def test_entmax_alpha_below_one_raises():
         build_attention_norm("entmax", alpha=0.5)
 
 
+def test_entmax_alpha_above_two_raises():
+    with pytest.raises(ValueError):
+        build_attention_norm("entmax", alpha=2.5)
+
+
+# --- 勾配の正しさ（解析 backward vs 数値微分）---
+
+
+@pytest.mark.parametrize("alpha", [1.3, 1.5, 1.8, 2.0])
+def test_entmax_backward_matches_numerical_gradient(alpha):
+    # 全要素が台に乗る内点（kink を避ける）で解析 Jacobian を数値微分と照合する
+    scores = torch.tensor(
+        [[0.5, 0.45, 0.55, 0.48, 0.52]], dtype=torch.double, requires_grad=True
+    )
+    norm = build_attention_norm("entmax", alpha=alpha, max_iter=_FINE_ITER)
+    out = norm(scores)
+    # 内点であること（台の外＝0 がないこと）を前提に確認する
+    assert (out > _ZERO_TOL).all()
+    assert torch.autograd.gradcheck(
+        lambda z: norm(z), (scores,), eps=1e-6, atol=1e-5, rtol=1e-4
+    )
+
+
 # --- 勾配（有限・非零）---
 
 
