@@ -52,6 +52,10 @@ DEFAULT_INST_K = 8
 DEFAULT_INST_SUBTYPING = True
 # 既定のクラス数
 DEFAULT_N_CLS = 3
+# 既定の倍率間冗長性罰則の重み（0 で無効）
+DEFAULT_DECORRELATION_WEIGHT = 0.0
+# 既定の倍率間冗長性罰則の手法
+DEFAULT_DECORRELATION_METHOD = "cosine"
 # 既定の DataLoader ワーカ数
 DEFAULT_NUM_WORKERS = 4
 # 既定の save_metric
@@ -91,6 +95,8 @@ class TrainConfig:
         inst_k: インスタンス補助損失の pos/neg パッチ数
         inst_subtyping: インスタンス補助損失に out-of-class 枝を加えるか
         n_cls: クラス数
+        decorrelation_weight: 倍率間冗長性罰則の重み（0 で無効，多倍率のみ有効）
+        decorrelation_method: 倍率間冗長性罰則の手法（``"cosine"`` / ``"covariance"``）
         is_weighted_sampler: train で WeightedRandomSampler を使うか
         num_workers: DataLoader ワーカ数
         pin_memory: DataLoader の pin_memory
@@ -128,6 +134,8 @@ class TrainConfig:
     inst_k: int = DEFAULT_INST_K
     inst_subtyping: bool = DEFAULT_INST_SUBTYPING
     n_cls: int = DEFAULT_N_CLS
+    decorrelation_weight: float = DEFAULT_DECORRELATION_WEIGHT
+    decorrelation_method: str = DEFAULT_DECORRELATION_METHOD
 
     is_weighted_sampler: bool = True
     num_workers: int = DEFAULT_NUM_WORKERS

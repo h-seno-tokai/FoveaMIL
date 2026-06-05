@@ -224,6 +224,59 @@ def test_mixed_single_and_multi_mag_with_zoom_axis():
     assert {c.config["k_sample"] for c in multi} == {8, 25}
 
 
+def test_single_mag_collapses_decorrelation_params():
+    # 単一倍率では decorrelation 系は無関係なので畳んで統合する
+    sweep = _base_sweep(
+        magnifications=[[40]],
+        decorrelation_weight=[0.0, 0.5],
+        decorrelation_method=["cosine", "covariance"],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs のみ decorrelation 系は畳まれる
+    keys = varying_axis_keys(combos)
+    assert "decorrelation_weight" not in keys
+    assert "decorrelation_method" not in keys
+    for c in combos:
+        assert c.config["decorrelation_weight"] == 0.0
+        assert c.config["decorrelation_method"] == "cosine"
+
+
+def test_multi_mag_keeps_decorrelation_weight():
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]], decorrelation_weight=[0.1, 0.5]
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 20  # 10 pairs * 2 weight
+    assert {c.config["decorrelation_weight"] for c in combos} == {0.1, 0.5}
+    assert "decorrelation_weight" in varying_axis_keys(combos)
+
+
+def test_decorrelation_method_collapses_when_weight_zero():
+    # weight=0 では method は無関係なので畳む
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        decorrelation_method=["cosine", "covariance"],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # method は畳まれて 10 pairs のみ
+    assert "decorrelation_method" not in varying_axis_keys(combos)
+    for c in combos:
+        assert c.config["decorrelation_method"] == "cosine"
+
+
+def test_decorrelation_method_kept_when_weight_positive():
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        decorrelation_weight=[0.5],
+        decorrelation_method=["cosine", "covariance"],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 20  # 10 pairs * 2 method
+    assert {c.config["decorrelation_method"] for c in combos} == {
+        "cosine", "covariance"
+    }
+
+
 def _write_fold(combo_dir, fold, val_auc, test_auc):
     fold_dir = os.path.join(combo_dir, f"fold{fold}")
     os.makedirs(fold_dir, exist_ok=True)

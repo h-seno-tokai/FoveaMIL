@@ -66,8 +66,16 @@
 
 - `base.py`: `ForwardContext`（各倍率のプーリング表現 `m_list`，各層の正規化補助アテンション `layer_aux`，各層の選択 `selections`，名前付きスカラ損失 `extra_losses`）と `Regularizer` 抽象基底（`__call__(context, label) -> scalar`，`weight`，`from_config(config) -> Optional[Regularizer]`）．
 - 公開 API：`iter_active_regularizers(config) -> List[Regularizer]`．登録済み各クラスの `from_config` を呼び有効な項を集める．学習ループは `CE + Σ w_i·reg_i + Σ extra_losses` を最小化する．
-- 登録済み：なし（具体項は各機能ブランチが追加する）．
+- 登録済み：`"decorrelation"`（倍率間表現の冗長性罰則）．
 - 追加方法：`regularizers/` に新ファイルを作り，`Regularizer` を継承して `name` を定め，`@register_regularizer` を付ける（自動探索で読み込まれる）．無効化は `from_config` が `None` を返すことで表す．
+
+#### `decorrelation.py`（倍率間冗長性罰則）
+
+`DecorrelationRegularizer(weight, method="cosine")`．`context.m_list`（各倍率のプーリング表現 `[B, 1, D]`）をサンプルごとの `[L, D]` とみなし，倍率間の冗長性を罰則化する．直交で 0，共線で増大する．
+
+- `method="cosine"`：倍率ベクトル対の余弦類似度 2 乗の非対角平均（共線で 1 に近づく）．
+- `method="covariance"`：各倍率ベクトルを次元方向に標準化した `L×L` 相互相関の非対角 2 乗和を `L(L-1)` で正規化（Barlow-Twins / VICReg の冗長性項に準ずる）．
+- `from_config`：`decorrelation_weight > 0` かつ倍率数 2 以上のときのみ有効．手法は `decorrelation_method`．単一倍率（`L < 2`）や空バッチでは 0 スカラを返す．`context.m_list` のみを読むため他の補助損失と独立に合算できる．
 
 ## fusion.py（多解像度融合）
 
