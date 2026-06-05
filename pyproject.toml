@@ -64,6 +64,7 @@ foveamil-stage = "foveamil.training.stage_cli:main"
 foveamil-train = "foveamil.training.train_cli:main"
 foveamil-sweep = "foveamil.training.sweep_cli:main"
 foveamil-eval = "foveamil.evaluation.report_cli:main"
+foveamil-redundancy = "foveamil.evaluation.redundancy_cli:main"
 foveamil-visualize = "foveamil.visualization.visualize_cli:main"
 
 # version は単一の真実源 foveamil.__version__（src/foveamil/__init__.py）から取る

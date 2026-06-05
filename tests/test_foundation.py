@@ -79,10 +79,11 @@ def test_topk_controller_train_soft_shape():
 # --- 正則化フック ---
 
 
-def test_foundation_has_no_active_regularizers():
-    # foundation は具体正則化項を出荷しない 既定設定では空
+def test_default_config_activates_no_regularizers():
+    # 既定設定では有効な正則化項は無い（具体項は設定で有効化する）
     assert iter_active_regularizers(TrainConfig()) == []
-    assert available_regularizers() == []
+    # 登録済み具体項は自動探索で読み込まれる
+    assert "decorrelation" in available_regularizers()
 
 
 def test_forward_context_holds_m_list():

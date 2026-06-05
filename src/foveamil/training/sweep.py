@@ -59,6 +59,10 @@ INSTANCE_LOSS_KEY = "instance_loss"
 ZOOM_PARAM_KEYS = ("k_sample", "k_sigma", "topk_method")
 # instance_loss 有効時のみ意味を持つキー（無効時は無関係）
 INSTANCE_PARAM_KEYS = ("bag_weight", "inst_k", "inst_subtyping")
+# 倍率間冗長性罰則の重みキー（多倍率のみ有効）
+DECORRELATION_WEIGHT_KEY = "decorrelation_weight"
+# decorrelation_weight 有効時のみ意味を持つキー（無効時は無関係）
+DECORRELATION_PARAM_KEYS = ("decorrelation_method",)
 # 単一倍率を表す倍率数
 SINGLE_MAG = 1
 # 自動解決されるため設定に手書きを許さないキー
@@ -224,8 +228,10 @@ def _canonicalize_conditional(
     ``instance_loss`` は単一倍率のみ有効（多倍率では既定の無効へ畳み単一倍率では真偽値へ
     正規化する）ズーム系（``k_sample`` / ``k_sigma`` / ``topk_method``）は多倍率のみ有効
     （単一倍率では畳む）instance 系（``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は
-    ``instance_loss`` 有効時のみ意味を持つ（無効時は畳む）畳んだキーは ``axis_values`` から
-    落とし集計・表に載せない明示値を捨てたキー集合を返す（警告用）
+    ``instance_loss`` 有効時のみ意味を持つ（無効時は畳む）``decorrelation_weight`` は多倍率の
+    み有効（単一倍率では畳む）``decorrelation_method`` は ``decorrelation_weight`` が正の
+    ときのみ意味を持つ（0 では畳む）畳んだキーは ``axis_values`` から落とし集計・表に
+    載せない明示値を捨てたキー集合を返す（警告用）
     """
     discarded: set = set()
     single_mag = len(config[MAGNIFICATIONS_KEY]) == SINGLE_MAG
@@ -243,8 +249,17 @@ def _canonicalize_conditional(
         for key in ZOOM_PARAM_KEYS:
             if _disable_param(config, axis_values, defaults, key):
                 discarded.add(key)
+        if _disable_param(config, axis_values, defaults, DECORRELATION_WEIGHT_KEY):
+            discarded.add(DECORRELATION_WEIGHT_KEY)
     if not instance_on:
         for key in INSTANCE_PARAM_KEYS:
+            if _disable_param(config, axis_values, defaults, key):
+                discarded.add(key)
+    decorrelation_on = (
+        config.get(DECORRELATION_WEIGHT_KEY, defaults[DECORRELATION_WEIGHT_KEY]) > 0.0
+    )
+    if not decorrelation_on:
+        for key in DECORRELATION_PARAM_KEYS:
             if _disable_param(config, axis_values, defaults, key):
                 discarded.add(key)
     return discarded
