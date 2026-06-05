@@ -18,7 +18,7 @@ import torch
 
 from foveamil.models import FoveaMIL
 from foveamil.training.config import TrainConfig
-from foveamil.training.trainer import _topk_kwargs
+from foveamil.training.trainer import build_foveamil_from_config
 
 # sweep / fold の出力ファイル名
 SWEEP_SUMMARY_JSON = "sweep_summary.json"
@@ -69,25 +69,11 @@ def _train_config_from_dict(config: Dict[str, Any]) -> TrainConfig:
 def build_model(config: Dict[str, Any]) -> FoveaMIL:
     """run_meta の config から FoveaMIL を ``Trainer.__init__`` と同一引数で構築する
 
-    topk セレクタ引数は ``trainer._topk_kwargs`` を共有する（写像のズレを防ぐ）
+    モデル組立は ``build_foveamil_from_config`` を共有し，正規化器・選択コントローラ・
+    top-k 引数の写像のズレを防ぐ
     """
     cfg = _train_config_from_dict(config)
-    num_layers = len(cfg.magnifications)
-    return FoveaMIL(
-        in_feat_dim=cfg.in_feat_dim,
-        hidden_feat_dim=cfg.hidden_feat_dim,
-        out_feat_dim=cfg.out_feat_dim,
-        dropout=cfg.drop_out,
-        k_sample=cfg.k_sample,
-        n_cls=cfg.n_cls,
-        num_layers=num_layers,
-        topk_method=cfg.topk_method,
-        topk_kwargs=_topk_kwargs(cfg),
-        fusion=cfg.fusion,
-        instance_loss=cfg.instance_loss,
-        inst_k=cfg.inst_k,
-        inst_subtyping=cfg.inst_subtyping,
-    )
+    return build_foveamil_from_config(cfg, len(cfg.magnifications))
 
 
 def resolve_best_combo(

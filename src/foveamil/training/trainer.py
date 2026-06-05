@@ -32,6 +32,7 @@ from torch.utils.data import (
 )
 
 from foveamil.models import FoveaMIL
+from foveamil.models.regularizers import ForwardContext, iter_active_regularizers
 from foveamil.training.accessor import FeatureAccessor
 from foveamil.training.config import TrainConfig
 from foveamil.training.dataset import feature_bag_collate
@@ -99,6 +100,47 @@ def _topk_kwargs(config: TrainConfig) -> dict:
     return {}
 
 
+def _aux_norm_kwargs(config: TrainConfig) -> dict:
+    """補助アテンション正規化器へ渡す追加引数を設定から組み立てる（既定は空）"""
+    return {}
+
+
+def _selector_kwargs(config: TrainConfig) -> dict:
+    """選択コントローラへ渡す追加引数を設定から組み立てる（既定は空）"""
+    return {}
+
+
+def build_foveamil_from_config(config: TrainConfig, num_layers: int) -> FoveaMIL:
+    """設定と倍率数から FoveaMIL を構築する（学習・再構築で同一の組立を共有する）
+
+    Args:
+        config: 学習設定
+        num_layers: 倍率数
+
+    Returns:
+        構築した :class:`FoveaMIL`
+    """
+    return FoveaMIL(
+        in_feat_dim=config.in_feat_dim,
+        hidden_feat_dim=config.hidden_feat_dim,
+        out_feat_dim=config.out_feat_dim,
+        dropout=config.drop_out,
+        k_sample=config.k_sample,
+        n_cls=config.n_cls,
+        num_layers=num_layers,
+        topk_method=config.topk_method,
+        topk_kwargs=_topk_kwargs(config),
+        aux_norm=config.aux_norm,
+        aux_norm_kwargs=_aux_norm_kwargs(config),
+        selector=config.selector,
+        selector_kwargs=_selector_kwargs(config),
+        fusion=config.fusion,
+        instance_loss=config.instance_loss,
+        inst_k=config.inst_k,
+        inst_subtyping=config.inst_subtyping,
+    )
+
+
 def _seed_everything(seed: int) -> None:
     """乱数シードを固定する"""
     random.seed(seed)
@@ -158,23 +200,12 @@ class Trainer:
         self.num_layers = len(self.magnifications)
         validate_magnification_hierarchy(self.magnifications)
 
-        self.model = FoveaMIL(
-            in_feat_dim=config.in_feat_dim,
-            hidden_feat_dim=config.hidden_feat_dim,
-            out_feat_dim=config.out_feat_dim,
-            dropout=config.drop_out,
-            k_sample=config.k_sample,
-            n_cls=config.n_cls,
-            num_layers=self.num_layers,
-            topk_method=config.topk_method,
-            topk_kwargs=_topk_kwargs(config),
-            fusion=config.fusion,
-            instance_loss=config.instance_loss,
-            inst_k=config.inst_k,
-            inst_subtyping=config.inst_subtyping,
-        ).to(self.device)
+        self.model = build_foveamil_from_config(config, self.num_layers).to(
+            self.device
+        )
         self.instance_enabled = config.instance_loss
         self.bag_weight = config.bag_weight
+        self.regularizers = iter_active_regularizers(config)
 
         self.train_ds = train_ds
         self.val_ds = val_ds
@@ -251,26 +282,28 @@ class Trainer:
 
     def _forward(
         self, base_feats: Tensor, slide_id: str
-    ) -> Tuple[Tensor, Tensor, Tensor]:
-        """最低倍率特徴から段階 forward で ``(logits, Y_hat, Y_prob)`` を返す
+    ) -> Tuple[Tensor, Tensor, Tensor, ForwardContext]:
+        """最低倍率特徴から段階 forward で予測と forward 文脈を返す
 
         各層の選択結果から子パッチの global index を求め，次倍率の特徴を都度ロード
         し，選択重みを子特徴へ掛けて補助アテンションへ勾配を流す子数は隣接倍率比
         ``r`` から ``r^2`` 個（連続 2x なら 4，4x なら 16）で，各親の子が連続するため
-        重みを ``cpp`` 回繰り返して整合させる
+        重みを ``cpp`` 回繰り返して整合させる各倍率のプーリング表現と各層の選択を
+        :class:`ForwardContext` に集め，補助損失が参照できるようにする
 
         Args:
             base_feats: 最低倍率の全特徴 ``[1, N, in_feat_dim]``
             slide_id: スライド識別子
 
         Returns:
-            ``(logits, Y_hat, Y_prob)``
+            ``(logits, Y_hat, Y_prob, context)``
         """
         accessor = FeatureAccessor(
             self.feature_root, self.encoder, slide_id, self.feature_type
         )
         try:
             M_list: List[Tensor] = []
+            selections: List[Optional[Dict[str, Tensor]]] = []
             x = base_feats.to(self.device)
             global_idx = None
             for layer_idx in range(self.num_layers):
@@ -279,8 +312,12 @@ class Trainer:
                 )
                 M_list.append(M)
                 if layer_idx >= self.num_layers - 1:
+                    selections.append(None)
                     continue
 
+                selections.append(
+                    {"select_indices": select_indices, "select_weight": select_weight}
+                )
                 cur_mag = self.magnifications[layer_idx]
                 next_mag = self.magnifications[layer_idx + 1]
                 cpp = children_per_parent(cur_mag, next_mag)
@@ -298,15 +335,38 @@ class Trainer:
                 x_next = x_next * w_child.unsqueeze(-1)
                 x = x_next
                 global_idx = child
-            return self.model.forward_final(M_list)
+            logits, Y_hat, Y_prob = self.model.forward_final(M_list)
+            context = ForwardContext(m_list=M_list, selections=selections)
+            return logits, Y_hat, Y_prob, context
         finally:
             accessor.close()
+
+    def _regularizer_loss(self, context: ForwardContext, label: Tensor):
+        """有効な正則化項と寄与損失を合算する
+
+        登録済みの各正則化項 ``reg`` の ``reg.weight * reg(context, label)`` と，
+        ``context.extra_losses`` の各値を足し合わせる有効な項が無ければ ``0.0`` を返す
+
+        Args:
+            context: 段階 forward の文脈
+            label: 正解クラス ``[B]``
+
+        Returns:
+            合算した補助損失（スカラまたは ``0.0``）
+        """
+        total = 0.0
+        for reg in self.regularizers:
+            total = total + reg.weight * reg(context, label)
+        for value in context.extra_losses.values():
+            total = total + value
+        return total
 
     def _train_one_epoch(self) -> float:
         """1 エポック学習し平均損失を返す
 
         ``instance_enabled`` なら最低倍率の全バッグ主アテンションでインスタンス補助
-        損失を計算し ``bag·bag_weight + inst·(1-bag_weight)`` を最小化する
+        損失を計算し ``bag·bag_weight + inst·(1-bag_weight)`` を最小化する補助損失が
+        有効なら ``CE + Σ w_i·reg_i + Σ extra_losses`` を最小化する
         """
         self.model.train()
         self.optimizer.zero_grad()
@@ -323,8 +383,10 @@ class Trainer:
                     + (1.0 - self.bag_weight) * inst_loss
                 )
             else:
-                logits, _, _ = self._forward(base_feats, slide_id)
-                loss = self.ce_loss(logits, label)
+                logits, _, _, context = self._forward(base_feats, slide_id)
+                loss = self.ce_loss(logits, label) + self._regularizer_loss(
+                    context, label
+                )
             total_loss += loss.item()
             loss.backward()
             self.optimizer.step()
@@ -345,7 +407,7 @@ class Trainer:
         with torch.no_grad():
             for base_feats, slide_id, label in loader:
                 label = label.to(self.device)
-                logits, Y_hat, Y_prob = self._forward(base_feats, slide_id)
+                logits, Y_hat, Y_prob, _ = self._forward(base_feats, slide_id)
                 metric_logger.log(Y_hat, label, Y_prob, Y_logit=logits)
                 slide_ids.append(slide_id)
                 total_loss += self.ce_loss(logits, label).item()

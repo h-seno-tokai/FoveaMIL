@@ -36,6 +36,10 @@ DEFAULT_K_SAMPLE = 12
 DEFAULT_K_SIGMA = 0.002
 # 既定の top-k 手法名
 DEFAULT_TOPK_METHOD = "perturbed"
+# 既定の補助アテンション正規化器名
+DEFAULT_AUX_NORM = "softmax"
+# 既定の選択コントローラ名
+DEFAULT_SELECTOR = "topk"
 # 既定の融合名
 DEFAULT_FUSION = "sum"
 # 既定のインスタンス補助損失の有効化
@@ -79,6 +83,8 @@ class TrainConfig:
         k_sample: ズーム選択数 k（単一倍率では無効）
         k_sigma: top-k 平滑化パラメータ（単一倍率では無効）
         topk_method: top-k 手法名（単一倍率では無効）
+        aux_norm: 補助アテンション正規化器名（単一倍率では無効）
+        selector: 選択コントローラ名（単一倍率では無効）
         fusion: 融合名
         instance_loss: インスタンス補助損失を加えるか（単一倍率のみ）
         bag_weight: bag 損失とインスタンス補助損失の重み（``bag·bag_weight + inst·(1-bag_weight)``）
@@ -114,6 +120,8 @@ class TrainConfig:
     k_sample: int = DEFAULT_K_SAMPLE
     k_sigma: float = DEFAULT_K_SIGMA
     topk_method: str = DEFAULT_TOPK_METHOD
+    aux_norm: str = DEFAULT_AUX_NORM
+    selector: str = DEFAULT_SELECTOR
     fusion: str = DEFAULT_FUSION
     instance_loss: bool = DEFAULT_INSTANCE_LOSS
     bag_weight: float = DEFAULT_BAG_WEIGHT
