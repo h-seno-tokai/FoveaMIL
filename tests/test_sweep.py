@@ -127,6 +127,103 @@ def test_varying_axis_keys():
     assert "fusion" not in keys  # not present at all
 
 
+# --- 構成に無関係なパラメータの統合（sweep 健全化）---
+
+
+def test_instance_loss_single_mag_only_constrained_join():
+    # instance_loss[true,false] x mags[[1.25,5.0],[10]] -> 多倍率は false のみ，単一倍率は両方
+    sweep = {
+        "encoder": ["ResNet50"],
+        "feature_type": ["mean"],
+        "magnifications": [[1.25, 5.0], [10]],
+        "instance_loss": [True, False],
+    }
+    combos = expand_combos(sweep, {}, _resolved())
+    seen = {(tuple(c.config["magnifications"]), c.config["instance_loss"]) for c in combos}
+    assert seen == {((1.25, 5.0), False), ((10.0,), True), ((10.0,), False)}
+    assert len(combos) == 3
+    # 多倍率 + instance_loss=True は無い
+    assert ((1.25, 5.0), True) not in seen
+
+
+def test_single_mag_collapses_zoom_params():
+    # 単一倍率では k_sample / k_sigma は無関係なので畳んで統合する（pair ぶんのみ残る）
+    sweep = _base_sweep(
+        magnifications=[[40]], k_sample=[8, 15, 25], k_sigma=[0.002, 0.005]
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs のみ zoom 系は畳まれる
+    keys = varying_axis_keys(combos)
+    assert "k_sample" not in keys and "k_sigma" not in keys
+    for c in combos:
+        assert c.config["k_sample"] == 12  # DEFAULT_K_SAMPLE
+        assert c.config["k_sigma"] == 0.002  # DEFAULT_K_SIGMA
+
+
+def test_multi_mag_keeps_zoom_params():
+    sweep = _base_sweep(magnifications=[[1.25, 2.5]], k_sample=[8, 25])
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 20  # 10 pairs * 2 k_sample
+    assert {c.config["k_sample"] for c in combos} == {8, 25}
+    assert "k_sample" in varying_axis_keys(combos)
+
+
+def test_instance_params_collapse_when_loss_off():
+    # instance_loss 既定 False -> bag_weight / inst_k は無関係なので畳む
+    sweep = _base_sweep(magnifications=[[40]], bag_weight=[0.7, 0.9], inst_k=[8, 16])
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10
+    for c in combos:
+        assert c.config["bag_weight"] == 0.7  # DEFAULT_BAG_WEIGHT
+        assert c.config["inst_k"] == 8  # DEFAULT_INST_K
+
+
+def test_instance_params_kept_when_loss_on():
+    sweep = _base_sweep(
+        magnifications=[[40]], instance_loss=[True], bag_weight=[0.7, 0.9]
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 20  # 10 pairs * 2 bag_weight
+    assert {c.config["bag_weight"] for c in combos} == {0.7, 0.9}
+    for c in combos:
+        assert c.config["instance_loss"] is True
+
+
+def test_dedup_merges_type_divergent_instance_loss():
+    # 単一倍率で instance_loss を True と 1 で書いても同一視して統合し bool へ正規化する
+    sweep = _base_sweep(magnifications=[[40]], instance_loss=[True, 1])
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs（True/1 は 1 つに統合）
+    for c in combos:
+        assert c.config["instance_loss"] is True
+
+
+def test_dedup_merges_int_and_float_param():
+    # 数値の型違い（1 と 1.0）は同値として統合する
+    sweep = _base_sweep(
+        magnifications=[[40]], instance_loss=[True], bag_weight=[1, 1.0]
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # bag_weight 1 と 1.0 は同一
+
+
+def test_mixed_single_and_multi_mag_with_zoom_axis():
+    # 単一 [40] は zoom 系を畳んで 1 件，多倍率 [1.25,2.5] は 2 件 -> 1 pair で計 3
+    sweep = {
+        "encoder": ["ResNet50"],
+        "feature_type": ["mean"],
+        "magnifications": [[40], [1.25, 2.5]],
+        "k_sample": [8, 25],
+    }
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 3
+    single = [c for c in combos if len(c.config["magnifications"]) == 1]
+    multi = [c for c in combos if len(c.config["magnifications"]) == 2]
+    assert len(single) == 1 and len(multi) == 2
+    assert single[0].config["k_sample"] == 12  # 畳まれて既定
+    assert {c.config["k_sample"] for c in multi} == {8, 25}
+
+
 def _write_fold(combo_dir, fold, val_auc, test_auc):
     fold_dir = os.path.join(combo_dir, f"fold{fold}")
     os.makedirs(fold_dir, exist_ok=True)

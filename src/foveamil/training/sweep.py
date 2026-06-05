@@ -53,6 +53,14 @@ logger = logging.getLogger(__name__)
 ENCODER_KEY = "encoder"
 FEATURE_TYPE_KEY = "feature_type"
 MAGNIFICATIONS_KEY = "magnifications"
+# インスタンス補助損失の有効化キー（単一倍率のみ有効）
+INSTANCE_LOSS_KEY = "instance_loss"
+# 多倍率（ズーム）でのみ意味を持つキー（単一倍率では学習に無関係）
+ZOOM_PARAM_KEYS = ("k_sample", "k_sigma", "topk_method")
+# instance_loss 有効時のみ意味を持つキー（無効時は無関係）
+INSTANCE_PARAM_KEYS = ("bag_weight", "inst_k", "inst_subtyping")
+# 単一倍率を表す倍率数
+SINGLE_MAG = 1
 # 自動解決されるため設定に手書きを許さないキー
 AUTO_RESOLVED_KEYS = ("in_feat_dim", "feature_root", "labels_csv", "n_cls", "classes")
 # combo ディレクトリ名の接頭辞
@@ -105,6 +113,11 @@ class Combo:
 def _train_config_fields() -> frozenset:
     """``TrainConfig`` のフィールド名集合を返す"""
     return frozenset(f.name for f in dataclasses.fields(TrainConfig))
+
+
+def _train_config_defaults() -> Dict[str, Any]:
+    """``TrainConfig`` の各フィールドの既定値を返す"""
+    return {f.name: f.default for f in dataclasses.fields(TrainConfig)}
 
 
 def _reject_auto_resolved(block_name: str, block: Dict[str, Any]) -> None:
@@ -184,6 +197,103 @@ def _combo_name(index: int, encoder: str, feature_type: str, n_mags: int) -> str
     return f"{COMBO_DIR_PREFIX}{index:03d}__{enc}_{feature_type}_m{n_mags}"
 
 
+def _disable_param(
+    config: Dict[str, Any],
+    axis_values: Dict[str, Any],
+    defaults: Dict[str, Any],
+    key: str,
+) -> bool:
+    """無関係なパラメータを既定値へ畳み axis_values から落とす
+
+    設定に現れたキーのみ畳む（未指定キーは ``TrainConfig`` の既定がそのまま効く）
+    明示値（既定と異なる値）を捨てた場合に ``True`` を返す（警告用）
+    """
+    discarded = False
+    if key in config:
+        discarded = config[key] != defaults[key]
+        config[key] = defaults[key]
+    axis_values.pop(key, None)
+    return discarded
+
+
+def _canonicalize_conditional(
+    config: Dict[str, Any], axis_values: Dict[str, Any], defaults: Dict[str, Any]
+) -> set:
+    """構成に無関係な条件付きパラメータを既定値へ畳む
+
+    ``instance_loss`` は単一倍率のみ有効（多倍率では既定の無効へ畳み単一倍率では真偽値へ
+    正規化する）ズーム系（``k_sample`` / ``k_sigma`` / ``topk_method``）は多倍率のみ有効
+    （単一倍率では畳む）instance 系（``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は
+    ``instance_loss`` 有効時のみ意味を持つ（無効時は畳む）畳んだキーは ``axis_values`` から
+    落とし集計・表に載せない明示値を捨てたキー集合を返す（警告用）
+    """
+    discarded: set = set()
+    single_mag = len(config[MAGNIFICATIONS_KEY]) == SINGLE_MAG
+    if not single_mag:
+        # 多倍率での無効化は dropped_instance_multi が警告するため discarded には積まない
+        _disable_param(config, axis_values, defaults, INSTANCE_LOSS_KEY)
+    instance_on = bool(config.get(INSTANCE_LOSS_KEY, defaults[INSTANCE_LOSS_KEY]))
+    if single_mag and INSTANCE_LOSS_KEY in config:
+        # 保存・署名を安定させるため真偽値へ正規化する（YAML の 1/'true' 等を吸収）
+        config[INSTANCE_LOSS_KEY] = instance_on
+        if INSTANCE_LOSS_KEY in axis_values:
+            axis_values[INSTANCE_LOSS_KEY] = instance_on
+
+    if single_mag:
+        for key in ZOOM_PARAM_KEYS:
+            if _disable_param(config, axis_values, defaults, key):
+                discarded.add(key)
+    if not instance_on:
+        for key in INSTANCE_PARAM_KEYS:
+            if _disable_param(config, axis_values, defaults, key):
+                discarded.add(key)
+    return discarded
+
+
+def _normalize_for_signature(value: Any) -> Any:
+    """署名用に値を正規化する（型違いの同値を同一視する）
+
+    ``bool`` / ``int`` / ``float`` は ``float`` へ寄せ ``1`` / ``1.0`` / ``True`` を同一視する
+    list は要素ごとに再帰し，その他は文字列化する
+    """
+    if isinstance(value, (bool, int, float)):
+        return float(value)
+    if isinstance(value, list):
+        return [_normalize_for_signature(item) for item in value]
+    return str(value)
+
+
+def _combo_signature(config: Dict[str, Any]) -> str:
+    """combo 設定の決定的な署名（重複判定キー）を返す"""
+    normalized = {key: _normalize_for_signature(val) for key, val in config.items()}
+    return json.dumps(normalized, sort_keys=True)
+
+
+def _warn_collapse(
+    n_raw: int,
+    n_kept: int,
+    dropped_instance_multi: bool,
+    discarded_keys: set,
+) -> None:
+    """無関係パラメータの統合・除外を警告で知らせる"""
+    merged = n_raw - n_kept
+    if merged > 0:
+        logger.warning(
+            "sweep 健全化: 構成に無関係なパラメータのみ異なる combo を %d 件統合しました"
+            "（展開 %d -> %d）",
+            merged, n_raw, n_kept,
+        )
+    if dropped_instance_multi:
+        logger.warning(
+            "instance_loss=True は単一倍率でのみ有効です 多倍率の combo では無効化しました"
+        )
+    if discarded_keys:
+        logger.warning(
+            "構成に無関係なため既定値へ畳んだ軸（記録しません）: %s",
+            sorted(discarded_keys),
+        )
+
+
 def expand_combos(
     sweep: Dict[str, Any], fixed: Dict[str, Any], resolved: ResolvedPaths
 ) -> List[Combo]:
@@ -191,7 +301,9 @@ def expand_combos(
 
     ``(encoder, feature_type)`` は制約付き join，他の軸は ``ParameterGrid`` で直積展開し，
     各 combo に解決済み ``in_feat_dim`` / ``feature_root`` / ``labels_csv`` / ``n_cls`` を
-    載せる``config`` のキーは ``TrainConfig`` フィールドに限る
+    載せる``config`` のキーは ``TrainConfig`` フィールドに限る展開後，構成に無関係な
+    条件付きパラメータ（単一倍率でのズーム系，無効時の instance 系，多倍率での
+    ``instance_loss``）を既定値へ畳んで重複 combo を統合する（直積の無駄を断つ）
 
     Args:
         sweep: 展開対象の軸辞書（``encoder`` / ``feature_type`` / ``magnifications`` を含む）
@@ -225,8 +337,9 @@ def expand_combos(
     other_combos = list(ParameterGrid(other_axes)) if other_axes else [{}]
 
     known = _train_config_fields()
-    combos: List[Combo] = []
-    index = 0
+    defaults = _train_config_defaults()
+
+    raw: List[Combo] = []
     for encoder, feature_type in pairs:
         for mags in mag_sets:
             for other in other_combos:
@@ -253,15 +366,53 @@ def expand_combos(
                     MAGNIFICATIONS_KEY: mags,
                     **other,
                 }
-                combos.append(
-                    Combo(
-                        index=index,
-                        name=_combo_name(index, encoder, feature_type, len(mags)),
-                        config=config,
-                        axis_values=axis_values,
-                    )
+                raw.append(
+                    Combo(index=-1, name="", config=config, axis_values=axis_values)
                 )
-                index += 1
+
+    return _collapse_combos(raw, defaults)
+
+
+def _collapse_combos(
+    raw: Sequence[Combo], defaults: Dict[str, Any]
+) -> List[Combo]:
+    """無関係パラメータを畳んで重複 combo を統合し連番・名前を振り直す"""
+    dropped_instance_multi = False
+    discarded_keys: set = set()
+    seen: set = set()
+    kept: List[Combo] = []
+    for combo in raw:
+        single_mag = len(combo.config[MAGNIFICATIONS_KEY]) == SINGLE_MAG
+        if not single_mag and bool(
+            combo.config.get(INSTANCE_LOSS_KEY, defaults[INSTANCE_LOSS_KEY])
+        ):
+            dropped_instance_multi = True
+        discarded_keys |= _canonicalize_conditional(
+            combo.config, combo.axis_values, defaults
+        )
+        signature = _combo_signature(combo.config)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        kept.append(combo)
+
+    _warn_collapse(len(raw), len(kept), dropped_instance_multi, discarded_keys)
+
+    combos: List[Combo] = []
+    for index, combo in enumerate(kept):
+        combos.append(
+            Combo(
+                index=index,
+                name=_combo_name(
+                    index,
+                    combo.config[ENCODER_KEY],
+                    combo.config[FEATURE_TYPE_KEY],
+                    len(combo.config[MAGNIFICATIONS_KEY]),
+                ),
+                config=combo.config,
+                axis_values=combo.axis_values,
+            )
+        )
     return combos
 
 

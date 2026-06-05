@@ -56,6 +56,13 @@ foveamil-train --config configs/train.example.yaml --split s.csv --out o \
 - `fixed`: 全 combo 共通のスカラ（`TrainConfig` フィールド）．
 - `parallel`: `gpu_ids`（使用 GPU 一覧）・`jobs_per_gpu`（GPU あたり並列数）．
 
+**構成に無関係なパラメータは自動で畳まれ重複 combo は統合される**（直積の無駄を断つ・統合時は警告）．
+単一倍率では `k_sample` / `k_sigma` / `topk_method`（ズーム系）が学習に無関係なので畳んで記録しない．
+インスタンス補助損失 `instance_loss=true` は単一倍率のみ有効で，多倍率の combo では無効化して統合する
+（`bag_weight` / `inst_k` / `inst_subtyping` は `instance_loss=true` のときだけ意味を持ち，無効時は畳む）．
+例えば `instance_loss: [false, true]` と `magnifications: [[1.25, 5.0], [40]]` を与えると，多倍率の
+`[1.25, 5.0]` は false の 1 件，単一倍率の `[40]` は false/true の 2 件＝計 3 combo に展開される．
+
 `in_feat_dim` / `labels_csv` / 完全形の `feature_root` / `splits_dir` は自動解決されるため
 設定に書かない（書くとエラー）．`in_feat_dim` は `encoder` と `feature_type` から解決され，
 `concat` は素の次元の 2 倍になる．

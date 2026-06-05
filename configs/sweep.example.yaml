@@ -12,20 +12,30 @@ resolve:
   cohort_root: cohort        # labels/ と splits/ を含むコホートルート
 
 # 展開する軸（リスト→展開）
+# 構成に無関係なパラメータは自動で畳まれ重複 combo は統合される（警告を出す）
+#   - 単一倍率では k_sample / k_sigma / topk_method は無関係（既定へ畳む 記録しない）
+#   - instance_loss=True は単一倍率のみ有効（多倍率の combo では無効化して統合）
+#   - instance_loss=False では bag_weight / inst_k / inst_subtyping は無関係（既定へ畳む）
 sweep:
   # encoder と feature_type は直積でなく妥当な組合せのみ（cls/concat は cls を持つ encoder のみ）
   encoder: [ResNet50, UNI2-h, Virchow2, Virchow2-mini-dinov2]
   feature_type: [mean, cls, concat]
   # 倍率セット自体を軸にする場合は list-of-lists 単一セットなら 1 つの list
+  # 単一倍率（例 [40]）はズーム無しの attention pooling になる
   magnifications:
     - [1.25, 2.5]
     - [1.25, 2.5, 5.0]
+    - [40]
   lr: [1.0e-4, 1.0e-3]
   topk_method: [perturbed, fast_sparse]
   drop_out: [0.3, 0.6, 0.7]
   k_sample: [8, 15, 25]
   k_sigma: [0.002, 0.005]
   fusion: [sum]
+  # インスタンス補助損失（単一倍率のみ有効）多倍率では自動で false に畳まれる
+  instance_loss: [false, true]
+  bag_weight: [0.7]
+  inst_k: [8]
 
 # 全 combo 共通スカラ（TrainConfig フィールド）
 fixed:

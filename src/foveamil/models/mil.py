@@ -21,6 +21,7 @@ from torch import Tensor
 from foveamil.models.attention import GatedAttention
 from foveamil.models.fusion import build_fusion
 from foveamil.models.heads import LinearClassifierHead
+from foveamil.models.instance import InstanceClusteringLoss
 from foveamil.models.topk import build_topk
 
 # 既定の中間アテンション次元
@@ -37,6 +38,10 @@ DEFAULT_NUM_LAYERS = 4
 DEFAULT_TOPK_METHOD = "perturbed"
 # 既定の融合名
 DEFAULT_FUSION = "sum"
+# 既定のインスタンス補助損失の pos/neg パッチ数
+DEFAULT_INST_K = 8
+# インスタンス補助損失を許す倍率数（単一倍率のみ）
+_SINGLE_LAYER = 1
 # 主・補助アテンションのクラス数（1 スコア/要素）
 _ATTENTION_N_CLS = 1
 # アテンションスコアの次元（n_cls=1 の squeeze 対象軸）
@@ -69,6 +74,12 @@ class FoveaMIL(nn.Module):
         topk_method: top-k 手法名（``build_topk`` のレジストリ）
         topk_kwargs: top-k セレクタへ渡す追加引数
         fusion: 融合名（``build_fusion`` のレジストリ）
+        instance_loss: インスタンス補助損失を持たせるか（単一倍率のみ）
+        inst_k: インスタンス補助損失の pos/neg パッチ数
+        inst_subtyping: インスタンス補助損失に out-of-class 枝を加えるか
+
+    Raises:
+        ValueError: ``instance_loss`` が真かつ ``num_layers`` が 1 でない場合
     """
 
     def __init__(
@@ -83,8 +94,16 @@ class FoveaMIL(nn.Module):
         topk_method: str = DEFAULT_TOPK_METHOD,
         topk_kwargs: Optional[dict] = None,
         fusion: str = DEFAULT_FUSION,
+        instance_loss: bool = False,
+        inst_k: int = DEFAULT_INST_K,
+        inst_subtyping: bool = True,
     ) -> None:
         super().__init__()
+        if instance_loss and num_layers != _SINGLE_LAYER:
+            raise ValueError(
+                "instance_loss requires a single magnification "
+                f"(num_layers=1); got num_layers={num_layers}"
+            )
         self.num_layers = num_layers
         self.k_sample = k_sample
         self.n_cls = n_cls
@@ -106,6 +125,26 @@ class FoveaMIL(nn.Module):
         self.topk = build_topk(topk_method, k_sample, **(topk_kwargs or {}))
         self.fusion = build_fusion(fusion, out_feat_dim, num_layers)
         self.head = LinearClassifierHead(self.fusion.out_dim, n_cls)
+        self.instance_module = (
+            InstanceClusteringLoss(out_feat_dim, n_cls, inst_k, inst_subtyping)
+            if instance_loss
+            else None
+        )
+
+    def _project_and_pool(
+        self, x: Tensor, layer_idx: int
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """射影と主アテンションでプーリング表現を作り ``(M, x_fc, A_primary)`` を返す
+
+        ``A_primary`` は softmax 済みの主アテンション ``[B, 1, N]````x_fc`` は射影後の
+        特徴 ``[B, N, out_dim]``プーリングと補助損失で同一の ``x_fc`` / ``A_primary``
+        を共有するための内部部品
+        """
+        x_fc = self.projections[layer_idx](x)
+        A_primary, _ = self.attentions[layer_idx](x_fc)
+        A_primary = F.softmax(A_primary.permute(0, 2, 1), dim=-1)
+        M = A_primary @ x_fc
+        return M, x_fc, A_primary
 
     def forward_layer(
         self, x: Tensor, layer_idx: int
@@ -127,12 +166,7 @@ class FoveaMIL(nn.Module):
             ``select_indices`` が ``[B, k]``（index 昇順, 勾配なし），
             ``select_weight`` が ``[B, k]``（学習時は勾配を保持）
         """
-        x_fc = self.projections[layer_idx](x)
-
-        A_primary, _ = self.attentions[layer_idx](x_fc)
-        A_primary = A_primary.permute(0, 2, 1)
-        A_primary = F.softmax(A_primary, dim=-1)
-        M = A_primary @ x_fc
+        M, x_fc, _ = self._project_and_pool(x, layer_idx)
 
         if layer_idx >= self.num_layers - 1:
             return M, None, None
@@ -175,6 +209,31 @@ class FoveaMIL(nn.Module):
         A_aux, _ = self.aux_attentions[layer_idx](x_fc)
         A_aux = F.softmax(A_aux.squeeze(dim=-1), dim=-1)
         return A_primary, A_aux
+
+    def forward_with_instance_loss(
+        self, x: Tensor, label: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
+        """単一倍率の bag forward とインスタンス補助損失を同一テンソルから返す
+
+        射影と主アテンションを 1 度だけ計算しプーリング表現と補助損失の双方で同じ
+        ``x_fc`` / ``A_primary`` を共有する（dropout 実現を一致させ余分な forward を避ける）
+        ``instance_module`` を持たないなら補助損失は ``None``単一倍率（``num_layers=1``）
+        の学習時に使う
+
+        Args:
+            x: 最低倍率の特徴 ``[B, N, in_feat_dim]``
+            label: 正解クラス ``[B]``
+
+        Returns:
+            ``(logits[B, n_cls], Y_hat[B, 1], Y_prob[B, n_cls], inst_loss)``
+            ``inst_loss`` はスカラまたは ``None``
+        """
+        M, x_fc, A_primary = self._project_and_pool(x, 0)
+        logits, Y_hat, Y_prob = self.forward_final([M])
+        inst_loss = None
+        if self.instance_module is not None:
+            inst_loss = self.instance_module(x_fc, A_primary.squeeze(dim=1), label)
+        return logits, Y_hat, Y_prob, inst_loss
 
     def forward_final(
         self, M_list: Sequence[Tensor]

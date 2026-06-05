@@ -169,7 +169,12 @@ class Trainer:
             topk_method=config.topk_method,
             topk_kwargs=_topk_kwargs(config),
             fusion=config.fusion,
+            instance_loss=config.instance_loss,
+            inst_k=config.inst_k,
+            inst_subtyping=config.inst_subtyping,
         ).to(self.device)
+        self.instance_enabled = config.instance_loss
+        self.bag_weight = config.bag_weight
 
         self.train_ds = train_ds
         self.val_ds = val_ds
@@ -298,14 +303,28 @@ class Trainer:
             accessor.close()
 
     def _train_one_epoch(self) -> float:
-        """1 エポック学習し平均損失を返す"""
+        """1 エポック学習し平均損失を返す
+
+        ``instance_enabled`` なら最低倍率の全バッグ主アテンションでインスタンス補助
+        損失を計算し ``bag·bag_weight + inst·(1-bag_weight)`` を最小化する
+        """
         self.model.train()
         self.optimizer.zero_grad()
         total_loss = 0.0
         for base_feats, slide_id, label in self.train_loader:
             label = label.to(self.device)
-            logits, _, _ = self._forward(base_feats, slide_id)
-            loss = self.ce_loss(logits, label)
+            if self.instance_enabled:
+                # 単一倍率の bag forward と補助損失を同一の射影・主アテンションから得る
+                logits, _, _, inst_loss = self.model.forward_with_instance_loss(
+                    base_feats.to(self.device), label
+                )
+                loss = (
+                    self.bag_weight * self.ce_loss(logits, label)
+                    + (1.0 - self.bag_weight) * inst_loss
+                )
+            else:
+                logits, _, _ = self._forward(base_feats, slide_id)
+                loss = self.ce_loss(logits, label)
             total_loss += loss.item()
             loss.backward()
             self.optimizer.step()

@@ -10,6 +10,7 @@
 | `topk/` | 微分可能 top-k セレクタ（レジストリで差し替え） |
 | `fusion.py` | 多解像度表現の融合（インタフェース，現状 Sum のみ） |
 | `heads.py` | 識別器ヘッド（融合と分離） |
+| `instance.py` | インスタンス疑似ラベルによる補助損失（単一倍率の主アテンション向け） |
 | `mil.py` | 本体組立（倍率数可変，部品注入） |
 
 ## attention.py
@@ -61,11 +62,22 @@
 
 `LinearClassifierHead(in_dim, n_cls)`．`forward(x: [B, in_dim]) -> logits: [B, n_cls]`．融合と分離した独立部品．
 
+## instance.py（インスタンス補助損失）
+
+`InstanceClusteringLoss(in_dim, n_cls, k, subtyping=True)`．スライド単位ラベルしか無い弱教師下で，主アテンションが高い/低いパッチを per-class の 2 値分類器（クラスごとに `Linear(in_dim, 2)`）で pos/neg として検算し，アテンションをクラス方向へ追加で鍛える補助損失．
+
+- `forward(h: [B, N, in_dim], attention: [B, N], label: [B]) -> scalar`．`attention` は softmax 済みの主アテンション重み．
+- in-class 枝：正解クラスで高アテンション上位 k を pos，低アテンション下位 k を neg として検算する．
+- out-of-class 枝（`subtyping=True`）：非正解クラスの分類器に高アテンション上位 k をすべて neg として与える（相互排他なサブタイプ向け）．`subtyping=True` のときは枝の和をクラス数で割る．
+- パッチ数が `2k` 未満なら k を縮める（`k = min(self.k, N // 2)`）．
+
+bag 分類損失（CE）と `bag·bag_weight + inst·(1-bag_weight)` で重み付き和を取って使う．**単一倍率（ズーム無しの attention pooling）の全バッグ主アテンションが対象**で，`k`（`inst_k`）はズーム選択数 `k_sample` とは別物．
+
 ## mil.py（組立）
 
-`FoveaMIL(in_feat_dim, hidden_feat_dim=256, out_feat_dim=512, dropout=None, k_sample=12, n_cls=3, num_layers=4, topk_method="perturbed", topk_kwargs=None, fusion="sum")`．
+`FoveaMIL(in_feat_dim, hidden_feat_dim=256, out_feat_dim=512, dropout=None, k_sample=12, n_cls=3, num_layers=4, topk_method="perturbed", topk_kwargs=None, fusion="sum", instance_loss=False, inst_k=8, inst_subtyping=True)`．
 
-倍率ごとに `nn.ModuleList` で特徴射影（`Linear + ReLU (+ Dropout)`），主アテンション，補助アテンション（最終層以外）を持つ．top-k セレクタ 1 つ・融合器・ヘッドを注入する．
+倍率ごとに `nn.ModuleList` で特徴射影（`Linear + ReLU (+ Dropout)`），主アテンション，補助アテンション（最終層以外）を持つ．top-k セレクタ 1 つ・融合器・ヘッドを注入する．`instance_loss=True` のとき `InstanceClusteringLoss` を持ち，`forward_with_instance_loss(x, label)` が単一倍率の bag forward（logits / Y_hat / Y_prob）と補助損失を**同一の射影・主アテンションから**返す（無効なら補助損失は `None`）．`instance_loss=True` は `num_layers=1`（単一倍率）のみ許し，多倍率では `ValueError`．
 
 - `forward(x) -> (logits, Y_hat, Y_prob)`．`x` は倍率ごとのテンソルのタプル（各 `[B, N_i, in_feat_dim]`，`N_i` は親の 4 倍）．
 - 各倍率でこれまでの選択行列を `kron(selection, eye(ratio))` と `einsum` で適用 → 射影 → 主アテンションで softmax プーリング表現を蓄積 → 補助アテンションのスコアから top-k で次倍率の選択行列を得る．最後に融合 → ヘッド → `logits`，`Y_hat`（予測クラス `[B, 1]`），`Y_prob`（softmax `[B, n_cls]`）．

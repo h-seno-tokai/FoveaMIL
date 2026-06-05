@@ -6,6 +6,7 @@ import torch
 from foveamil.models import (
     FoveaMIL,
     GatedAttention,
+    InstanceClusteringLoss,
     LinearClassifierHead,
     build_fusion,
     build_topk,
@@ -188,3 +189,80 @@ def test_single_magnification_is_final_only():
     logits, _, Y_prob = model.forward_final([M])
     assert logits.shape == (2, 3)
     assert torch.allclose(Y_prob.sum(dim=-1), torch.ones(2), atol=1e-6)
+
+
+# --- インスタンス補助損失 ---
+
+
+def test_instance_loss_shape_and_gradient():
+    loss = InstanceClusteringLoss(in_dim=12, n_cls=3, k=4, subtyping=True)
+    h = torch.randn(1, 50, 12, requires_grad=True)
+    attention = torch.softmax(torch.randn(1, 50), dim=-1)
+    out = loss(h, attention, torch.tensor([1]))
+    assert out.dim() == 0
+    out.backward()
+    assert h.grad is not None and h.grad.abs().sum().item() > 0
+
+
+def test_instance_loss_clamps_k_for_small_bags():
+    # パッチ数 < 2k なら k を縮め，パッチが 1 枚以下なら 0 を返す
+    loss = InstanceClusteringLoss(in_dim=8, n_cls=2, k=8, subtyping=False)
+    small = loss(torch.randn(1, 3, 8), torch.softmax(torch.randn(1, 3), -1), torch.tensor([0]))
+    assert torch.isfinite(small)
+    single = loss(torch.randn(1, 1, 8), torch.softmax(torch.randn(1, 1), -1), torch.tensor([0]))
+    assert single.item() == 0.0
+
+
+def test_instance_loss_subtyping_uses_all_classifiers():
+    # subtyping=True は非正解クラスの分類器にも勾配を流す
+    loss = InstanceClusteringLoss(in_dim=8, n_cls=3, k=4, subtyping=True)
+    h = torch.randn(1, 40, 8)
+    attention = torch.softmax(torch.randn(1, 40), dim=-1)
+    loss(h, attention, torch.tensor([0])).backward()
+    grads = [c.weight.grad for c in loss.classifiers]
+    assert all(g is not None and g.abs().sum().item() > 0 for g in grads)
+
+
+def test_model_builds_instance_module_only_when_enabled():
+    off = _build_model(num_layers=1, n_cls=3)
+    assert off.instance_module is None
+    # 無効時は補助損失 None で bag forward は従来どおり
+    logits, _, _, inst = off.forward_with_instance_loss(
+        torch.randn(1, 10, 8), torch.tensor([0])
+    )
+    assert inst is None and logits.shape == (1, 3)
+
+    on = FoveaMIL(
+        in_feat_dim=8, hidden_feat_dim=16, out_feat_dim=12, n_cls=3,
+        num_layers=1, instance_loss=True, inst_k=4,
+    )
+    assert on.instance_module is not None
+    logits, _, _, inst = on.forward_with_instance_loss(
+        torch.randn(1, 30, 8), torch.tensor([1])
+    )
+    assert logits.shape == (1, 3)
+    assert inst.dim() == 0 and torch.isfinite(inst)
+
+
+def test_forward_with_instance_loss_shares_one_forward():
+    # bag forward と補助損失は同一の射影・主アテンションを共有する（dropout 無しでは一致確認）
+    model = FoveaMIL(
+        in_feat_dim=8, hidden_feat_dim=16, out_feat_dim=12, n_cls=3,
+        num_layers=1, instance_loss=True, inst_k=4,
+    )
+    model.train()
+    x = torch.randn(1, 40, 8)
+    logits, _, _, inst = model.forward_with_instance_loss(x, torch.tensor([0]))
+    # forward_layer のプーリングと同じ M から logits が出る（dropout=None なので決定的）
+    M, _, _ = model.forward_layer(x, 0)
+    ref_logits, _, _ = model.forward_final([M])
+    assert torch.allclose(logits, ref_logits, atol=1e-6)
+    # 結合損失の backward が bag ヘッドと instance 分類器の双方へ勾配を流す
+    (0.7 * logits.sum() + 0.3 * inst).backward()
+    assert model.head.fc.weight.grad is not None
+    assert model.instance_module.classifiers[0].weight.grad is not None
+
+
+def test_instance_loss_requires_single_magnification():
+    with pytest.raises(ValueError, match="single magnification"):
+        FoveaMIL(in_feat_dim=8, out_feat_dim=12, n_cls=3, num_layers=2, instance_loss=True)

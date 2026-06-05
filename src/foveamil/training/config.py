@@ -38,6 +38,14 @@ DEFAULT_K_SIGMA = 0.002
 DEFAULT_TOPK_METHOD = "perturbed"
 # 既定の融合名
 DEFAULT_FUSION = "sum"
+# 既定のインスタンス補助損失の有効化
+DEFAULT_INSTANCE_LOSS = False
+# 既定の bag 損失とインスタンス補助損失の重み（bag 側）
+DEFAULT_BAG_WEIGHT = 0.7
+# 既定のインスタンス補助損失の pos/neg パッチ数
+DEFAULT_INST_K = 8
+# 既定のインスタンス補助損失の out-of-class 枝の有無
+DEFAULT_INST_SUBTYPING = True
 # 既定のクラス数
 DEFAULT_N_CLS = 3
 # 既定の DataLoader ワーカ数
@@ -68,10 +76,14 @@ class TrainConfig:
         hidden_feat_dim: アテンション中間次元
         out_feat_dim: 特徴射影後の次元
         drop_out: Dropout 率（``None`` なら Dropout なし）
-        k_sample: ズーム選択数 k
-        k_sigma: top-k 平滑化パラメータ
-        topk_method: top-k 手法名
+        k_sample: ズーム選択数 k（単一倍率では無効）
+        k_sigma: top-k 平滑化パラメータ（単一倍率では無効）
+        topk_method: top-k 手法名（単一倍率では無効）
         fusion: 融合名
+        instance_loss: インスタンス補助損失を加えるか（単一倍率のみ）
+        bag_weight: bag 損失とインスタンス補助損失の重み（``bag·bag_weight + inst·(1-bag_weight)``）
+        inst_k: インスタンス補助損失の pos/neg パッチ数
+        inst_subtyping: インスタンス補助損失に out-of-class 枝を加えるか
         n_cls: クラス数
         is_weighted_sampler: train で WeightedRandomSampler を使うか
         num_workers: DataLoader ワーカ数
@@ -103,6 +115,10 @@ class TrainConfig:
     k_sigma: float = DEFAULT_K_SIGMA
     topk_method: str = DEFAULT_TOPK_METHOD
     fusion: str = DEFAULT_FUSION
+    instance_loss: bool = DEFAULT_INSTANCE_LOSS
+    bag_weight: float = DEFAULT_BAG_WEIGHT
+    inst_k: int = DEFAULT_INST_K
+    inst_subtyping: bool = DEFAULT_INST_SUBTYPING
     n_cls: int = DEFAULT_N_CLS
 
     is_weighted_sampler: bool = True

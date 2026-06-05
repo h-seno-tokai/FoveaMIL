@@ -84,6 +84,9 @@ def build_model(config: Dict[str, Any]) -> FoveaMIL:
         topk_method=cfg.topk_method,
         topk_kwargs=_topk_kwargs(cfg),
         fusion=cfg.fusion,
+        instance_loss=cfg.instance_loss,
+        inst_k=cfg.inst_k,
+        inst_subtyping=cfg.inst_subtyping,
     )
 
 

@@ -23,10 +23,16 @@ feature_type: mean                         # mean / cls / concat
 # モデル
 in_feat_dim: 1024     # 入力特徴次元（エンコーダ出力に合わせる）
 n_cls: 3              # クラス数（labels_csv から自動上書きされる）
-k_sample: 12          # ズーム選択数 k
-k_sigma: 0.002        # top-k 平滑化パラメータ（perturbed の sigma / fast_sparse の epsilon）
-topk_method: perturbed  # perturbed / fast_sparse
+k_sample: 12          # ズーム選択数 k（単一倍率では無効）
+k_sigma: 0.002        # top-k 平滑化パラメータ（perturbed の sigma / fast_sparse の epsilon・単一倍率では無効）
+topk_method: perturbed  # perturbed / fast_sparse（単一倍率では無効）
 fusion: sum           # 倍率融合（sum）
+
+# インスタンス補助損失（単一倍率のみ・高/低アテンションのパッチを per-class 2 値分類器で検算）
+instance_loss: false  # 有効化（multi-magnification と併用するとエラー）
+bag_weight: 0.7       # bag 損失とインスタンス損失の重み（bag·w + inst·(1-w)）
+inst_k: 8             # pos/neg に取る上位・下位パッチ数（k_sample とは別物）
+inst_subtyping: true  # 非正解クラスの out-of-class 枝を加えるか
 
 # 学習インタフェース
 save_metric: loss            # best 保存基準（loss / f1）
