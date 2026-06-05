@@ -50,6 +50,14 @@ SELECT_INDEX = "index"
 FOLD_ALL = "all"
 # 倍率ラベルの接尾辞
 MAG_LABEL_SUFFIX = "x"
+# CKA ヒートマップの値域・配色（0–1）
+CKA_VMIN = 0.0
+CKA_VMAX = 1.0
+CKA_CMAP = "viridis"
+# Pearson ヒートマップの値域・配色（負値を含むため発散配色）
+PEARSON_VMIN = -1.0
+PEARSON_VMAX = 1.0
+PEARSON_CMAP = "coolwarm"
 
 
 def _resolve_feature_root(args: argparse.Namespace) -> str:
@@ -120,15 +128,18 @@ def _write_heatmaps(
     labels = _mag_labels(magnifications)
     written: List[str] = []
     pairs = (
-        ("cka_matrix", CKA_PNG, "Inter-magnification linear CKA"),
-        ("pearson_matrix", PEARSON_PNG, "Inter-magnification Pearson correlation"),
+        ("cka_matrix", CKA_PNG, "Inter-magnification linear CKA",
+         CKA_VMIN, CKA_VMAX, CKA_CMAP),
+        ("pearson_matrix", PEARSON_PNG, "Inter-magnification Pearson correlation",
+         PEARSON_VMIN, PEARSON_VMAX, PEARSON_CMAP),
     )
-    for key, png_name, title in pairs:
+    for key, png_name, title, vmin, vmax, cmap in pairs:
         if key not in summary:
             continue
         matrix = np.asarray(summary[key], dtype=float)
         out_png = os.path.join(out_dir, png_name)
-        if save_heatmap(matrix, labels, title, out_png):
+        if save_heatmap(matrix, labels, title, out_png,
+                        vmin=vmin, vmax=vmax, cmap=cmap):
             written.append(png_name)
     return written
 

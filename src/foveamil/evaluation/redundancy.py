@@ -22,6 +22,8 @@ _MIN_LAYERS = 2
 _EPS = 1e-8
 # バッチ軸の添字（バッチサイズ 1 前提）
 _BATCH = 0
+# 最低倍率の添字（倍率列は低→高）
+_LOWEST_MAG_IDX = 0
 # 実効ランクで無視する特異値の下限（相対）
 _SPECTRUM_EPS = 1e-12
 
@@ -67,7 +69,12 @@ def collect_magnification_vectors(
     accessor = FeatureAccessor(feature_root, encoder, slide_id, feature_type)
     try:
         m_rows: List[np.ndarray] = []
-        x = accessor.load_all(magnifications[_BATCH]).float().unsqueeze(0).to(device)
+        x = (
+            accessor.load_all(magnifications[_LOWEST_MAG_IDX])
+            .float()
+            .unsqueeze(0)
+            .to(device)
+        )
         global_idx: Optional[np.ndarray] = None
         with torch.no_grad():
             for layer_idx in range(num_layers):
@@ -210,6 +217,7 @@ def aggregate_redundancy(slide_vectors: Sequence[np.ndarray]) -> dict:
     if not slide_vectors:
         return {"n_slides": 0, "n_layers": 0}
     num_layers = slide_vectors[0].shape[0]
+    vec_dim = slide_vectors[0].shape[1]
     result: dict = {"n_slides": len(slide_vectors), "n_layers": int(num_layers)}
     if num_layers < _MIN_LAYERS:
         return result
@@ -222,7 +230,7 @@ def aggregate_redundancy(slide_vectors: Sequence[np.ndarray]) -> dict:
     result["mean_cosine"] = _safe_nanmean(cos_raw)
     result["mean_cosine_centered"] = _safe_nanmean(cos_centered)
     result["mean_effective_rank"] = _safe_nanmean(eff_rank)
-    result["max_effective_rank"] = float(num_layers)
+    result["max_effective_rank"] = float(min(num_layers, vec_dim))
     result["mean_singular_values"] = np.nanmean(spectra, axis=0).tolist()
 
     cka, pearson = _pairwise_cka_pearson(slide_vectors, num_layers)
@@ -267,16 +275,29 @@ def _flattened_pearson(a: np.ndarray, b: np.ndarray) -> float:
     return float((a_c @ b_c) / denom)
 
 
-def save_heatmap(matrix: np.ndarray, labels: Sequence[str], title: str, out_png: str) -> bool:
+def save_heatmap(
+    matrix: np.ndarray,
+    labels: Sequence[str],
+    title: str,
+    out_png: str,
+    vmin: float = 0.0,
+    vmax: float = 1.0,
+    cmap: str = "viridis",
+) -> bool:
     """``L×L`` 行列をヒートマップ PNG に保存する成功で ``True``
 
     matplotlib が無ければ描かず ``False`` を返す（依存が無くても診断を止めない）
+    ``vmin`` / ``vmax`` で値域を，``cmap`` で配色を指定する負値を含む相関には
+    ``vmin=-1`` と発散配色を渡す
 
     Args:
         matrix: ``L×L`` 行列
         labels: 倍率ラベル（軸目盛）
         title: 図タイトル
         out_png: 出力 PNG パス
+        vmin: カラースケール下限
+        vmax: カラースケール上限
+        cmap: matplotlib のカラーマップ名
 
     Returns:
         描画できたか
@@ -290,7 +311,7 @@ def save_heatmap(matrix: np.ndarray, labels: Sequence[str], title: str, out_png:
         return False
 
     fig, ax = plt.subplots()
-    im = ax.imshow(matrix, cmap="viridis", vmin=0.0, vmax=1.0)
+    im = ax.imshow(matrix, cmap=cmap, vmin=vmin, vmax=vmax)
     fig.colorbar(im, ax=ax)
     ticks = list(range(len(labels)))
     ax.set_xticks(ticks)

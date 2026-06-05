@@ -238,6 +238,16 @@ def test_aggregate_orders_redundancy():
     assert np.shape(coll["pearson_matrix"]) == (3, 3)
 
 
+def test_max_effective_rank_is_min_layers_dim():
+    # 倍率数 L が次元 D を上回る場合は上限が D になる
+    rng = np.random.default_rng(7)
+    slides = [rng.standard_normal((5, 2)).astype(np.float32) for _ in range(4)]
+    summary = aggregate_redundancy(slides)
+    assert summary["max_effective_rank"] == min(5, 2)
+    # 実効ランクは上限 min(L, D) を超えない
+    assert summary["mean_effective_rank"] <= summary["max_effective_rank"] + 1e-9
+
+
 def test_aggregate_edge_cases():
     assert aggregate_redundancy([]) == {"n_slides": 0, "n_layers": 0}
     single = aggregate_redundancy([np.ones((1, 8), dtype=np.float32)])
