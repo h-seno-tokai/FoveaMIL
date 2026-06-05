@@ -11,6 +11,12 @@ from foveamil.models.regularizers import (
     Regularizer,
     iter_active_regularizers,
 )
+from foveamil.models.search import (
+    MCTSZoomDriver,
+    PolicyNetwork,
+    ValueNetwork,
+    build_planner,
+)
 from foveamil.models.selection import (
     SelectionController,
     build_selection_controller,
@@ -34,4 +40,8 @@ __all__ = [
     "build_selection_controller",
     "TopKSelector",
     "build_topk",
+    "PolicyNetwork",
+    "ValueNetwork",
+    "build_planner",
+    "MCTSZoomDriver",
 ]

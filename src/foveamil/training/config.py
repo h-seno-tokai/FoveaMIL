@@ -56,6 +56,20 @@ DEFAULT_N_CLS = 3
 DEFAULT_NUM_WORKERS = 4
 # 既定の save_metric
 DEFAULT_SAVE_METRIC = "loss"
+# 既定のズーム駆動名（既定駆動は従来挙動を再現する）
+DEFAULT_ZOOM_DRIVER = "differentiable"
+# 既定の探索プランナ名（``zoom_driver="mcts"`` のときのみ有効）
+DEFAULT_MCTS_PLANNER = "gumbel"
+# 既定の模擬予算
+DEFAULT_MCTS_SIMULATIONS = 16
+# 既定の検討最大候補数 m（Gumbel top-m）
+DEFAULT_MCTS_MAX_CONSIDERED = 8
+# 既定の方策蒸留損失重み
+DEFAULT_POLICY_LOSS_WEIGHT = 1.0
+# 既定の価値回帰損失重み
+DEFAULT_VALUE_LOSS_WEIGHT = 1.0
+# 既定の方策エントロピー損失重み（探索の早期収束を抑える既定は無効）
+DEFAULT_POLICY_ENTROPY_WEIGHT = 0.0
 
 
 @dataclass
@@ -95,6 +109,14 @@ class TrainConfig:
         num_workers: DataLoader ワーカ数
         pin_memory: DataLoader の pin_memory
         save_metric: best 保存基準（``"loss"`` / ``"f1"``）
+        zoom_driver: ズーム駆動名（``"differentiable"`` で従来挙動，``"mcts"`` で探索）
+        mcts_planner: 探索プランナ名（``"gumbel"`` / ``"puct"````mcts`` のみ有効）
+        mcts_simulations: 模擬予算（``mcts`` のみ有効）
+        mcts_max_considered: 検討最大候補数 m（Gumbel top-m``mcts`` のみ有効）
+        policy_loss_weight: 方策蒸留損失の重み λ_π（``mcts`` のみ有効）
+        value_loss_weight: 価値回帰損失の重み λ_v（``mcts`` のみ有効）
+        policy_entropy_weight: 方策エントロピー損失の重み（``mcts`` のみ有効）
+        mcts_hidden_dim: 方策・価値ネットの中間次元（``None`` なら ``hidden_feat_dim``）
     """
 
     seed: int = DEFAULT_SEED
@@ -133,3 +155,12 @@ class TrainConfig:
     num_workers: int = DEFAULT_NUM_WORKERS
     pin_memory: bool = True
     save_metric: str = DEFAULT_SAVE_METRIC
+
+    zoom_driver: str = DEFAULT_ZOOM_DRIVER
+    mcts_planner: str = DEFAULT_MCTS_PLANNER
+    mcts_simulations: int = DEFAULT_MCTS_SIMULATIONS
+    mcts_max_considered: int = DEFAULT_MCTS_MAX_CONSIDERED
+    policy_loss_weight: float = DEFAULT_POLICY_LOSS_WEIGHT
+    value_loss_weight: float = DEFAULT_VALUE_LOSS_WEIGHT
+    policy_entropy_weight: float = DEFAULT_POLICY_ENTROPY_WEIGHT
+    mcts_hidden_dim: Optional[int] = None

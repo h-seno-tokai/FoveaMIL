@@ -57,6 +57,20 @@ MAGNIFICATIONS_KEY = "magnifications"
 INSTANCE_LOSS_KEY = "instance_loss"
 # 多倍率（ズーム）でのみ意味を持つキー（単一倍率では学習に無関係）
 ZOOM_PARAM_KEYS = ("k_sample", "k_sigma", "topk_method")
+# ズーム駆動の選択キー（単一倍率ではズーム自体が無いため無関係）
+ZOOM_DRIVER_KEY = "zoom_driver"
+# 探索駆動を表す zoom_driver の値
+ZOOM_DRIVER_MCTS = "mcts"
+# zoom_driver="mcts" 時のみ意味を持つキー（それ以外は無関係）
+MCTS_PARAM_KEYS = (
+    "mcts_planner",
+    "mcts_simulations",
+    "mcts_max_considered",
+    "policy_loss_weight",
+    "value_loss_weight",
+    "policy_entropy_weight",
+    "mcts_hidden_dim",
+)
 # instance_loss 有効時のみ意味を持つキー（無効時は無関係）
 INSTANCE_PARAM_KEYS = ("bag_weight", "inst_k", "inst_subtyping")
 # 単一倍率を表す倍率数
@@ -222,10 +236,12 @@ def _canonicalize_conditional(
     """構成に無関係な条件付きパラメータを既定値へ畳む
 
     ``instance_loss`` は単一倍率のみ有効（多倍率では既定の無効へ畳み単一倍率では真偽値へ
-    正規化する）ズーム系（``k_sample`` / ``k_sigma`` / ``topk_method``）は多倍率のみ有効
-    （単一倍率では畳む）instance 系（``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は
-    ``instance_loss`` 有効時のみ意味を持つ（無効時は畳む）畳んだキーは ``axis_values`` から
-    落とし集計・表に載せない明示値を捨てたキー集合を返す（警告用）
+    正規化する）ズーム系（``k_sample`` / ``k_sigma`` / ``topk_method`` / ``zoom_driver``）は
+    多倍率のみ有効（単一倍率では畳む）MCTS 系（探索プランナ・模擬予算・損失重み等）は
+    ``zoom_driver="mcts"`` の多倍率のみ意味を持つ（それ以外は畳む）instance 系
+    （``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は ``instance_loss`` 有効時のみ意味を
+    持つ（無効時は畳む）畳んだキーは ``axis_values`` から落とし集計・表に載せない明示値を
+    捨てたキー集合を返す（警告用）
     """
     discarded: set = set()
     single_mag = len(config[MAGNIFICATIONS_KEY]) == SINGLE_MAG
@@ -240,7 +256,15 @@ def _canonicalize_conditional(
             axis_values[INSTANCE_LOSS_KEY] = instance_on
 
     if single_mag:
-        for key in ZOOM_PARAM_KEYS:
+        for key in (*ZOOM_PARAM_KEYS, ZOOM_DRIVER_KEY):
+            if _disable_param(config, axis_values, defaults, key):
+                discarded.add(key)
+    mcts_on = (
+        not single_mag
+        and config.get(ZOOM_DRIVER_KEY, defaults[ZOOM_DRIVER_KEY]) == ZOOM_DRIVER_MCTS
+    )
+    if not mcts_on:
+        for key in MCTS_PARAM_KEYS:
             if _disable_param(config, axis_values, defaults, key):
                 discarded.add(key)
     if not instance_on:

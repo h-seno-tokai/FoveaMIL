@@ -15,6 +15,7 @@
 | `staging.py` | 特徴量セットを SSD へ一括コピーする `FeatureStager`（`foveamil-stage` が使う）． |
 | `stage_cli.py` | 特徴セットを事前ステージする `foveamil-stage` コマンド． |
 | `config.py` | 学習 1 回分の設定をまとめた dataclass `TrainConfig`． |
+| `zoom_driver.py` | 倍率ごとのズーム駆動の差し替えシーム（既定の微分可能駆動・探索駆動，`build_zoom_driver`）． |
 | `metrics.py` | 予測を蓄積して分類指標を集計する `MetricLogger`． |
 | `saver.py` | 検証指標の改善時にモデル重みを保存する `ModelSaver`． |
 | `trainer.py` | 学習・検証・評価を司る `Trainer`． |
@@ -44,6 +45,27 @@
 高/低アテンションのパッチを per-class 2 値分類器で検算する補助損失（`models/instance.py`）を
 bag 損失と `bag·bag_weight + inst·(1-bag_weight)` で結合する．**単一倍率のみ有効**で，
 多倍率と併用すると `FoveaMIL` 構築時に `ValueError`．`inst_k` はズーム選択数 `k_sample` とは別物．
+
+探索ベースのズーム（`zoom_driver` `mcts_planner` `mcts_simulations` `mcts_max_considered`
+`policy_loss_weight` `value_loss_weight` `policy_entropy_weight` `mcts_hidden_dim`）は，倍率ごとの
+ズーム先を一括 top-k ではなく学習方策・価値による探索で決める．既定 `zoom_driver="differentiable"`
+は従来の微分可能 top-k 駆動を再現する．これらは **`zoom_driver="mcts"` の多倍率のみ意味を持ち**，
+それ以外（単一倍率，または既定駆動）では sweep が既定値へ畳んで記録しない．
+
+## `zoom_driver.py` — `ZoomDriver`, `build_zoom_driver`
+
+倍率ごとのズーム駆動を差し替え可能にするシーム．`run(base_feats, magnifications, child_loader,
+device, label=None) -> (logits, Y_hat, Y_prob, ForwardContext)` を共通インタフェースとし，子特徴の
+ロードは callable `child_loader(next_mag, child_global_indices) -> [1, Nc, D]` で注入する（`Trainer` は
+`FeatureAccessor.load_patches` 由来のローダを，テストは合成子を返すローダを与える）．
+
+- `DifferentiableZoomDriver`: 補助アテンションの top-k を一括確定する既定駆動．従来の `Trainer._forward`
+  ループと**同一の数値**を再現する（回帰ガード `tests/test_zoom_driver.py`）．
+- `MCTSZoomDriver`（`models/search/`）: 各倍率で方策・価値による探索を回してズーム先を選び，方策蒸留・
+  価値回帰（任意でエントロピー）損失を `ForwardContext.extra_losses` に積む．識別器ヘッド・射影は基線と
+  共有する．
+- `build_zoom_driver(config, model)`: `config.zoom_driver` の名前から駆動を構築する（`"differentiable"` /
+  `"mcts"`）．`Trainer.__init__` がこれで `self.zoom_driver` を構築し，`_forward` が委ねる．
 
 ## `metrics.py` — `MetricLogger`
 
