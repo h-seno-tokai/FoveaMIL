@@ -110,9 +110,9 @@ class TrainConfig:
         pin_memory: DataLoader の pin_memory
         save_metric: best 保存基準（``"loss"`` / ``"f1"``）
         zoom_driver: ズーム駆動名（``"differentiable"`` で従来挙動，``"mcts"`` で探索）
-        mcts_planner: 探索プランナ名（``"gumbel"`` / ``"puct"````mcts`` のみ有効）
+        mcts_planner: 探索プランナ名（``"gumbel"`` / ``"puct"``，``mcts`` のみ有効）
         mcts_simulations: 模擬予算（``mcts`` のみ有効）
-        mcts_max_considered: 検討最大候補数 m（Gumbel top-m``mcts`` のみ有効）
+        mcts_max_considered: 検討最大候補数 m（Gumbel top-m，``mcts`` のみ有効）
         policy_loss_weight: 方策蒸留損失の重み λ_π（``mcts`` のみ有効）
         value_loss_weight: 価値回帰損失の重み λ_v（``mcts`` のみ有効）
         policy_entropy_weight: 方策エントロピー損失の重み（``mcts`` のみ有効）

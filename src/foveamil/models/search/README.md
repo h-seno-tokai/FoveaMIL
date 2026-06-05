@@ -43,6 +43,8 @@
 - 学習損失（`ForwardContext.extra_losses` に名前付きで積む）：分類損失（CE，学習ループが加える）に加え `λ_π · 方策蒸留`（π から改良方策への交差エントロピー，目標は detach）と `λ_v · 価値回帰`（探索表現の実現報酬＝負分類損失への MSE，目標は detach）．任意でエントロピー項．
 - 方策・価値ネットは `model` の子モジュール（`search_policy` / `search_value`）として登録し，`model.parameters()` で基線の識別器ヘッド・射影と同一 optimizer で最適化される（並列分類器は持たず，利得を探索に帰属させる）．
 - 推論：ラベル無しで同じ探索を回しズーム先を選ぶ（`extra_losses` は積まない）．
+- `context.selections[i]['select_weight']`：MCTS 駆動では選んだ親の方策確率（`PolicyNetwork` 出力）であり，differentiable 駆動の補助アテンション重みとは別物．アテンションベースの正則化器など下流の消費者はこの違いに留意する．
+- 価値ネットは価値回帰項からのみ勾配を受けるため，`value_loss_weight > 0` のときに限り学習される（0 なら初期重みのまま固定）．`zoom_driver="mcts"` かつ `value_loss_weight==0` のとき 1 度警告を出す．
 
 ## 他シームとの両立
 

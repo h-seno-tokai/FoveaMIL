@@ -263,6 +263,59 @@ def test_mcts_driver_deterministic_under_seed():
     assert a_sel == b_sel
 
 
+def _zoom_search_problem(model, value_net):
+    """``_ZoomSearchProblem`` の最小インスタンスを作る（``evaluate`` の単体検証用）
+
+    同一の ``model`` ``value_net`` を共有し，値の差は評価モードのみに由来させる
+    """
+    import numpy as np
+
+    from foveamil.models.search.driver import _ZoomSearchProblem
+
+    return _ZoomSearchProblem(
+        prior_np=np.full(3, 1.0 / 3),
+        x_fc=torch.zeros(1, 3, OUT_DIM),
+        layer_idx=0,
+        next_mag=MAGS_2[1],
+        cpp=children_per_parent(MAGS_2[0], MAGS_2[1]),
+        global_idx=None,
+        model=model,
+        value_net=value_net,
+        child_loader=_seeded_child_loader(),
+        device=torch.device("cpu"),
+    )
+
+
+def test_evaluate_independent_of_value_net_train_eval_mode():
+    from foveamil.models.search.value import ValueNetwork
+
+    torch.manual_seed(0)
+    model = _model(num_layers=2)
+    value_net = ValueNetwork(OUT_DIM, HIDDEN, dropout=0.5)
+
+    value_net.train()
+    torch.manual_seed(7)
+    reward_train = _zoom_search_problem(model, value_net).evaluate(0)
+
+    value_net.eval()
+    torch.manual_seed(7)
+    reward_eval = _zoom_search_problem(model, value_net).evaluate(0)
+
+    # dropout 0.5 でも train/eval どちらのモードでも葉評価は一致する（eval を強制）
+    assert reward_train == pytest.approx(reward_eval)
+
+
+def test_evaluate_restores_value_net_training_mode():
+    from foveamil.models.search.value import ValueNetwork
+
+    model = _model(num_layers=2)
+    value_net = ValueNetwork(OUT_DIM, HIDDEN, dropout=0.5)
+    value_net.train()
+    _zoom_search_problem(model, value_net).evaluate(0)
+    # 前向き後に元の train モードへ戻る
+    assert value_net.training
+
+
 def test_mcts_driver_entropy_term_when_enabled():
     torch.manual_seed(0)
     model = _model(num_layers=2)
