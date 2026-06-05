@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "foveamil"
+dynamic = ["version"]
+description = "FoveaMIL — multi-resolution MIL for pathology WSIs (fovea-style patch selection)."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Seno Hiroki" }]
+requires-python = ">=3.8"
+keywords = [
+    "multiple-instance-learning",
+    "computational-pathology",
+    "whole-slide-image",
+    "histopathology",
+    "multi-resolution",
+    "attention",
+    "deep-learning",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "h5py",
+    "opencv-python",
+    "scipy",
+    "openslide-python",
+    "torch",
+    "torchvision",
+    "timm",
+    "huggingface_hub",
+    "pyyaml",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.urls]
+Repository = "https://github.com/h-seno-tokai/FoveaMIL"
+
+[project.scripts]
+foveamil-cohort = "foveamil.cohort.cli:main"
+foveamil-coords = "foveamil.preprocessing.coordinates_cli:main"
+foveamil-features = "foveamil.preprocessing.features_cli:main"
+foveamil-notify = "foveamil.utils.notify:notify_main"
+foveamil-stage = "foveamil.training.stage_cli:main"
+foveamil-train = "foveamil.training.train_cli:main"
+foveamil-sweep = "foveamil.training.sweep_cli:main"
+foveamil-eval = "foveamil.evaluation.report_cli:main"
+foveamil-visualize = "foveamil.visualization.visualize_cli:main"
+
+# version は単一の真実源 foveamil.__version__（src/foveamil/__init__.py）から取る
+[tool.setuptools.dynamic]
+version = { attr = "foveamil.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

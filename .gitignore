@@ -1,0 +1,62 @@
+# =============================================================================
+# FoveaMIL .gitignore
+# =============================================================================
+
+# --- コホート: README と template のみ追跡 ---
+cohort/**
+!cohort/**/
+!cohort/**/README.md
+!cohort/**/*.template.*
+
+# --- 秘密情報 ---
+.env
+.envrc
+*.secret
+credentials*.json
+
+# --- ローカル実行スクリプト（汎用版 scripts/*.sh は追跡）---
+*.local.sh
+
+# --- 大規模データ / 成果物 ---
+features/
+features_fp16/
+coords/
+checkpoints/
+experiments/
+pretrained/*
+!pretrained/README.md
+!pretrained/.gitkeep
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+
+# --- ログ・実験出力 ---
+logs/
+runs/
+wandb/
+*.log
+events.out.tfevents.*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
+.pytest_cache/
+.venv/
+venv/
+
+# --- OS / IDE ---
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# --- ローカル設定 ---
+.claude/

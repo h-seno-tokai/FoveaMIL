@@ -1,0 +1,34 @@
+# FoveaMIL 単一学習の設定例
+# foveamil-train --config configs/train.example.yaml --split /path/to/split.csv --out /path/to/out --weights-out /path/to/weights
+# パスはすべてプレースホルダなので環境に合わせて差し替える
+# feature_root は事前に foveamil-stage でステージ済みである前提（学習はそのまま読む）
+# ログ・結果は --out（home），重み（.pt）は --weights-out（Dataset）へ分けて保存する
+
+# 乱数シード
+seed: 1
+# 最大エポック数
+max_epochs: 100
+
+# 最適化
+lr: 1.0e-4          # 学習率
+reg: 0.0            # 重み減衰（Adam の weight_decay）
+
+# データ
+feature_root: /path/to/features            # 特徴ルート（{encoder}/{mag}x/{slide_id}.h5）
+encoder: ResNet50                          # エンコーダ名
+labels_csv: /path/to/cohort/labels/labels_3class.csv  # slide_id,label の CSV
+magnifications: [1.25, 2.5, 5.0]           # 倍率の列（低→高）
+feature_type: mean                         # mean / cls / concat
+
+# モデル
+in_feat_dim: 1024     # 入力特徴次元（エンコーダ出力に合わせる）
+n_cls: 3              # クラス数（labels_csv から自動上書きされる）
+k_sample: 12          # ズーム選択数 k
+k_sigma: 0.002        # top-k 平滑化パラメータ（perturbed の sigma / fast_sparse の epsilon）
+topk_method: perturbed  # perturbed / fast_sparse
+fusion: sum           # 倍率融合（sum）
+
+# 学習インタフェース
+save_metric: loss            # best 保存基準（loss / f1）
+is_weighted_sampler: true    # train で WeightedRandomSampler を使うか
+num_workers: 4               # DataLoader ワーカ数（Lazy ロードは内部で 0 固定）

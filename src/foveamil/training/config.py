@@ -1,0 +1,111 @@
+"""学習 1 回分の設定を保持する dataclass
+
+最適化・データ・モデル・学習インタフェースの各設定をフィールドに持つ
+``num_layers`` は ``magnifications`` の長さから導く``n_cls`` は ``classes`` や
+ラベル辞書から上書きしてよい
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Optional
+
+# 既定の乱数シード
+DEFAULT_SEED = 1
+# 既定の最大エポック数
+DEFAULT_MAX_EPOCHS = 100
+# 既定の学習率
+DEFAULT_LR = 1e-4
+# 既定の重み減衰（weight_decay）
+DEFAULT_REG = 0.0
+# 既定の学習率スケジューラ減衰係数
+DEFAULT_SCHEDULER_DECAY_RATE = 0.5
+# 既定の学習率スケジューラ忍耐エポック数
+DEFAULT_SCHEDULER_PATIENCE = 5
+# 既定の feature_type
+DEFAULT_FEATURE_TYPE = "mean"
+# 既定の入力特徴次元
+DEFAULT_IN_FEAT_DIM = 1024
+# 既定のアテンション中間次元
+DEFAULT_HIDDEN_FEAT_DIM = 256
+# 既定の特徴射影後の次元
+DEFAULT_OUT_FEAT_DIM = 512
+# 既定のズーム選択数 k
+DEFAULT_K_SAMPLE = 12
+# 既定の top-k 平滑化パラメータ（perturbed の sigma / fast_sparse の epsilon）
+DEFAULT_K_SIGMA = 0.002
+# 既定の top-k 手法名
+DEFAULT_TOPK_METHOD = "perturbed"
+# 既定の融合名
+DEFAULT_FUSION = "sum"
+# 既定のクラス数
+DEFAULT_N_CLS = 3
+# 既定の DataLoader ワーカ数
+DEFAULT_NUM_WORKERS = 4
+# 既定の save_metric
+DEFAULT_SAVE_METRIC = "loss"
+
+
+@dataclass
+class TrainConfig:
+    """学習 1 回分の設定
+
+    Attributes:
+        seed: 乱数シード
+        max_epochs: 最大エポック数
+        save_path: 出力先ディレクトリ
+        lr: 学習率
+        reg: 重み減衰（Adam の weight_decay）
+        scheduler_decay_rate: ReduceLROnPlateau の減衰係数
+        scheduler_patience: ReduceLROnPlateau の忍耐エポック数
+        feature_root: 特徴ルートディレクトリ
+        encoder: エンコーダ名
+        labels_csv: ``slide_id,label`` の CSV パス
+        magnifications: 倍率の列（低→高，倍率レイヤ順）
+        feature_type: ``"mean"`` / ``"cls"`` / ``"concat"``
+        classes: クラス名の並び（``None`` なら CSV から導く）
+        in_feat_dim: 入力特徴次元
+        hidden_feat_dim: アテンション中間次元
+        out_feat_dim: 特徴射影後の次元
+        drop_out: Dropout 率（``None`` なら Dropout なし）
+        k_sample: ズーム選択数 k
+        k_sigma: top-k 平滑化パラメータ
+        topk_method: top-k 手法名
+        fusion: 融合名
+        n_cls: クラス数
+        is_weighted_sampler: train で WeightedRandomSampler を使うか
+        num_workers: DataLoader ワーカ数
+        pin_memory: DataLoader の pin_memory
+        save_metric: best 保存基準（``"loss"`` / ``"f1"``）
+    """
+
+    seed: int = DEFAULT_SEED
+    max_epochs: int = DEFAULT_MAX_EPOCHS
+    save_path: Optional[str] = None
+
+    lr: float = DEFAULT_LR
+    reg: float = DEFAULT_REG
+    scheduler_decay_rate: float = DEFAULT_SCHEDULER_DECAY_RATE
+    scheduler_patience: int = DEFAULT_SCHEDULER_PATIENCE
+
+    feature_root: Optional[str] = None
+    encoder: Optional[str] = None
+    labels_csv: Optional[str] = None
+    magnifications: Optional[List[float]] = None
+    feature_type: str = DEFAULT_FEATURE_TYPE
+    classes: Optional[List[str]] = None
+
+    in_feat_dim: int = DEFAULT_IN_FEAT_DIM
+    hidden_feat_dim: int = DEFAULT_HIDDEN_FEAT_DIM
+    out_feat_dim: int = DEFAULT_OUT_FEAT_DIM
+    drop_out: Optional[float] = None
+    k_sample: int = DEFAULT_K_SAMPLE
+    k_sigma: float = DEFAULT_K_SIGMA
+    topk_method: str = DEFAULT_TOPK_METHOD
+    fusion: str = DEFAULT_FUSION
+    n_cls: int = DEFAULT_N_CLS
+
+    is_weighted_sampler: bool = True
+    num_workers: int = DEFAULT_NUM_WORKERS
+    pin_memory: bool = True
+    save_metric: str = DEFAULT_SAVE_METRIC

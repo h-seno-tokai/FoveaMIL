@@ -1,0 +1,41 @@
+# =============================================================================
+# FoveaMIL conda 環境 — CUDA 12.8（Blackwell 対応）
+#   対象GPU: Blackwell (RTX 50系, sm_120) / Ampere (RTX A6000, sm_86) ほか sm_70–120
+#   非対応 : Pascal (GTX 1080Ti, sm_61) → environment-cu118.yml を使う
+#   作成   : conda env create -f environments/environment-cu128.yml
+#            その後 PyTorch を CUDA 12.8 ビルドで pip 導入する（↓ NOTE）
+#   開発   : 続けて  pip install -e .   （foveamil を editable 導入）
+#   バージョンは検証済み環境の実値に固定する
+# =============================================================================
+name: foveamil-cu128
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+
+  # --- PyTorch は pip で CUDA 12.8 ビルドを別途導入する（↓ NOTE arch に sm_120 を含む）---
+
+  # --- コア依存 ---
+  - numpy=2.2.6
+  - scipy=1.17.0
+  - pandas=2.3.3
+  - scikit-learn=1.8.0
+  - matplotlib=3.10.8
+  - h5py=3.15.1
+  - pyyaml=6.0.3
+  - tensorboard=2.20.0
+  - psutil=7.2.1
+  - openslide=4.0.0
+
+  - pip
+  - pip:
+    - opencv-python==4.12.0.88
+    - openslide-python==1.4.3
+    - timm==1.0.24
+    - huggingface_hub==0.36.0
+    - pytest==8.3.5
+
+# NOTE: PyTorch は CUDA 12.8 ビルドを別途 pip 導入する（Blackwell sm_120 対応）
+#   conda env create のあと cu128 index から入れる:
+#     pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
+#   続けて  pip install -e .

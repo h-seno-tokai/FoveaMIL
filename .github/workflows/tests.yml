@@ -1,0 +1,55 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# テストは依存の重さで二段に分ける
+#   core: システムライブラリ不要（pip wheel のみ）で回る非 WSI テスト
+#   full: OpenSlide / libGL を入れて WSI 経路を含む全テスト
+# core 除外分は foveamil.visualization / preprocessing.features 経由で OpenSlide を
+# import するため システムライブラリが要る
+jobs:
+  core:
+    name: core (no system libraries)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install CPU PyTorch
+        run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      - name: Install package
+        run: pip install -e ".[dev]"
+      - name: Run non-WSI tests
+        run: |
+          pytest tests/ -v \
+            --ignore=tests/test_features.py \
+            --ignore=tests/test_viz_cases.py \
+            --ignore=tests/test_viz_geometry.py \
+            --ignore=tests/test_viz_illuminate.py \
+            --ignore=tests/test_viz_loader.py \
+            --ignore=tests/test_viz_region_reader.py
+
+  full:
+    name: full (with OpenSlide)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y openslide-tools libgl1
+      - name: Install CPU PyTorch
+        run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      - name: Install package
+        run: pip install -e ".[dev]"
+      - name: Run full test suite
+        run: pytest tests/ -v

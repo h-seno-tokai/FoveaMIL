@@ -1,0 +1,44 @@
+# 11 クラス（FL グレード分割を主眼）向け sweep 設定
+# foveamil-sweep --config configs/sweep_11class_virchow2.yaml --out experiments/11class_virchow2 --weights-out /path/to/weights
+# Virchow2 の cls / concat のみ（探索が効くかを高倍率で検証する用）
+# 展開数: feature_type(2) × magnifications(2) × topk_method(2) × k_sample(3) × k_sigma(2) = 48 combo
+#         × 10 fold = 480 job lr / drop_out を広げると比例して増える
+
+# 解決の起点
+resolve:
+  n_cls: 11                       # labels_11class.csv と splits/11class/ を解決
+  folds: 10                       # 推奨 10
+  feature_root: ${FEATURE_ROOT}   # 特徴ルートの base .env で渡す
+  cohort_root: cohort
+
+# 展開する軸
+sweep:
+  encoder: [Virchow2]
+  feature_type: [cls, concat]     # Virchow2 は has_cls=True 両方有効 concat は次元 2 倍(2560)
+  # 倍率セットが探索の核 高倍率まで含めるほど高倍率パッチ選定の余地が増える
+  # 低→高の順 先頭が base(低倍率で全ロード) 以降が選定で拡大する候補
+  magnifications:
+    - [2.5, 5.0, 10.0]
+    - [1.25, 2.5, 5.0, 10.0, 20.0, 40.0]
+  topk_method: [perturbed]
+  k_sample: [8, 15, 25]           # ズーム選択数 k
+  k_sigma: [0.002, 0.005]         # top-k 平滑化
+  lr: [1.0e-4]                    # 広げる場合は [1.0e-4, 1.0e-3]
+  drop_out: [0.6]                 # 広げる場合は [0.3, 0.6, 0.7]
+  fusion: [sum]
+
+# 全 combo 共通スカラ
+fixed:
+  seed: 42
+  max_epochs: 50
+  scheduler_patience: 10
+  scheduler_decay_rate: 0.8
+  reg: 1.0e-4
+  save_metric: f1
+  is_weighted_sampler: true       # クラス不均衡(11クラスは偏りあり)に対応
+  num_workers: 1
+
+# 並列実行 環境に合わせて上書き（--gpu-ids / --jobs-per-gpu）
+parallel:
+  gpu_ids: [0, 1, 2]
+  jobs_per_gpu: 36

@@ -1,0 +1,44 @@
+# FoveaMIL sweep の設定例
+# foveamil-sweep --config configs/sweep.example.yaml --out /path/to/out --weights-out /path/to/weights
+# 4 ブロック: resolve（解決の起点）/ sweep（展開する軸）/ fixed（共通スカラ）/ parallel（制御）
+# in_feat_dim / feature_root（完全形）/ labels_csv / splits_dir は自動解決されるため書かない
+# feature_root は base のみ与える（encoder と倍率は自動付与）
+
+# 解決の起点（スカラ）
+resolve:
+  n_cls: 11                  # labels_{N}class.csv と splits/{N}class/ を解決
+  folds: 10                  # 5 か 10 のみ 推奨 10
+  feature_root: ${FEATURE_ROOT}   # 特徴ルートの base .env か環境変数で与える
+  cohort_root: cohort        # labels/ と splits/ を含むコホートルート
+
+# 展開する軸（リスト→展開）
+sweep:
+  # encoder と feature_type は直積でなく妥当な組合せのみ（cls/concat は cls を持つ encoder のみ）
+  encoder: [ResNet50, UNI2-h, Virchow2, Virchow2-mini-dinov2]
+  feature_type: [mean, cls, concat]
+  # 倍率セット自体を軸にする場合は list-of-lists 単一セットなら 1 つの list
+  magnifications:
+    - [1.25, 2.5]
+    - [1.25, 2.5, 5.0]
+  lr: [1.0e-4, 1.0e-3]
+  topk_method: [perturbed, fast_sparse]
+  drop_out: [0.3, 0.6, 0.7]
+  k_sample: [8, 15, 25]
+  k_sigma: [0.002, 0.005]
+  fusion: [sum]
+
+# 全 combo 共通スカラ（TrainConfig フィールド）
+fixed:
+  seed: 42
+  max_epochs: 150
+  scheduler_patience: 30
+  scheduler_decay_rate: 0.8
+  reg: 1.0e-4
+  save_metric: f1
+  is_weighted_sampler: true
+  num_workers: 1
+
+# 並列実行（展開対象外 CLI の --gpu-ids / --jobs-per-gpu で上書き可）
+parallel:
+  gpu_ids: [0, 1, 2, 3]
+  jobs_per_gpu: 12
