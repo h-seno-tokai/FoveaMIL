@@ -90,6 +90,7 @@ def test_default_config_activates_no_regularizers():
     assert iter_active_regularizers(TrainConfig()) == []
     # 登録済み具体項は自動探索で読み込まれる
     assert "decorrelation" in available_regularizers()
+    assert "dpp_diversity" in available_regularizers()
 
 
 def test_forward_context_holds_m_list():

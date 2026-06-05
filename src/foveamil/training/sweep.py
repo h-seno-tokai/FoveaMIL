@@ -72,6 +72,19 @@ INSTANCE_PARAM_KEYS = ("bag_weight", "inst_k", "inst_subtyping")
 DECORRELATION_WEIGHT_KEY = "decorrelation_weight"
 # decorrelation_weight 有効時のみ意味を持つキー（無効時は無関係）
 DECORRELATION_PARAM_KEYS = ("decorrelation_method",)
+# 選択コントローラ名キー
+SELECTOR_KEY = "selector"
+# DPP 選択コントローラ名
+SELECTOR_DPP = "dpp"
+# selector=="dpp" かつ多倍率でのみ意味を持つキー（他では無関係）
+DPP_PARAM_KEYS = (
+    "dpp_similarity",
+    "dpp_temperature",
+    "dpp_quality_beta",
+    "dpp_rbf_gamma",
+    "dpp_use_gumbel",
+    "dpp_diversity_weight",
+)
 # 単一倍率を表す倍率数
 SINGLE_MAG = 1
 # 自動解決されるため設定に手書きを許さないキー
@@ -235,11 +248,14 @@ def _canonicalize_conditional(
     """構成に無関係な条件付きパラメータを既定値へ畳む
 
     ``instance_loss`` は単一倍率のみ有効（多倍率では既定の無効へ畳み単一倍率では真偽値へ
-    正規化する）ズーム系（``k_sample`` / ``k_sigma`` / ``topk_method`` / ``aux_norm``）は
-    多倍率のみ有効（単一倍率では畳む）``aux_norm_temperature`` / ``aux_norm_alpha`` は対応する
-    ``aux_norm`` 値（``temperature`` / ``entmax``）かつ多倍率のときのみ意味を持つ（他では畳む）
-    instance 系（``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は ``instance_loss`` 有効時の
-    み意味を持つ（無効時は畳む）``decorrelation_weight`` は多倍率のみ有効（単一倍率では畳む）
+    正規化する）ズーム系（``k_sample`` / ``k_sigma`` / ``topk_method`` / ``aux_norm`` /
+    ``selector``）は多倍率のみ有効（単一倍率では畳む）``aux_norm_temperature`` /
+    ``aux_norm_alpha`` は対応する ``aux_norm`` 値（``temperature`` / ``entmax``）かつ多倍率の
+    ときのみ意味を持つ（他では畳む）DPP 系（``dpp_similarity`` / ``dpp_temperature`` /
+    ``dpp_quality_beta`` / ``dpp_rbf_gamma`` / ``dpp_use_gumbel`` / ``dpp_diversity_weight``）は
+    ``selector=="dpp"`` かつ多倍率のときのみ意味を持つ（他では畳む）instance 系
+    （``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は ``instance_loss`` 有効時のみ意味を持つ
+    （無効時は畳む）``decorrelation_weight`` は多倍率のみ有効（単一倍率では畳む）
     ``decorrelation_method`` は ``decorrelation_weight`` が正のときのみ意味を持つ（0 では畳む）
     畳んだキーは ``axis_values`` から落とし集計・表に載せない明示値を捨てたキー集合を返す（警告用）
     """
@@ -262,8 +278,15 @@ def _canonicalize_conditional(
                 discarded.add(key)
         if _disable_param(config, axis_values, defaults, DECORRELATION_WEIGHT_KEY):
             discarded.add(DECORRELATION_WEIGHT_KEY)
+        if _disable_param(config, axis_values, defaults, SELECTOR_KEY):
+            discarded.add(SELECTOR_KEY)
     for key, required_aux_norm in AUX_NORM_PARAM_KEYS.items():
         if single_mag or aux_norm != required_aux_norm:
+            if _disable_param(config, axis_values, defaults, key):
+                discarded.add(key)
+    dpp_on = config.get(SELECTOR_KEY, defaults[SELECTOR_KEY]) == SELECTOR_DPP
+    if single_mag or not dpp_on:
+        for key in DPP_PARAM_KEYS:
             if _disable_param(config, axis_values, defaults, key):
                 discarded.add(key)
     if not instance_on:

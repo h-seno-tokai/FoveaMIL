@@ -71,6 +71,8 @@ AUX_NORM_ENTMAX = "entmax"
 # 各正規化器が取る追加引数のキー
 AUX_NORM_TEMPERATURE_KEY = "temperature"
 AUX_NORM_ALPHA_KEY = "alpha"
+# DPP 選択コントローラ名
+SELECTOR_DPP = "dpp"
 # last モデルの接尾辞
 LAST_SUFFIX = "last"
 # 評価する split 名
@@ -142,7 +144,20 @@ def _aux_norm_kwargs(config: TrainConfig) -> dict:
 
 
 def _selector_kwargs(config: TrainConfig) -> dict:
-    """選択コントローラへ渡す追加引数を設定から組み立てる（既定は空）"""
+    """選択コントローラへ渡す追加引数を設定から組み立てる
+
+    ``selector=="dpp"`` なら ``similarity`` / ``temperature`` / ``quality_beta`` /
+    ``rbf_gamma`` / ``use_gumbel`` を返すそれ以外は空辞書を返す（既定 top-k は追加引数を
+    持たない）
+    """
+    if config.selector == SELECTOR_DPP:
+        return {
+            "similarity": config.dpp_similarity,
+            "temperature": config.dpp_temperature,
+            "quality_beta": config.dpp_quality_beta,
+            "rbf_gamma": config.dpp_rbf_gamma,
+            "use_gumbel": config.dpp_use_gumbel,
+        }
     return {}
 
 
@@ -341,6 +356,7 @@ class Trainer:
             M_list: List[Tensor] = []
             selections: List[Optional[Dict[str, Tensor]]] = []
             layer_aux: List[Optional[Tensor]] = []
+            dpp_log_dets: List[Tensor] = []
             x = base_feats.to(self.device)
             global_idx = None
             for layer_idx in range(self.num_layers):
@@ -349,6 +365,10 @@ class Trainer:
                 )
                 M_list.append(M)
                 layer_aux.append(aux)
+                # DPP 選択コントローラなら選択部分カーネル log-det を排出して文脈へ積む
+                log_det = self._pop_selector_log_det()
+                if log_det is not None:
+                    dpp_log_dets.append(log_det)
                 if layer_idx >= self.num_layers - 1:
                     selections.append(None)
                     continue
@@ -375,11 +395,21 @@ class Trainer:
                 global_idx = child
             logits, Y_hat, Y_prob = self.model.forward_final(M_list)
             context = ForwardContext(
-                m_list=M_list, selections=selections, layer_aux=layer_aux
+                m_list=M_list,
+                selections=selections,
+                layer_aux=layer_aux,
+                dpp_log_dets=dpp_log_dets,
             )
             return logits, Y_hat, Y_prob, context
         finally:
             accessor.close()
+
+    def _pop_selector_log_det(self):
+        """選択コントローラが log-det を保持していれば取り出す（無ければ ``None``）"""
+        pop = getattr(self.model.selector, "pop_log_det", None)
+        if pop is None:
+            return None
+        return pop()
 
     def _regularizer_loss(self, context: ForwardContext, label: Tensor):
         """有効な正則化項と寄与損失を合算する（``regularizer_loss`` へ委譲する）"""

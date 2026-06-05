@@ -362,6 +362,63 @@ def test_multi_mag_keeps_aux_norm_axis():
     assert "aux_norm" in varying_axis_keys(combos)
 
 
+def test_dpp_params_collapse_when_selector_not_dpp():
+    # selector 既定 topk -> dpp 系は無関係なので畳んで統合する
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        dpp_temperature=[0.5, 1.0],
+        dpp_similarity=["cosine", "rbf"],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs のみ dpp 系は畳まれる
+    keys = varying_axis_keys(combos)
+    assert "dpp_temperature" not in keys and "dpp_similarity" not in keys
+    for c in combos:
+        assert c.config["dpp_temperature"] == 1.0  # DEFAULT_DPP_TEMPERATURE
+        assert c.config["dpp_similarity"] == "cosine"  # DEFAULT_DPP_SIMILARITY
+
+
+def test_dpp_params_kept_when_dpp_multi_mag():
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]], selector=["dpp"], dpp_temperature=[0.5, 1.0]
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 20  # 10 pairs * 2 dpp_temperature
+    assert {c.config["dpp_temperature"] for c in combos} == {0.5, 1.0}
+    assert "dpp_temperature" in varying_axis_keys(combos)
+
+
+def test_dpp_params_collapse_for_single_magnification():
+    # 単一倍率では選択自体が無効なので dpp 系も畳む
+    sweep = _base_sweep(
+        magnifications=[[40]], selector=["dpp"], dpp_diversity_weight=[0.0, 0.1]
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10
+    keys = varying_axis_keys(combos)
+    assert "dpp_diversity_weight" not in keys
+    for c in combos:
+        assert c.config["dpp_diversity_weight"] == 0.0  # DEFAULT_DPP_DIVERSITY_WEIGHT
+
+
+def test_selector_collapses_for_single_magnification():
+    # 単一倍率では選択が走らず topk/dpp は挙動同一なので selector 軸を畳む
+    sweep = _base_sweep(magnifications=[[40]], selector=["topk", "dpp"])
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10
+    assert "selector" not in varying_axis_keys(combos)
+    for c in combos:
+        assert c.config["selector"] == "topk"  # DEFAULT_SELECTOR
+
+
+def test_selector_kept_as_axis_for_multi_magnification():
+    # 多倍率では selector を on/off 軸として保持する
+    sweep = _base_sweep(magnifications=[[1.25, 2.5]], selector=["topk", "dpp"])
+    combos = expand_combos(sweep, {}, _resolved())
+    assert {c.config["selector"] for c in combos} == {"topk", "dpp"}
+    assert "selector" in varying_axis_keys(combos)
+
+
 def _write_fold(combo_dir, fold, val_auc, test_auc):
     fold_dir = os.path.join(combo_dir, f"fold{fold}")
     os.makedirs(fold_dir, exist_ok=True)
