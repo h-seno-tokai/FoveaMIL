@@ -44,6 +44,12 @@ DEFAULT_SELECTOR = "topk"
 DEFAULT_DPP_SIMILARITY = "cosine"
 # 既定の DPP 緩和温度（soft argmax / Gumbel-softmax）
 DEFAULT_DPP_TEMPERATURE = 1.0
+# 既定の DPP 品質スケール q_i = exp(beta·scores_i)
+DEFAULT_DPP_QUALITY_BETA = 1.0
+# 既定の DPP RBF 帯域（similarity=="rbf" 時のみ）
+DEFAULT_DPP_RBF_GAMMA = 1.0
+# 既定の DPP Gumbel 利用（学習時の確率的選択）
+DEFAULT_DPP_USE_GUMBEL = False
 # 既定の DPP 多様性正則化重み（0 で無効）
 DEFAULT_DPP_DIVERSITY_WEIGHT = 0.0
 # 既定の融合名
@@ -93,6 +99,9 @@ class TrainConfig:
         selector: 選択コントローラ名（単一倍率では無効）
         dpp_similarity: DPP 類似度名（``"cosine"`` / ``"rbf"``，``selector=="dpp"`` 時のみ）
         dpp_temperature: DPP 緩和温度（``selector=="dpp"`` 時のみ）
+        dpp_quality_beta: DPP 品質スケール ``q_i = exp(beta·scores_i)``（``selector=="dpp"`` 時のみ）
+        dpp_rbf_gamma: DPP RBF 帯域（``selector=="dpp"`` かつ ``dpp_similarity=="rbf"`` 時のみ）
+        dpp_use_gumbel: DPP 学習時に Gumbel 雑音で確率的に選ぶか（``selector=="dpp"`` 時のみ）
         dpp_diversity_weight: DPP 多様性正則化の重み（0 で無効，``selector=="dpp"`` 多倍率時のみ）
         fusion: 融合名
         instance_loss: インスタンス補助損失を加えるか（単一倍率のみ）
@@ -133,6 +142,9 @@ class TrainConfig:
     selector: str = DEFAULT_SELECTOR
     dpp_similarity: str = DEFAULT_DPP_SIMILARITY
     dpp_temperature: float = DEFAULT_DPP_TEMPERATURE
+    dpp_quality_beta: float = DEFAULT_DPP_QUALITY_BETA
+    dpp_rbf_gamma: float = DEFAULT_DPP_RBF_GAMMA
+    dpp_use_gumbel: bool = DEFAULT_DPP_USE_GUMBEL
     dpp_diversity_weight: float = DEFAULT_DPP_DIVERSITY_WEIGHT
     fusion: str = DEFAULT_FUSION
     instance_loss: bool = DEFAULT_INSTANCE_LOSS

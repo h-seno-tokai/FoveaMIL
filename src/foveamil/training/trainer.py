@@ -110,13 +110,17 @@ def _aux_norm_kwargs(config: TrainConfig) -> dict:
 def _selector_kwargs(config: TrainConfig) -> dict:
     """選択コントローラへ渡す追加引数を設定から組み立てる
 
-    ``selector=="dpp"`` なら ``{"similarity": ..., "temperature": ...}`` を返す
-    それ以外は空辞書を返す（既定 top-k は追加引数を持たない）
+    ``selector=="dpp"`` なら ``similarity`` / ``temperature`` / ``quality_beta`` /
+    ``rbf_gamma`` / ``use_gumbel`` を返すそれ以外は空辞書を返す（既定 top-k は追加引数を
+    持たない）
     """
     if config.selector == SELECTOR_DPP:
         return {
             "similarity": config.dpp_similarity,
             "temperature": config.dpp_temperature,
+            "quality_beta": config.dpp_quality_beta,
+            "rbf_gamma": config.dpp_rbf_gamma,
+            "use_gumbel": config.dpp_use_gumbel,
         }
     return {}
 

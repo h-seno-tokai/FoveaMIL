@@ -64,7 +64,14 @@ SELECTOR_KEY = "selector"
 # DPP 選択コントローラ名
 SELECTOR_DPP = "dpp"
 # selector=="dpp" かつ多倍率でのみ意味を持つキー（他では無関係）
-DPP_PARAM_KEYS = ("dpp_similarity", "dpp_temperature", "dpp_diversity_weight")
+DPP_PARAM_KEYS = (
+    "dpp_similarity",
+    "dpp_temperature",
+    "dpp_quality_beta",
+    "dpp_rbf_gamma",
+    "dpp_use_gumbel",
+    "dpp_diversity_weight",
+)
 # 単一倍率を表す倍率数
 SINGLE_MAG = 1
 # 自動解決されるため設定に手書きを許さないキー
@@ -230,8 +237,9 @@ def _canonicalize_conditional(
     ``instance_loss`` は単一倍率のみ有効（多倍率では既定の無効へ畳み単一倍率では真偽値へ
     正規化する）ズーム系（``k_sample`` / ``k_sigma`` / ``topk_method``）は多倍率のみ有効
     （単一倍率では畳む）``selector`` と DPP 系（``dpp_similarity`` / ``dpp_temperature`` /
-    ``dpp_diversity_weight``）は多倍率時のみ意味を持ち，DPP 系はさらに ``selector=="dpp"``
-    時のみ意味を持つ（単一倍率や非 DPP では畳む）
+    ``dpp_quality_beta`` / ``dpp_rbf_gamma`` / ``dpp_use_gumbel`` / ``dpp_diversity_weight``）
+    は多倍率時のみ意味を持ち，DPP 系はさらに ``selector=="dpp"`` 時のみ意味を持つ（単一倍率
+    や非 DPP では畳む）
     instance 系（``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は ``instance_loss`` 有効時
     のみ意味を持つ（無効時は畳む）畳んだキーは ``axis_values`` から落とし集計・表に載せない
     明示値を捨てたキー集合を返す（警告用）

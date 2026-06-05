@@ -140,6 +140,45 @@ def test_dpp_deterministic_with_seed():
     assert torch.allclose(a, b)
 
 
+def test_dpp_train_mode_distinct_argmax_covers_clusters():
+    # 学習（soft）モードでも k 個の argmax は相異なり全クラスタを被覆する（D1 ガード）
+    scores, features, cluster_of = _planted_clusters()
+    dpp = build_selection_controller(
+        "dpp", k=PLANTED_CLUSTERS, similarity="cosine", temperature=1.0
+    )
+    dpp.train()
+    sel = dpp.select(scores, features)
+    idx = sel.argmax(dim=-1)[0].tolist()
+    assert len(set(idx)) == PLANTED_CLUSTERS
+    assert _covered_clusters(sel, cluster_of) == set(range(PLANTED_CLUSTERS))
+
+
+def test_dpp_pop_log_det_finite_in_train_mode():
+    # 学習モードの forward 後でも pop_log_det が有限（D2 ガード）
+    scores, features, _ = _planted_clusters()
+    dpp = build_selection_controller("dpp", k=PLANTED_CLUSTERS, temperature=1.0)
+    dpp.train()
+    dpp.select(scores, features)
+    log_det = dpp.pop_log_det()
+    assert log_det is not None
+    assert torch.isfinite(log_det).all()
+
+
+def test_dpp_select_does_not_perturb_global_rng():
+    # seed 付き select は global RNG を汚さない（D3 ガード）
+    scores, features, _ = _planted_clusters()
+    dpp = build_selection_controller(
+        "dpp", k=PLANTED_CLUSTERS, use_gumbel=True, temperature=1.0, seed=123
+    )
+    dpp.train()
+    torch.manual_seed(999)
+    before = torch.rand(5)
+    dpp.select(scores, features)
+    torch.manual_seed(999)
+    after = torch.rand(5)
+    assert torch.allclose(before, after)
+
+
 def test_dpp_log_det_decreases_with_similarity():
     scores, features, _ = _planted_clusters()
     dpp = build_selection_controller("dpp", k=PLANTED_CLUSTERS, temperature=SHARP_TEMP)
@@ -241,6 +280,39 @@ def test_foveamil_dpp_forward_backward_smoke():
         float(p.grad.abs().sum()) for p in model.parameters() if p.grad is not None
     )
     assert grad_sum > 0.0
+
+
+def test_selector_kwargs_forwards_all_dpp_knobs():
+    # config の DPP ノブが selector_kwargs 経由でコントローラへ渡る（D4 ガード）
+    from foveamil.training.trainer import _selector_kwargs
+
+    config = _cfg(
+        selector="dpp",
+        magnifications=[1.25, 2.5],
+        dpp_similarity="rbf",
+        dpp_temperature=0.3,
+        dpp_quality_beta=2.0,
+        dpp_rbf_gamma=0.5,
+        dpp_use_gumbel=True,
+    )
+    kwargs = _selector_kwargs(config)
+    assert kwargs == {
+        "similarity": "rbf",
+        "temperature": 0.3,
+        "quality_beta": 2.0,
+        "rbf_gamma": 0.5,
+        "use_gumbel": True,
+    }
+    dpp = build_selection_controller("dpp", k=2, **kwargs)
+    assert dpp.quality_beta == 2.0
+    assert dpp.rbf_gamma == 0.5
+    assert dpp.use_gumbel is True
+
+
+def test_selector_kwargs_empty_for_topk():
+    from foveamil.training.trainer import _selector_kwargs
+
+    assert _selector_kwargs(_cfg(selector="topk", magnifications=[1.25, 2.5])) == {}
 
 
 def test_default_selector_topk_bit_identical():

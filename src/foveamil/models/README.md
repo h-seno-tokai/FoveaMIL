@@ -57,7 +57,7 @@
 - `base.py`: `SelectionController(nn.Module)` 抽象基底．`k` を保持し，`select(scores, features) -> [B, k, N]` を実装する．
 - `topk_controller.py`: `TopKSelectionController(k, topk_method, topk_kwargs)`．`build_topk` の微分可能 top-k をスコアに適用する既定コントローラ（特徴は未使用）．
 - `dpp.py`: `DPPSelectionController(k, similarity="cosine", temperature=1.0, quality_beta=1.0, rbf_gamma=1.0, use_gumbel=False, seed=None)`．品質 `q_i = exp(beta·scores_i)` と類似度 `k(z_i, z_j)`（`cosine` / `rbf`）から DPP カーネル `L_ij = q_i q_j k(z_i, z_j)` を張り，サイズ k の部分集合を貪欲 MAP（Chen et al. 2018）で選ぶ．各段の条件付き限界利得に対する argmax を温度付き soft argmax / Gumbel-softmax（`use_gumbel=True`）で緩和し，学習時は soft な選択行列，推論時は hard な one-hot 行を返す．勾配がアテンション（品質）と特徴射影（多様性）の双方へ流れ，密な高品質クラスタへ偏る top-k と違い各クラスタから 1 点ずつ拾う傾向を持つ．`k` が `N` を超える場合は `min(N, k)` に丸める．`pop_log_det()` で直近 forward の選択部分カーネル log-det を取り出せる（多様性正則化が参照する）．Kulesza & Taskar 2012，Chen et al. NeurIPS 2018，Jang et al. ICLR 2017 に基づく．
-- 公開 API：`build_selection_controller(name, k, topk_method="perturbed", topk_kwargs=None, **kwargs) -> SelectionController`．レジストリ `SELECTION_CONTROLLERS` から構築する．未登録名は `KeyError`．`"dpp"` のとき `_selector_kwargs` 経由で `similarity` / `temperature` が渡る．
+- 公開 API：`build_selection_controller(name, k, topk_method="perturbed", topk_kwargs=None, **kwargs) -> SelectionController`．レジストリ `SELECTION_CONTROLLERS` から構築する．未登録名は `KeyError`．`"dpp"` のとき `_selector_kwargs` 経由で `similarity` / `temperature` / `quality_beta` / `rbf_gamma` / `use_gumbel` が渡る．
 - 登録済み：`"topk"`，`"dpp"`．
 - 追加方法：`selection/` に新ファイルを作り，`SelectionController` を継承して `@register_selection_controller("name")` を付ける（自動探索で読み込まれる）．
 

@@ -2,12 +2,10 @@
 
 品質と多様性を同時に測る決定点過程（DPP）のカーネル ``L_ij = q_i q_j k(z_i, z_j)``
 を候補上に張る品質 ``q_i`` は正規化済み補助アテンション ``scores`` から，類似度 ``k``
-は射影特徴 ``features`` から作るサイズ k の部分集合を貪欲 MAP（Chen et al. 2018）で
-選び，各段の条件付き限界利得（残差ノルム）に対する argmax を温度付き soft argmax /
-Gumbel-softmax で緩和して学習時に連続化する推論時は hard な貪欲 MAP で one-hot 行を
-返すこれにより品質（アテンション）と多様性（特徴射影）の双方へ勾配が流れ，密な
-高品質クラスタへ偏る top-k と違い各クラスタから 1 点ずつ拾う傾向を持つ
-Kulesza & Taskar 2012Chen et al. NeurIPS 2018Jang et al. ICLR 2017 に基づく
+は射影特徴 ``features`` から作るサイズ k の部分集合を貪欲 MAP で選び，各段で選んだ
+index を温度付き soft one-hot で緩和して学習時に連続化する推論時は hard な one-hot 行を
+返す各段の選択 index は no_grad で hard に決め，その index で残差（Cholesky 因子）を
+更新する一方，返す行は同 index を中心とする soft one-hot とし品質・特徴双方へ勾配を流す
 """
 
 from __future__ import annotations
@@ -41,6 +39,10 @@ _EPS = 1e-10
 _NORM_EPS = 1e-8
 # 既選択をマスクするための大きな負の値
 _NEG_INF = -1e9
+# log-det 安定化のため対角の大きさへ比例させるジッタ係数
+_LOGDET_JITTER = 1e-4
+# soft one-hot が hard one-hot とみなせる閾値（既選択判定）
+_CHOSEN_THRESHOLD = 0.5
 
 
 def cosine_similarity_matrix(features: Tensor) -> Tensor:
@@ -77,30 +79,38 @@ def build_dpp_kernel(
     return quality.unsqueeze(-1) * similarity * quality.unsqueeze(-2)
 
 
-def _soft_onehot(
+def _masked_logits(
     gains: Tensor,
     chosen_mask: Tensor,
     temperature: float,
-    hard: bool,
     use_gumbel: bool,
+    generator: Optional[torch.Generator],
 ) -> Tensor:
-    """限界利得 ``gains [B, N]`` から 1 段ぶんの選択ベクトル ``[B, N]`` を作る
+    """限界利得 ``gains [B, N]`` を温度で割り既選択をマスクしたロジット ``[B, N]`` を作る
 
-    既選択（``chosen_mask`` が真）を ``-inf`` でマスクし，温度付き softmax で緩和した
-    one-hot 風ベクトルを返す``hard`` 時は argmax の hard one-hot を straight-through
-    で返す``use_gumbel`` 時は Gumbel 雑音を加える（学習時の確率的探索）
+    既選択（``chosen_mask`` が真）を ``-inf`` でマスクする``use_gumbel`` 時は Gumbel
+    雑音を加える（``generator`` で標本の決定性を保つ）
     """
     logits = gains / temperature
     logits = logits.masked_fill(chosen_mask, _NEG_INF)
-    if use_gumbel and not hard:
-        uniform = torch.rand_like(logits).clamp_min(_EPS)
+    if use_gumbel:
+        uniform = torch.rand(
+            logits.shape, generator=generator, device=logits.device, dtype=logits.dtype
+        ).clamp_min(_EPS)
         gumbel = -torch.log((-torch.log(uniform)).clamp_min(_EPS))
         logits = logits + gumbel
+    return logits
+
+
+def _soft_onehot_at(logits: Tensor, index: Tensor) -> Tensor:
+    """選択 index を中心とする 1 段ぶんの選択ベクトル ``[B, N]`` を作る
+
+    前向きの値は ``index`` の hard one-hot に一致させ（straight-through），勾配は温度付き
+    softmax を通して品質・特徴へ流す``logits`` は温度反映済みとし``[B, 1]`` の ``index``
+    は呼び出し側が no_grad で hard に決め，残差更新と返す行の中心を一致させる
+    """
+    hard_vec = torch.zeros_like(logits).scatter_(-1, index, 1.0)
     soft = F.softmax(logits, dim=-1)
-    if not hard:
-        return soft
-    index = soft.argmax(dim=-1, keepdim=True)
-    hard_vec = torch.zeros_like(soft).scatter_(-1, index, 1.0)
     return hard_vec + (soft - soft.detach())
 
 
@@ -109,10 +119,9 @@ class DPPSelectionController(SelectionController):
     """品質と多様性を測る微分可能 k-DPP の選択コントローラ
 
     品質 ``q_i`` を正規化済み補助アテンション，類似度を射影特徴から作り，DPP カーネル
-    の貪欲 MAP（Chen et al. 2018）でサイズ k の部分集合を選ぶ各段の条件付き限界利得
-    に対する argmax を温度付き soft argmax / Gumbel-softmax で緩和し，学習時は soft な
-    選択行列，推論時は hard な one-hot 行を返す``k`` が ``N`` を超える場合は ``min(N, k)``
-    に丸める
+    の貪欲 MAP でサイズ k の部分集合を選ぶ各段の条件付き限界利得に対する argmax を温度付き
+    soft argmax / Gumbel-softmax で緩和し，学習時は soft な選択行列，推論時は hard な
+    one-hot 行を返す``k`` が ``N`` を超える場合は ``min(N, k)`` に丸める
 
     Args:
         k: 選択する要素数
@@ -148,6 +157,8 @@ class DPPSelectionController(SelectionController):
         self.rbf_gamma = rbf_gamma
         self.use_gumbel = use_gumbel
         self.seed = seed
+        # Gumbel 標本専用の乱数生成器（global RNG を汚さない select の入力デバイスで作る）
+        self._gen: Optional[torch.Generator] = None
         # 直近 forward の選択部分カーネルの log-det（多様性正則化が排出する）
         self._last_log_det: Optional[Tensor] = None
 
@@ -167,7 +178,8 @@ class DPPSelectionController(SelectionController):
 
         各行の argmax で選択 index 集合 ``S`` を決め（非微分），``L`` から ``L_S = L[S, S]``
         を取り出してその log-det を返すカーネル要素（品質・類似度）に対して微分可能で，
-        多様な（互いに非類似な）選択ほど log-det が大きい対角へ微小量を足し数値安定化する
+        多様な（互いに非類似な）選択ほど log-det が大きい対角へ大きさ比例のジッタを足し，
+        符号付き ``slogdet`` で数値安定に評価する
 
         Args:
             kernel: DPP カーネル ``[B, N, N]``
@@ -185,15 +197,24 @@ class DPPSelectionController(SelectionController):
         col_index = indices.unsqueeze(-2).expand(-1, k, -1)
         sub = rows.gather(2, col_index)
         eye = torch.eye(k, device=sub.device, dtype=sub.dtype)
-        sub = sub + _EPS * eye
-        return torch.logdet(sub).mean()
+        diag_scale = torch.diagonal(sub, dim1=-2, dim2=-1).abs().mean(
+            dim=-1, keepdim=True
+        ).clamp_min(_EPS)
+        jitter = (_LOGDET_JITTER * diag_scale).unsqueeze(-1)
+        sub = sub + jitter * eye
+        sign, logabsdet = torch.linalg.slogdet(sub)
+        # 正定値なら sign>0 でそのまま，非正の符号は数値由来として log-det を 0 へ寄せる
+        logabsdet = torch.where(sign > 0, logabsdet, torch.zeros_like(logabsdet))
+        return logabsdet.mean()
 
     def _greedy_map(self, kernel: Tensor, k: int, hard: bool) -> Tensor:
-        """貪欲 MAP（Chen et al. 2018）でサイズ k の選択行列 ``[B, k, N]`` を作る
+        """貪欲 MAP でサイズ k の選択行列 ``[B, k, N]`` を作る
 
-        各段で条件付き限界利得（残差分散 ``d_i^2``）を計算し，その argmax を soft /
-        hard に緩和した選択ベクトルを 1 行として積む選んだ要素の Cholesky 因子
-        ``c`` を漸進更新し ``d_i^2 -= c_i^2`` で残差を縮める既選択はマスクする
+        各段で条件付き限界利得（残差分散 ``d_i^2``）を計算し，その argmax の index を
+        no_grad で hard に決める残差（Cholesky 因子 ``c``）はその hard index に対して
+        厳密に更新し ``d_i^2 -= c_i^2`` で縮める既選択はマスクし k 個の hard index は
+        相異なる返す行は同 index を中心とする温度付き soft one-hot（学習時）または hard
+        one-hot（推論時）で，品質・特徴双方へ勾配を流す
         """
         batch_size, num_elements, _ = kernel.shape
         device = kernel.device
@@ -207,25 +228,29 @@ class DPPSelectionController(SelectionController):
         rows = []
         for _ in range(k):
             gains = torch.log(d2.clamp_min(_EPS))
-            row = _soft_onehot(
-                gains, chosen_mask, self.temperature, hard, self.use_gumbel
+            logits = _masked_logits(
+                gains, chosen_mask, self.temperature, self.use_gumbel, self._gen
             )
-            rows.append(row)
-            # 選択ベクトルで該当列を集約し Cholesky 因子を漸進更新する
-            l_col = torch.einsum("bn,bmn->bm", row, kernel)
+            # 選択 index は no_grad で hard に決め，残差更新と返す行の中心へ共用する
+            with torch.no_grad():
+                index = logits.argmax(dim=-1, keepdim=True)
+            sel = torch.zeros_like(logits).scatter_(-1, index, 1.0)
+            rows.append(sel if hard else _soft_onehot_at(logits, index))
+            # hard index の列で Cholesky 因子を厳密更新する（soft 平均を使わない）
+            l_col = torch.einsum("bn,bmn->bm", sel, kernel)
             if cis:
                 prev_factors = torch.stack(cis, dim=1)
-                prev = torch.einsum("bsn,bn->bs", prev_factors, row)
+                prev = torch.einsum("bsn,bn->bs", prev_factors, sel)
                 proj = torch.einsum("bsm,bs->bm", prev_factors, prev)
             else:
                 proj = torch.zeros_like(l_col)
             denom = torch.sqrt(
-                (d2 * row).sum(dim=-1, keepdim=True).clamp_min(_EPS)
+                (d2 * sel).sum(dim=-1, keepdim=True).clamp_min(_EPS)
             )
             ci = (l_col - proj) / denom
             cis.append(ci)
             d2 = (d2 - ci * ci).clamp_min(0.0)
-            chosen_mask = chosen_mask | (row > 0.5)
+            chosen_mask = chosen_mask.scatter(-1, index, True)
 
         return torch.stack(rows, dim=1)
 
@@ -239,15 +264,26 @@ class DPPSelectionController(SelectionController):
         Returns:
             選択行列 ``[B, k, N]``
         """
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
         num_elements = scores.shape[-1]
         k = min(self.k, num_elements)
         kernel = self.kernel(scores, features)
+        self._sync_generator_device(kernel.device)
         selection = self._greedy_map(kernel, k, hard=not self.training)
         # 多様性正則化が後で排出できるよう選択部分カーネルの log-det を保持する
         self._last_log_det = self.selected_log_det(kernel, selection)
         return selection
+
+    def _sync_generator_device(self, device: torch.device) -> None:
+        """Gumbel 用生成器を入力デバイスへ合わせ seed を巻き戻す（seed 指定時のみ）
+
+        ``torch.Generator`` はデバイス固有のため，入力が別デバイスなら作り直す各 select で
+        同 seed へ巻き戻すことで，連続呼び出しでも同一の Gumbel 標本を再現する
+        """
+        if self.seed is None:
+            return
+        if self._gen is None or self._gen.device != device:
+            self._gen = torch.Generator(device=device)
+        self._gen.manual_seed(self.seed)
 
     def pop_log_det(self) -> Optional[Tensor]:
         """直近 forward の選択部分カーネル log-det を取り出して消費する"""
