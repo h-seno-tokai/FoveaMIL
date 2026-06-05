@@ -16,9 +16,15 @@ from foveamil.models import (
     iter_active_regularizers,
 )
 from foveamil.models.attention_norm import available_attention_norms
-from foveamil.models.regularizers import available_regularizers
+from foveamil.models.regularizers import (
+    REGULARIZERS,
+    Regularizer,
+    available_regularizers,
+)
+from foveamil.models.regularizers.base import ForwardContext as _FC
 from foveamil.models.selection import available_selection_controllers
 from foveamil.training.config import TrainConfig
+from foveamil.training.trainer import regularizer_loss
 
 
 # --- アテンション正規化器 ---
@@ -137,12 +143,78 @@ def test_seams_add_no_state_dict_keys():
 def test_default_model_forward_layer_contract_unchanged():
     model = _model(num_layers=2)
     model.eval()
-    M, idx, weight = model.forward_layer(torch.randn(2, 10, 8), layer_idx=0)
+    M, idx, weight, aux = model.forward_layer(torch.randn(2, 10, 8), layer_idx=0)
     assert M.shape == (2, 1, 12)
     assert idx.shape == (2, 4) and weight.shape == (2, 4)
+    assert aux.shape == (2, 10)
     assert (idx[:, 1:] >= idx[:, :-1]).all()
-    M_final, idx_f, w_f = model.forward_layer(torch.randn(2, 7, 8), layer_idx=1)
-    assert idx_f is None and w_f is None
+    M_final, idx_f, w_f, aux_f = model.forward_layer(torch.randn(2, 7, 8), layer_idx=1)
+    assert idx_f is None and w_f is None and aux_f is None
     logits, Y_hat, Y_prob = model.forward_final([M, M_final])
     assert logits.shape == (2, 3)
     assert torch.allclose(Y_prob.sum(dim=-1), torch.ones(2), atol=1e-6)
+
+
+# --- 正則化フックの結合（layer_aux の供給と損失合算） ---
+
+
+def test_forward_layer_surfaces_aux_for_layer_aux_context():
+    # forward_layer は非最終層で正規化済み補助アテンションを返し layer_aux を埋められる
+    model = _model(num_layers=3)
+    model.eval()
+    auxes = []
+    for layer_idx in range(3):
+        _, _, _, aux = model.forward_layer(torch.randn(1, 9, 8), layer_idx)
+        auxes.append(aux)
+    assert auxes[0] is not None and auxes[1] is not None and auxes[2] is None
+    assert auxes[0].shape == (1, 9)
+    assert torch.allclose(auxes[0].sum(dim=-1), torch.ones(1), atol=1e-6)
+
+
+class _AuxEntropyRegularizer(Regularizer):
+    # layer_aux を読む使い捨て正則化項（テスト用）
+    name = "_test_aux_entropy"
+
+    def __call__(self, context, label):
+        total = context.m_list[0].new_zeros(())
+        for aux in context.layer_aux:
+            if aux is not None:
+                total = total + -(aux * (aux + 1e-12).log()).sum(dim=-1).mean()
+        return total
+
+    @classmethod
+    def from_config(cls, config):
+        return None
+
+
+def test_regularizer_loss_combines_weight_reg_and_extra_losses():
+    feat = torch.randn(1, 6, 4, requires_grad=True)
+    aux = torch.softmax(feat.sum(dim=-1), dim=-1)
+    ctx = _FC(
+        m_list=[torch.randn(1, 1, 4)],
+        layer_aux=[aux, None],
+        extra_losses={"policy": (feat ** 2).mean()},
+    )
+    reg = _AuxEntropyRegularizer(weight=0.5)
+    loss = regularizer_loss([reg], ctx, torch.tensor([0]))
+    expected = 0.5 * reg(ctx, torch.tensor([0])) + ctx.extra_losses["policy"]
+    assert torch.allclose(loss, expected)
+    loss.backward()
+    assert feat.grad is not None and feat.grad.abs().sum().item() > 0
+
+
+def test_regularizer_loss_is_zero_without_regularizers_or_extra_losses():
+    ctx = _FC(m_list=[torch.randn(1, 1, 4)])
+    assert regularizer_loss([], ctx, torch.tensor([0])) == 0.0
+
+
+def test_register_regularizer_then_cleanup_keeps_registry_clean():
+    # 使い捨て正則化項を登録 -> iter で拾えること -> 後始末でレジストリを汚さないこと
+    from foveamil.models.regularizers import register_regularizer
+
+    register_regularizer(_AuxEntropyRegularizer)
+    try:
+        assert "_test_aux_entropy" in REGULARIZERS
+    finally:
+        REGULARIZERS.pop("_test_aux_entropy", None)
+    assert "_test_aux_entropy" not in REGULARIZERS

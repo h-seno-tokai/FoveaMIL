@@ -168,28 +168,30 @@ class FoveaMIL(nn.Module):
 
     def forward_layer(
         self, x: Tensor, layer_idx: int
-    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+    ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
         """1 倍率分の特徴を処理しプーリング表現と次倍率の選択を返す
 
         主アテンションで softmax 重み付き和を取りプーリング表現 ``M`` を作る最終層
         以外は補助アテンションのスコアから top-k セレクタで選択行列 ``[B, k, N]`` を
         作り，その argmax を index 昇順に並べ，選択行列から各選択 index の重み
-        （学習時 soft / 推論時 hard）を ``select_weight`` として取り出す
+        （学習時 soft / 推論時 hard）を ``select_weight`` として取り出す選択に使った
+        正規化済み補助アテンション ``A_aux`` も併せて返す
 
         Args:
             x: 現倍率の特徴 ``[B, N, in_feat_dim]``
             layer_idx: 現倍率の添字
 
         Returns:
-            ``(M, select_indices, select_weight)``M は ``[B, 1, out_dim]``最終層
-            では ``select_indices`` / ``select_weight`` は ``None``それ以外は
-            ``select_indices`` が ``[B, k]``（index 昇順, 勾配なし），
-            ``select_weight`` が ``[B, k]``（学習時は勾配を保持）
+            ``(M, select_indices, select_weight, A_aux)``M は ``[B, 1, out_dim]``
+            最終層では ``select_indices`` / ``select_weight`` / ``A_aux`` は ``None``
+            それ以外は ``select_indices`` が ``[B, k]``（index 昇順, 勾配なし），
+            ``select_weight`` が ``[B, k]``（学習時は勾配を保持），``A_aux`` が
+            正規化済み補助アテンション ``[B, N]``
         """
         M, x_fc, _ = self._project_and_pool(x, layer_idx)
 
         if layer_idx >= self.num_layers - 1:
-            return M, None, None
+            return M, None, None, None
 
         A_aux, _ = self.aux_attentions[layer_idx](x_fc)
         A_aux = self.aux_norm(A_aux.squeeze(dim=-1))
@@ -201,7 +203,7 @@ class FoveaMIL(nn.Module):
         select_weight = selection.gather(
             -1, select_indices.unsqueeze(-1)
         ).squeeze(-1)
-        return M, select_indices, select_weight
+        return M, select_indices, select_weight, A_aux
 
     def layer_attention(
         self, x: Tensor, layer_idx: int

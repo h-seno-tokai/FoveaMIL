@@ -100,6 +100,28 @@ def _topk_kwargs(config: TrainConfig) -> dict:
     return {}
 
 
+def regularizer_loss(regularizers, context: ForwardContext, label: Tensor):
+    """有効な正則化項と寄与損失を合算する
+
+    各正則化項 ``reg`` の ``reg.weight * reg(context, label)`` と，
+    ``context.extra_losses`` の各値を足し合わせる項が無ければ ``0.0`` を返す
+
+    Args:
+        regularizers: :class:`Regularizer` のリスト
+        context: 段階 forward の文脈
+        label: 正解クラス ``[B]``
+
+    Returns:
+        合算した補助損失（スカラまたは ``0.0``）
+    """
+    total = 0.0
+    for reg in regularizers:
+        total = total + reg.weight * reg(context, label)
+    for value in context.extra_losses.values():
+        total = total + value
+    return total
+
+
 def _aux_norm_kwargs(config: TrainConfig) -> dict:
     """補助アテンション正規化器へ渡す追加引数を設定から組み立てる（既定は空）"""
     return {}
@@ -304,13 +326,15 @@ class Trainer:
         try:
             M_list: List[Tensor] = []
             selections: List[Optional[Dict[str, Tensor]]] = []
+            layer_aux: List[Optional[Tensor]] = []
             x = base_feats.to(self.device)
             global_idx = None
             for layer_idx in range(self.num_layers):
-                M, select_indices, select_weight = self.model.forward_layer(
+                M, select_indices, select_weight, aux = self.model.forward_layer(
                     x, layer_idx
                 )
                 M_list.append(M)
+                layer_aux.append(aux)
                 if layer_idx >= self.num_layers - 1:
                     selections.append(None)
                     continue
@@ -336,30 +360,16 @@ class Trainer:
                 x = x_next
                 global_idx = child
             logits, Y_hat, Y_prob = self.model.forward_final(M_list)
-            context = ForwardContext(m_list=M_list, selections=selections)
+            context = ForwardContext(
+                m_list=M_list, selections=selections, layer_aux=layer_aux
+            )
             return logits, Y_hat, Y_prob, context
         finally:
             accessor.close()
 
     def _regularizer_loss(self, context: ForwardContext, label: Tensor):
-        """有効な正則化項と寄与損失を合算する
-
-        登録済みの各正則化項 ``reg`` の ``reg.weight * reg(context, label)`` と，
-        ``context.extra_losses`` の各値を足し合わせる有効な項が無ければ ``0.0`` を返す
-
-        Args:
-            context: 段階 forward の文脈
-            label: 正解クラス ``[B]``
-
-        Returns:
-            合算した補助損失（スカラまたは ``0.0``）
-        """
-        total = 0.0
-        for reg in self.regularizers:
-            total = total + reg.weight * reg(context, label)
-        for value in context.extra_losses.values():
-            total = total + value
-        return total
+        """有効な正則化項と寄与損失を合算する（``regularizer_loss`` へ委譲する）"""
+        return regularizer_loss(self.regularizers, context, label)
 
     def _train_one_epoch(self) -> float:
         """1 エポック学習し平均損失を返す
