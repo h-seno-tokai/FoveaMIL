@@ -2,7 +2,8 @@
 
 :class:`ForwardContext` は段階 forward が集めた中間量を運ぶ容器で，各倍率のプーリング
 表現 ``m_list``，各層の正規化補助アテンション ``layer_aux``，各層の選択 ``selections``，
-コンポーネントが寄与する名前付きスカラ損失 ``extra_losses`` を持つ
+各層の選択部分カーネル log-det ``dpp_log_dets``，コンポーネントが寄与する名前付きスカラ
+損失 ``extra_losses`` を持つ
 :class:`Regularizer` はこの文脈と正解ラベルからスカラ損失を返す補助損失の共通インタ
 フェースで，``weight`` を持ち，``from_config`` で設定に応じて有効/無効を決める
 """
@@ -25,12 +26,14 @@ class ForwardContext:
         extra_losses: コンポーネントが寄与する名前付きスカラ損失
         layer_aux: 各層の正規化補助アテンション ``[B, N]``（最終層は ``None``）
         selections: 各層の選択情報（``select_indices`` / ``select_weight`` 等）
+        dpp_log_dets: 各層の選択部分カーネル log-det（多様性正則化が参照する）
     """
 
     m_list: List[Tensor]
     extra_losses: Dict[str, Tensor] = field(default_factory=dict)
     layer_aux: List[Optional[Tensor]] = field(default_factory=list)
     selections: List[Optional[Dict[str, Tensor]]] = field(default_factory=list)
+    dpp_log_dets: List[Tensor] = field(default_factory=list)
 
 
 class Regularizer(abc.ABC):

@@ -59,6 +59,12 @@ INSTANCE_LOSS_KEY = "instance_loss"
 ZOOM_PARAM_KEYS = ("k_sample", "k_sigma", "topk_method")
 # instance_loss 有効時のみ意味を持つキー（無効時は無関係）
 INSTANCE_PARAM_KEYS = ("bag_weight", "inst_k", "inst_subtyping")
+# 選択コントローラ名キー
+SELECTOR_KEY = "selector"
+# DPP 選択コントローラ名
+SELECTOR_DPP = "dpp"
+# selector=="dpp" かつ多倍率でのみ意味を持つキー（他では無関係）
+DPP_PARAM_KEYS = ("dpp_similarity", "dpp_temperature", "dpp_diversity_weight")
 # 単一倍率を表す倍率数
 SINGLE_MAG = 1
 # 自動解決されるため設定に手書きを許さないキー
@@ -223,9 +229,11 @@ def _canonicalize_conditional(
 
     ``instance_loss`` は単一倍率のみ有効（多倍率では既定の無効へ畳み単一倍率では真偽値へ
     正規化する）ズーム系（``k_sample`` / ``k_sigma`` / ``topk_method``）は多倍率のみ有効
-    （単一倍率では畳む）instance 系（``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は
-    ``instance_loss`` 有効時のみ意味を持つ（無効時は畳む）畳んだキーは ``axis_values`` から
-    落とし集計・表に載せない明示値を捨てたキー集合を返す（警告用）
+    （単一倍率では畳む）DPP 系（``dpp_similarity`` / ``dpp_temperature`` /
+    ``dpp_diversity_weight``）は ``selector=="dpp"`` かつ多倍率時のみ意味を持つ（他では畳む）
+    instance 系（``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は ``instance_loss`` 有効時
+    のみ意味を持つ（無効時は畳む）畳んだキーは ``axis_values`` から落とし集計・表に載せない
+    明示値を捨てたキー集合を返す（警告用）
     """
     discarded: set = set()
     single_mag = len(config[MAGNIFICATIONS_KEY]) == SINGLE_MAG
@@ -241,6 +249,11 @@ def _canonicalize_conditional(
 
     if single_mag:
         for key in ZOOM_PARAM_KEYS:
+            if _disable_param(config, axis_values, defaults, key):
+                discarded.add(key)
+    dpp_on = config.get(SELECTOR_KEY, defaults[SELECTOR_KEY]) == SELECTOR_DPP
+    if single_mag or not dpp_on:
+        for key in DPP_PARAM_KEYS:
             if _disable_param(config, axis_values, defaults, key):
                 discarded.add(key)
     if not instance_on:

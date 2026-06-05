@@ -56,17 +56,19 @@
 
 - `base.py`: `SelectionController(nn.Module)` 抽象基底．`k` を保持し，`select(scores, features) -> [B, k, N]` を実装する．
 - `topk_controller.py`: `TopKSelectionController(k, topk_method, topk_kwargs)`．`build_topk` の微分可能 top-k をスコアに適用する既定コントローラ（特徴は未使用）．
-- 公開 API：`build_selection_controller(name, k, topk_method="perturbed", topk_kwargs=None, **kwargs) -> SelectionController`．レジストリ `SELECTION_CONTROLLERS` から構築する．未登録名は `KeyError`．
-- 登録済み：`"topk"`．
+- `dpp.py`: `DPPSelectionController(k, similarity="cosine", temperature=1.0, quality_beta=1.0, rbf_gamma=1.0, use_gumbel=False, seed=None)`．品質 `q_i = exp(beta·scores_i)` と類似度 `k(z_i, z_j)`（`cosine` / `rbf`）から DPP カーネル `L_ij = q_i q_j k(z_i, z_j)` を張り，サイズ k の部分集合を貪欲 MAP（Chen et al. 2018）で選ぶ．各段の条件付き限界利得に対する argmax を温度付き soft argmax / Gumbel-softmax（`use_gumbel=True`）で緩和し，学習時は soft な選択行列，推論時は hard な one-hot 行を返す．勾配がアテンション（品質）と特徴射影（多様性）の双方へ流れ，密な高品質クラスタへ偏る top-k と違い各クラスタから 1 点ずつ拾う傾向を持つ．`k` が `N` を超える場合は `min(N, k)` に丸める．`pop_log_det()` で直近 forward の選択部分カーネル log-det を取り出せる（多様性正則化が参照する）．Kulesza & Taskar 2012，Chen et al. NeurIPS 2018，Jang et al. ICLR 2017 に基づく．
+- 公開 API：`build_selection_controller(name, k, topk_method="perturbed", topk_kwargs=None, **kwargs) -> SelectionController`．レジストリ `SELECTION_CONTROLLERS` から構築する．未登録名は `KeyError`．`"dpp"` のとき `_selector_kwargs` 経由で `similarity` / `temperature` が渡る．
+- 登録済み：`"topk"`，`"dpp"`．
 - 追加方法：`selection/` に新ファイルを作り，`SelectionController` を継承して `@register_selection_controller("name")` を付ける（自動探索で読み込まれる）．
 
 ## regularizers/（補助損失）
 
 スライド分類損失（CE）に加える補助損失（正則化項）の部品群と，段階 forward の中間量を運ぶ文脈．
 
-- `base.py`: `ForwardContext`（各倍率のプーリング表現 `m_list`，各層の正規化補助アテンション `layer_aux`，各層の選択 `selections`，名前付きスカラ損失 `extra_losses`）と `Regularizer` 抽象基底（`__call__(context, label) -> scalar`，`weight`，`from_config(config) -> Optional[Regularizer]`）．
+- `base.py`: `ForwardContext`（各倍率のプーリング表現 `m_list`，各層の正規化補助アテンション `layer_aux`，各層の選択 `selections`，各層の選択部分カーネル log-det `dpp_log_dets`，名前付きスカラ損失 `extra_losses`）と `Regularizer` 抽象基底（`__call__(context, label) -> scalar`，`weight`，`from_config(config) -> Optional[Regularizer]`）．
+- `dpp_diversity.py`: `DPPDiversityRegularizer`（`name="dpp_diversity"`）．各層の選択部分カーネル `L_S` の負 log-det を加え，多様な（互いに非類似な）選択へ誘導する．`config.selector=="dpp"` かつ多倍率かつ `config.dpp_diversity_weight>0` のときのみ有効で，それ以外は `from_config` が `None` を返す（既定では無効）．`ForwardContext.dpp_log_dets` を参照する（学習ループの段階 forward が DPP コントローラの `pop_log_det()` を各層から排出して積む）．
 - 公開 API：`iter_active_regularizers(config) -> List[Regularizer]`．登録済み各クラスの `from_config` を呼び有効な項を集める．学習ループは `CE + Σ w_i·reg_i + Σ extra_losses` を最小化する．
-- 登録済み：なし（具体項は各機能ブランチが追加する）．
+- 登録済み：`"dpp_diversity"`（既定無効）．
 - 追加方法：`regularizers/` に新ファイルを作り，`Regularizer` を継承して `name` を定め，`@register_regularizer` を付ける（自動探索で読み込まれる）．無効化は `from_config` が `None` を返すことで表す．
 
 ## fusion.py（多解像度融合）

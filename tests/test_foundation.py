@@ -16,7 +16,6 @@ from foveamil.models import (
     iter_active_regularizers,
 )
 from foveamil.models.attention_norm import available_attention_norms
-from foveamil.models.regularizers import available_regularizers
 from foveamil.models.selection import available_selection_controllers
 from foveamil.training.config import TrainConfig
 
@@ -79,10 +78,9 @@ def test_topk_controller_train_soft_shape():
 # --- 正則化フック ---
 
 
-def test_foundation_has_no_active_regularizers():
-    # foundation は具体正則化項を出荷しない 既定設定では空
+def test_default_config_has_no_active_regularizers():
+    # 既定設定（dpp_diversity_weight=0）では有効な正則化項は無い
     assert iter_active_regularizers(TrainConfig()) == []
-    assert available_regularizers() == []
 
 
 def test_forward_context_holds_m_list():

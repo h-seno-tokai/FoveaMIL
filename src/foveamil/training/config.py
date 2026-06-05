@@ -40,6 +40,12 @@ DEFAULT_TOPK_METHOD = "perturbed"
 DEFAULT_AUX_NORM = "softmax"
 # 既定の選択コントローラ名
 DEFAULT_SELECTOR = "topk"
+# 既定の DPP 類似度名（cosine / rbf）
+DEFAULT_DPP_SIMILARITY = "cosine"
+# 既定の DPP 緩和温度（soft argmax / Gumbel-softmax）
+DEFAULT_DPP_TEMPERATURE = 1.0
+# 既定の DPP 多様性正則化重み（0 で無効）
+DEFAULT_DPP_DIVERSITY_WEIGHT = 0.0
 # 既定の融合名
 DEFAULT_FUSION = "sum"
 # 既定のインスタンス補助損失の有効化
@@ -85,6 +91,9 @@ class TrainConfig:
         topk_method: top-k 手法名（単一倍率では無効）
         aux_norm: 補助アテンション正規化器名（単一倍率では無効）
         selector: 選択コントローラ名（単一倍率では無効）
+        dpp_similarity: DPP 類似度名（``"cosine"`` / ``"rbf"``，``selector=="dpp"`` 時のみ）
+        dpp_temperature: DPP 緩和温度（``selector=="dpp"`` 時のみ）
+        dpp_diversity_weight: DPP 多様性正則化の重み（0 で無効，``selector=="dpp"`` 多倍率時のみ）
         fusion: 融合名
         instance_loss: インスタンス補助損失を加えるか（単一倍率のみ）
         bag_weight: bag 損失とインスタンス補助損失の重み（``bag·bag_weight + inst·(1-bag_weight)``）
@@ -122,6 +131,9 @@ class TrainConfig:
     topk_method: str = DEFAULT_TOPK_METHOD
     aux_norm: str = DEFAULT_AUX_NORM
     selector: str = DEFAULT_SELECTOR
+    dpp_similarity: str = DEFAULT_DPP_SIMILARITY
+    dpp_temperature: float = DEFAULT_DPP_TEMPERATURE
+    dpp_diversity_weight: float = DEFAULT_DPP_DIVERSITY_WEIGHT
     fusion: str = DEFAULT_FUSION
     instance_loss: bool = DEFAULT_INSTANCE_LOSS
     bag_weight: float = DEFAULT_BAG_WEIGHT
