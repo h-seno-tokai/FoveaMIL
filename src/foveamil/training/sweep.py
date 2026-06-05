@@ -66,6 +66,20 @@ AUX_NORM_PARAM_KEYS = {
     "aux_norm_temperature": AUX_NORM_TEMPERATURE,
     "aux_norm_alpha": AUX_NORM_ENTMAX,
 }
+# ズーム駆動の選択キー（単一倍率ではズーム自体が無いため無関係）
+ZOOM_DRIVER_KEY = "zoom_driver"
+# 探索駆動を表す zoom_driver の値
+ZOOM_DRIVER_MCTS = "mcts"
+# zoom_driver="mcts" 時のみ意味を持つキー（それ以外は無関係）
+MCTS_PARAM_KEYS = (
+    "mcts_planner",
+    "mcts_simulations",
+    "mcts_max_considered",
+    "policy_loss_weight",
+    "value_loss_weight",
+    "policy_entropy_weight",
+    "mcts_hidden_dim",
+)
 # instance_loss 有効時のみ意味を持つキー（無効時は無関係）
 INSTANCE_PARAM_KEYS = ("bag_weight", "inst_k", "inst_subtyping")
 # 倍率間冗長性罰則の重みキー（多倍率のみ有効）
@@ -247,15 +261,15 @@ def _canonicalize_conditional(
 ) -> set:
     """構成に無関係な条件付きパラメータを既定値へ畳む
 
-    ``instance_loss`` は単一倍率のみ有効（多倍率では既定の無効へ畳み単一倍率では真偽値へ
     正規化する）ズーム系（``k_sample`` / ``k_sigma`` / ``topk_method`` / ``aux_norm`` /
-    ``selector``）は多倍率のみ有効（単一倍率では畳む）``aux_norm_temperature`` /
+    ``selector`` / ``zoom_driver``）は多倍率のみ有効（単一倍率では畳む）``aux_norm_temperature`` /
     ``aux_norm_alpha`` は対応する ``aux_norm`` 値（``temperature`` / ``entmax``）かつ多倍率の
     ときのみ意味を持つ（他では畳む）DPP 系（``dpp_similarity`` / ``dpp_temperature`` /
     ``dpp_quality_beta`` / ``dpp_rbf_gamma`` / ``dpp_use_gumbel`` / ``dpp_diversity_weight``）は
-    ``selector=="dpp"`` かつ多倍率のときのみ意味を持つ（他では畳む）instance 系
-    （``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は ``instance_loss`` 有効時のみ意味を持つ
-    （無効時は畳む）``decorrelation_weight`` は多倍率のみ有効（単一倍率では畳む）
+    ``selector=="dpp"`` かつ多倍率のときのみ意味を持つ（他では畳む）MCTS 系（探索プランナ・
+    模擬予算・損失重み等）は ``zoom_driver=="mcts"`` の多倍率のみ意味を持つ（それ以外は畳む）
+    instance 系（``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は ``instance_loss`` 有効時の
+    み意味を持つ（無効時は畳む）``decorrelation_weight`` は多倍率のみ有効（単一倍率では畳む）
     ``decorrelation_method`` は ``decorrelation_weight`` が正のときのみ意味を持つ（0 では畳む）
     畳んだキーは ``axis_values`` から落とし集計・表に載せない明示値を捨てたキー集合を返す（警告用）
     """
@@ -273,13 +287,21 @@ def _canonicalize_conditional(
 
     aux_norm = config.get(AUX_NORM_KEY, defaults[AUX_NORM_KEY])
     if single_mag:
-        for key in ZOOM_PARAM_KEYS:
+        for key in (*ZOOM_PARAM_KEYS, ZOOM_DRIVER_KEY):
             if _disable_param(config, axis_values, defaults, key):
                 discarded.add(key)
         if _disable_param(config, axis_values, defaults, DECORRELATION_WEIGHT_KEY):
             discarded.add(DECORRELATION_WEIGHT_KEY)
         if _disable_param(config, axis_values, defaults, SELECTOR_KEY):
             discarded.add(SELECTOR_KEY)
+    mcts_on = (
+        not single_mag
+        and config.get(ZOOM_DRIVER_KEY, defaults[ZOOM_DRIVER_KEY]) == ZOOM_DRIVER_MCTS
+    )
+    if not mcts_on:
+        for key in MCTS_PARAM_KEYS:
+            if _disable_param(config, axis_values, defaults, key):
+                discarded.add(key)
     for key, required_aux_norm in AUX_NORM_PARAM_KEYS.items():
         if single_mag or aux_norm != required_aux_norm:
             if _disable_param(config, axis_values, defaults, key):

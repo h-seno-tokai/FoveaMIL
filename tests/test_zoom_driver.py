@@ -1,0 +1,330 @@
+"""ズーム駆動シーム（既定の微分可能駆動・探索駆動）のユニット
+
+既定駆動が従来ループの数値を再現する回帰ガードと，探索駆動が妥当な融合表現・有限な
+合成損失を作り，方策・価値・共有ヘッドへ勾配を流し，シードで決定的であることを確認する
+"""
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from foveamil.models.mil import FoveaMIL
+from foveamil.training.config import TrainConfig
+from foveamil.training.hierarchy import children_per_parent, compute_child_indices
+from foveamil.training.zoom_driver import (
+    DifferentiableZoomDriver,
+    build_zoom_driver,
+)
+
+IN_DIM = 8
+OUT_DIM = 12
+N_CLS = 3
+HIDDEN = 16
+K = 3
+MAGS_3 = [1.25, 2.5, 5.0]
+MAGS_2 = [1.25, 2.5]
+
+
+def _model(num_layers, k=K):
+    return FoveaMIL(
+        in_feat_dim=IN_DIM,
+        hidden_feat_dim=HIDDEN,
+        out_feat_dim=OUT_DIM,
+        k_sample=k,
+        n_cls=N_CLS,
+        num_layers=num_layers,
+        topk_method="perturbed",
+        fusion="sum",
+    )
+
+
+def _seeded_child_loader():
+    """合成子ローダ：``(mag, indices)`` で決定的な ``[1, Nc, IN_DIM]`` を返す"""
+    store = {}
+
+    def loader(next_mag, child_idx):
+        n = len(child_idx)
+        key = (round(float(next_mag), 4), tuple(int(i) for i in child_idx))
+        if key not in store:
+            seed = (int(next_mag * 1000) * 131 + sum(int(i) for i in child_idx)) % (2**31)
+            g = torch.Generator().manual_seed(seed)
+            store[key] = torch.randn(1, n, IN_DIM, generator=g)
+        return store[key].clone()
+
+    return loader
+
+
+# --- 既定駆動の回帰ガード（従来ループと同一数値） ---
+
+
+def _replay_prior_loop(model, base, mags, child_loader, device):
+    """従来 ``Trainer._forward`` のループを逐語再生する（回帰ガードの参照）"""
+    M_list = []
+    selections = []
+    x = base.to(device)
+    global_idx = None
+    num_layers = model.num_layers
+    for layer_idx in range(num_layers):
+        M, si, sw, _ = model.forward_layer(x, layer_idx)
+        M_list.append(M)
+        if layer_idx >= num_layers - 1:
+            selections.append(None)
+            continue
+        selections.append({"select_indices": si, "select_weight": sw})
+        cur, nxt = mags[layer_idx], mags[layer_idx + 1]
+        cpp = children_per_parent(cur, nxt)
+        local = si[0].detach().cpu().numpy()
+        child = compute_child_indices(local, global_idx, children=cpp)
+        x_next = child_loader(nxt, child).to(device)
+        w_child = sw.repeat_interleave(cpp, dim=1)
+        x_next = x_next * w_child.unsqueeze(-1)
+        x = x_next
+        global_idx = child
+    return model.forward_final(M_list)
+
+
+@pytest.mark.parametrize("num_layers,mags", [(2, MAGS_2), (3, MAGS_3)])
+def test_differentiable_driver_matches_prior_loop(num_layers, mags):
+    torch.manual_seed(11)
+    model = _model(num_layers)
+    model.eval()
+    device = torch.device("cpu")
+    base = torch.randn(1, 9, IN_DIM)
+    loader = _seeded_child_loader()
+
+    driver = DifferentiableZoomDriver(model, num_layers)
+    d_logits, d_yhat, d_yprob, ctx = driver.run(base, mags, loader, device)
+    r_logits, r_yhat, r_yprob = _replay_prior_loop(model, base, mags, loader, device)
+
+    assert torch.equal(d_logits, r_logits)
+    assert torch.equal(d_yhat, r_yhat)
+    assert torch.equal(d_yprob, r_yprob)
+    assert len(ctx.m_list) == num_layers
+
+
+def test_differentiable_driver_train_propagates_gradient():
+    torch.manual_seed(3)
+    model = _model(num_layers=2)
+    model.train()
+    device = torch.device("cpu")
+    base = torch.randn(1, 8, IN_DIM)
+    driver = DifferentiableZoomDriver(model, 2)
+    logits, _, _, _ = driver.run(base, MAGS_2, _seeded_child_loader(), device)
+    F.cross_entropy(logits, torch.tensor([1])).backward()
+    # 補助アテンション（選択経路）へ勾配が流れる
+    aux_grad = model.aux_attentions[0].attention_c.weight.grad
+    assert aux_grad is not None and aux_grad.abs().sum().item() > 0
+
+
+# --- ファクトリ ---
+
+
+def test_build_zoom_driver_default_is_differentiable():
+    model = _model(num_layers=2)
+    cfg = TrainConfig(
+        in_feat_dim=IN_DIM, out_feat_dim=OUT_DIM, hidden_feat_dim=HIDDEN,
+        k_sample=K, n_cls=N_CLS,
+    )
+    driver = build_zoom_driver(cfg, model)
+    assert isinstance(driver, DifferentiableZoomDriver)
+
+
+def test_build_zoom_driver_unknown_raises():
+    model = _model(num_layers=2)
+    cfg = TrainConfig(
+        in_feat_dim=IN_DIM, out_feat_dim=OUT_DIM, hidden_feat_dim=HIDDEN,
+        k_sample=K, n_cls=N_CLS, zoom_driver="does_not_exist",
+    )
+    with pytest.raises(KeyError):
+        build_zoom_driver(cfg, model)
+
+
+def _mcts_config(**overrides):
+    cfg = TrainConfig(
+        in_feat_dim=IN_DIM, out_feat_dim=OUT_DIM, hidden_feat_dim=HIDDEN,
+        k_sample=K, n_cls=N_CLS, drop_out=None,
+        zoom_driver="mcts", mcts_simulations=8, mcts_max_considered=6,
+    )
+    for key, value in overrides.items():
+        setattr(cfg, key, value)
+    return cfg
+
+
+def test_build_zoom_driver_mcts_registers_search_modules():
+    from foveamil.models.search import MCTSZoomDriver
+
+    model = _model(num_layers=3)
+    before = {n for n, _ in model.named_parameters()}
+    driver = build_zoom_driver(_mcts_config(), model)
+    after = {n for n, _ in model.named_parameters()}
+    assert isinstance(driver, MCTSZoomDriver)
+    # 方策・価値ネットが model のパラメータに加わる（共有 optimizer で最適化される）
+    added = after - before
+    assert any("search_policy" in n for n in added)
+    assert any("search_value" in n for n in added)
+
+
+# --- 探索駆動の forward・合成損失・勾配 ---
+
+
+@pytest.mark.parametrize("num_layers,mags", [(2, MAGS_2), (3, MAGS_3)])
+def test_mcts_driver_forward_and_composite_loss(num_layers, mags):
+    torch.manual_seed(0)
+    model = _model(num_layers)
+    driver = build_zoom_driver(_mcts_config(), model)
+    model.train()
+    device = torch.device("cpu")
+    base = torch.randn(1, 10, IN_DIM)
+    label = torch.tensor([1])
+
+    logits, Y_hat, Y_prob, ctx = driver.run(
+        base, mags, _seeded_child_loader(), device, label=label
+    )
+    assert logits.shape == (1, N_CLS)
+    assert Y_hat.shape == (1, 1)
+    assert torch.allclose(Y_prob.sum(dim=-1), torch.ones(1), atol=1e-6)
+    # context.m_list は駆動に依らず埋まる（A ブランチとの両立）
+    assert len(ctx.m_list) == num_layers
+    assert all(m is not None for m in ctx.m_list)
+
+    # CE + 方策蒸留 + 価値回帰 が有限
+    assert "mcts_policy" in ctx.extra_losses
+    assert "mcts_value" in ctx.extra_losses
+    composite = F.cross_entropy(logits, label) + sum(ctx.extra_losses.values())
+    assert torch.isfinite(composite)
+
+
+def test_mcts_driver_backward_populates_policy_value_and_head():
+    torch.manual_seed(0)
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(_mcts_config(), model)
+    model.train()
+    device = torch.device("cpu")
+    base = torch.randn(1, 10, IN_DIM)
+    label = torch.tensor([2])
+
+    logits, _, _, ctx = driver.run(
+        base, MAGS_3, _seeded_child_loader(), device, label=label
+    )
+    composite = F.cross_entropy(logits, label) + sum(ctx.extra_losses.values())
+    composite.backward()
+
+    def has_grad(module):
+        return any(
+            p.grad is not None and p.grad.abs().sum().item() > 0
+            for p in module.parameters()
+        )
+
+    assert has_grad(model.search_policy)
+    assert has_grad(model.search_value)
+    # 共有識別器ヘッド・射影へも勾配が流れる
+    assert model.head.fc.weight.grad is not None
+    assert model.head.fc.weight.grad.abs().sum().item() > 0
+    assert has_grad(model.projections[0])
+
+
+def test_mcts_driver_inference_has_no_extra_losses():
+    torch.manual_seed(0)
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(_mcts_config(), model)
+    model.eval()
+    device = torch.device("cpu")
+    base = torch.randn(1, 9, IN_DIM)
+    with torch.no_grad():
+        logits, _, _, ctx = driver.run(
+            base, MAGS_3, _seeded_child_loader(), device, label=None
+        )
+    assert logits.shape == (1, N_CLS)
+    assert ctx.extra_losses == {}
+
+
+def test_mcts_driver_deterministic_under_seed():
+    device = torch.device("cpu")
+    base = torch.randn(1, 10, IN_DIM)
+
+    def run_once():
+        torch.manual_seed(5)
+        model = _model(num_layers=3)
+        driver = build_zoom_driver(_mcts_config(), model)
+        model.eval()
+        with torch.no_grad():
+            logits, _, _, ctx = driver.run(
+                base, MAGS_3, _seeded_child_loader(), device, label=None
+            )
+        sel = [
+            None if s is None else s["select_indices"].cpu().numpy().tolist()
+            for s in ctx.selections
+        ]
+        return logits, sel
+
+    a_logits, a_sel = run_once()
+    b_logits, b_sel = run_once()
+    assert torch.allclose(a_logits, b_logits)
+    assert a_sel == b_sel
+
+
+def _zoom_search_problem(model, value_net):
+    """``_ZoomSearchProblem`` の最小インスタンスを作る（``evaluate`` の単体検証用）
+
+    同一の ``model`` ``value_net`` を共有し，値の差は評価モードのみに由来させる
+    """
+    import numpy as np
+
+    from foveamil.models.search.driver import _ZoomSearchProblem
+
+    return _ZoomSearchProblem(
+        prior_np=np.full(3, 1.0 / 3),
+        x_fc=torch.zeros(1, 3, OUT_DIM),
+        layer_idx=0,
+        next_mag=MAGS_2[1],
+        cpp=children_per_parent(MAGS_2[0], MAGS_2[1]),
+        global_idx=None,
+        model=model,
+        value_net=value_net,
+        child_loader=_seeded_child_loader(),
+        device=torch.device("cpu"),
+    )
+
+
+def test_evaluate_independent_of_value_net_train_eval_mode():
+    from foveamil.models.search.value import ValueNetwork
+
+    torch.manual_seed(0)
+    model = _model(num_layers=2)
+    value_net = ValueNetwork(OUT_DIM, HIDDEN, dropout=0.5)
+
+    value_net.train()
+    torch.manual_seed(7)
+    reward_train = _zoom_search_problem(model, value_net).evaluate(0)
+
+    value_net.eval()
+    torch.manual_seed(7)
+    reward_eval = _zoom_search_problem(model, value_net).evaluate(0)
+
+    # dropout 0.5 でも train/eval どちらのモードでも葉評価は一致する（eval を強制）
+    assert reward_train == pytest.approx(reward_eval)
+
+
+def test_evaluate_restores_value_net_training_mode():
+    from foveamil.models.search.value import ValueNetwork
+
+    model = _model(num_layers=2)
+    value_net = ValueNetwork(OUT_DIM, HIDDEN, dropout=0.5)
+    value_net.train()
+    _zoom_search_problem(model, value_net).evaluate(0)
+    # 前向き後に元の train モードへ戻る
+    assert value_net.training
+
+
+def test_mcts_driver_entropy_term_when_enabled():
+    torch.manual_seed(0)
+    model = _model(num_layers=2)
+    driver = build_zoom_driver(_mcts_config(policy_entropy_weight=0.1), model)
+    model.train()
+    device = torch.device("cpu")
+    base = torch.randn(1, 9, IN_DIM)
+    _, _, _, ctx = driver.run(
+        base, MAGS_2, _seeded_child_loader(), device, label=torch.tensor([0])
+    )
+    assert "mcts_entropy" in ctx.extra_losses
+    assert torch.isfinite(ctx.extra_losses["mcts_entropy"])

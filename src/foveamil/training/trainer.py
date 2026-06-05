@@ -36,13 +36,10 @@ from foveamil.models.regularizers import ForwardContext, iter_active_regularizer
 from foveamil.training.accessor import FeatureAccessor
 from foveamil.training.config import TrainConfig
 from foveamil.training.dataset import feature_bag_collate
-from foveamil.training.hierarchy import (
-    children_per_parent,
-    compute_child_indices,
-    validate_magnification_hierarchy,
-)
+from foveamil.training.hierarchy import validate_magnification_hierarchy
 from foveamil.training.metrics import MetricLogger
 from foveamil.training.saver import ModelSaver
+from foveamil.training.zoom_driver import build_zoom_driver
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +251,7 @@ class Trainer:
         self.model = build_foveamil_from_config(config, self.num_layers).to(
             self.device
         )
+        self.zoom_driver = build_zoom_driver(config, self.model)
         self.instance_enabled = config.instance_loss
         self.bag_weight = config.bag_weight
         self.regularizers = iter_active_regularizers(config)
@@ -332,19 +330,19 @@ class Trainer:
             self.tb_writer.add_scalar(key, value, step)
 
     def _forward(
-        self, base_feats: Tensor, slide_id: str
+        self, base_feats: Tensor, slide_id: str, label: Optional[Tensor] = None
     ) -> Tuple[Tensor, Tensor, Tensor, ForwardContext]:
         """最低倍率特徴から段階 forward で予測と forward 文脈を返す
 
-        各層の選択結果から子パッチの global index を求め，次倍率の特徴を都度ロード
-        し，選択重みを子特徴へ掛けて補助アテンションへ勾配を流す子数は隣接倍率比
-        ``r`` から ``r^2`` 個（連続 2x なら 4，4x なら 16）で，各親の子が連続するため
-        重みを ``cpp`` 回繰り返して整合させる各倍率のプーリング表現と各層の選択を
-        :class:`ForwardContext` に集め，補助損失が参照できるようにする
+        子特徴ローダを :class:`FeatureAccessor` から組み，:attr:`zoom_driver` に倍率
+        ごとのズーム駆動を委ねる駆動は次倍率と子 global index からローダを呼び子を
+        都度ロードし，各倍率のプーリング表現と選択を :class:`ForwardContext` に集める
+        ``label`` は探索系の駆動が補助損失に使う（既定駆動は無視する）
 
         Args:
             base_feats: 最低倍率の全特徴 ``[1, N, in_feat_dim]``
             slide_id: スライド識別子
+            label: 正解クラス ``[B]``（学習時の補助損失用無ければ推論）
 
         Returns:
             ``(logits, Y_hat, Y_prob, context)``
@@ -353,63 +351,18 @@ class Trainer:
             self.feature_root, self.encoder, slide_id, self.feature_type
         )
         try:
-            M_list: List[Tensor] = []
-            selections: List[Optional[Dict[str, Tensor]]] = []
-            layer_aux: List[Optional[Tensor]] = []
-            dpp_log_dets: List[Tensor] = []
-            x = base_feats.to(self.device)
-            global_idx = None
-            for layer_idx in range(self.num_layers):
-                M, select_indices, select_weight, aux = self.model.forward_layer(
-                    x, layer_idx
-                )
-                M_list.append(M)
-                layer_aux.append(aux)
-                # DPP 選択コントローラなら選択部分カーネル log-det を排出して文脈へ積む
-                log_det = self._pop_selector_log_det()
-                if log_det is not None:
-                    dpp_log_dets.append(log_det)
-                if layer_idx >= self.num_layers - 1:
-                    selections.append(None)
-                    continue
+            def child_loader(next_mag: float, child_global_indices) -> Tensor:
+                return accessor.load_patches(next_mag, child_global_indices).unsqueeze(0)
 
-                selections.append(
-                    {"select_indices": select_indices, "select_weight": select_weight}
-                )
-                cur_mag = self.magnifications[layer_idx]
-                next_mag = self.magnifications[layer_idx + 1]
-                cpp = children_per_parent(cur_mag, next_mag)
-
-                local_idx = select_indices[0].detach().cpu().numpy()
-                child = compute_child_indices(local_idx, global_idx, children=cpp)
-                x_next = (
-                    accessor.load_patches(next_mag, child)
-                    .unsqueeze(0)
-                    .to(self.device)
-                )
-                # 選択重みを子特徴へ掛け，補助アテンションへ勾配を流す
-                # （各親の子が連続する r^2 個なので重みを cpp 回繰り返す）
-                w_child = select_weight.repeat_interleave(cpp, dim=1)
-                x_next = x_next * w_child.unsqueeze(-1)
-                x = x_next
-                global_idx = child
-            logits, Y_hat, Y_prob = self.model.forward_final(M_list)
-            context = ForwardContext(
-                m_list=M_list,
-                selections=selections,
-                layer_aux=layer_aux,
-                dpp_log_dets=dpp_log_dets,
+            return self.zoom_driver.run(
+                base_feats,
+                self.magnifications,
+                child_loader,
+                self.device,
+                label=label,
             )
-            return logits, Y_hat, Y_prob, context
         finally:
             accessor.close()
-
-    def _pop_selector_log_det(self):
-        """選択コントローラが log-det を保持していれば取り出す（無ければ ``None``）"""
-        pop = getattr(self.model.selector, "pop_log_det", None)
-        if pop is None:
-            return None
-        return pop()
 
     def _regularizer_loss(self, context: ForwardContext, label: Tensor):
         """有効な正則化項と寄与損失を合算する（``regularizer_loss`` へ委譲する）"""
@@ -437,7 +390,7 @@ class Trainer:
                     + (1.0 - self.bag_weight) * inst_loss
                 )
             else:
-                logits, _, _, context = self._forward(base_feats, slide_id)
+                logits, _, _, context = self._forward(base_feats, slide_id, label)
                 loss = self.ce_loss(logits, label) + self._regularizer_loss(
                     context, label
                 )

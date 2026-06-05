@@ -419,6 +419,54 @@ def test_selector_kept_as_axis_for_multi_magnification():
     assert "selector" in varying_axis_keys(combos)
 
 
+# --- MCTS（探索駆動）パラメータの統合 ---
+
+
+def test_mcts_params_collapse_when_driver_not_mcts():
+    # 既定 zoom_driver=differentiable では MCTS 系は無関係なので畳む
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        mcts_simulations=[8, 16],
+        policy_loss_weight=[0.5, 1.0],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs のみ MCTS 系は畳まれる
+    keys = varying_axis_keys(combos)
+    assert "mcts_simulations" not in keys and "policy_loss_weight" not in keys
+    for c in combos:
+        assert c.config["mcts_simulations"] == 16  # DEFAULT_MCTS_SIMULATIONS
+        assert c.config["policy_loss_weight"] == 1.0  # DEFAULT_POLICY_LOSS_WEIGHT
+
+
+def test_mcts_params_kept_when_driver_mcts():
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        zoom_driver=["mcts"],
+        mcts_simulations=[8, 16],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 20  # 10 pairs * 2 simulations
+    assert {c.config["mcts_simulations"] for c in combos} == {8, 16}
+    assert "mcts_simulations" in varying_axis_keys(combos)
+    for c in combos:
+        assert c.config["zoom_driver"] == "mcts"
+
+
+def test_zoom_driver_collapses_for_single_mag():
+    # 単一倍率はズーム自体が無いため zoom_driver も MCTS 系も無関係 -> 畳む
+    sweep = _base_sweep(
+        magnifications=[[40]],
+        zoom_driver=["differentiable", "mcts"],
+        mcts_simulations=[8, 16],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs のみ
+    keys = varying_axis_keys(combos)
+    assert "zoom_driver" not in keys and "mcts_simulations" not in keys
+    for c in combos:
+        assert c.config["zoom_driver"] == "differentiable"  # DEFAULT_ZOOM_DRIVER
+
+
 def _write_fold(combo_dir, fold, val_auc, test_auc):
     fold_dir = os.path.join(combo_dir, f"fold{fold}")
     os.makedirs(fold_dir, exist_ok=True)

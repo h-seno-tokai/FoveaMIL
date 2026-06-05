@@ -10,6 +10,7 @@
 | `attention_norm/` | アテンションスコアの正規化器（レジストリで差し替え，既定 softmax） |
 | `topk/` | 微分可能 top-k セレクタ（レジストリで差し替え） |
 | `selection/` | パッチ選択コントローラ（スコア・特徴 → 選択行列，レジストリで差し替え） |
+| `search/` | 探索ベースのズーム決定（方策・価値ネット，Gumbel-AlphaZero / PUCT プランナ，探索駆動） |
 | `regularizers/` | 補助損失（正則化項）と forward 文脈（レジストリで差し替え） |
 | `fusion.py` | 多解像度表現の融合（インタフェース，現状 Sum のみ） |
 | `heads.py` | 識別器ヘッド（融合と分離） |
@@ -66,6 +67,13 @@
 - 公開 API：`build_selection_controller(name, k, topk_method="perturbed", topk_kwargs=None, **kwargs) -> SelectionController`．レジストリ `SELECTION_CONTROLLERS` から構築する．未登録名は `KeyError`．`"dpp"` のとき `_selector_kwargs` 経由で `similarity` / `temperature` / `quality_beta` / `rbf_gamma` / `use_gumbel` が渡る．
 - 登録済み：`"topk"`，`"dpp"`．
 - 追加方法：`selection/` に新ファイルを作り，`SelectionController` を継承して `@register_selection_controller("name")` を付ける（自動探索で読み込まれる）．
+
+## search/（探索ベースのズーム決定）
+
+倍率ごとのズーム先を一括の top-k 確定ではなく，学習した方策・価値による look-ahead で決める部品群．方策ネット `π(a|state)` が候補親上の事前を，価値ネット `v(state)` が部分選択状態のスカラ推定を与え，プランナがズーム木を探索して改良方策と選択アクションを返す．責任の詳細は [search/README.md](search/README.md) を参照．
+
+- 公開 API：`PolicyNetwork`，`ValueNetwork`，`build_planner(name, simulations, max_considered, seed, **kwargs)`（`"gumbel"` / `"puct"`），`MCTSZoomDriver`．
+- 学習駆動の差し替えは `foveamil.training.zoom_driver` の `build_zoom_driver(config, model)` で行い，既定 `"differentiable"` は従来挙動を再現する．
 
 ## regularizers/（補助損失）
 
