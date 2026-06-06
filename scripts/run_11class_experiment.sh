@@ -5,6 +5,13 @@
 #
 # 前提: 特徴は事前に foveamil-stage で 1 回ステージしておく（このスクリプトはステージしない）
 #       FEATURE_ROOT がステージ先（または正準特徴ルート）を指すこと
+#   cls-only 実験なので cls 特徴だけステージすると容量が約半分になる（40x が巨大なため有効）:
+#     foveamil-stage --feature-root <正準> --encoder Virchow2 --feature-type cls \
+#       --magnifications 1.25 2.5 5.0 10.0 20.0 40.0 --splits-dir cohort/splits/11class/cv10 \
+#       --cache-dir /tmp/foveamil_feat_stage
+#     export FEATURE_ROOT=/tmp/foveamil_feat_stage   # ステージ先を指す
+#   多並列で CPU をスラッシュさせないため OMP_NUM_THREADS=1 を必ず設定する:
+#     export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 #
 # 必須引数:
 #   --weights-base DIR   重み(.pt)の出力ルート（Dataset 側）配下に abd/ mcts/ を作る

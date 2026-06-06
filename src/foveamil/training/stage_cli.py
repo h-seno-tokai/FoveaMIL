@@ -63,7 +63,11 @@ def run(args: argparse.Namespace) -> int:
     )
     stager = FeatureStager(cache_dir=cache_dir)
     staged_root = stager.stage_set(
-        args.feature_root, args.encoder, args.magnifications, slide_ids
+        args.feature_root,
+        args.encoder,
+        args.magnifications,
+        slide_ids,
+        feature_type=args.feature_type,
     )
     logger.info("staged root: %s", staged_root)
     return 0
@@ -101,6 +105,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="CSV with a slide_id column, or a text file with one id per line.",
     )
 
+    parser.add_argument(
+        "--feature-type",
+        choices=("mean", "cls", "concat"),
+        default=None,
+        help="Stage only this feature's datasets (cls/mean keep that feature "
+        "+ coords, halving size); default copies the full h5.",
+    )
     parser.add_argument(
         "--cache-dir",
         default=None,
