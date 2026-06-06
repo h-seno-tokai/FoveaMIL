@@ -685,8 +685,10 @@ def run_jobs_on_gpu_pool(
                 returncode = 1
             results[index] = returncode
     except KeyboardInterrupt:
-        logger.warning("interrupted; shutting down workers")
-        executor.shutdown(wait=False, cancel_futures=True)
+        logger.warning("interrupted; cancelling pending jobs")
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False)
         raise
     finally:
         executor.shutdown(wait=True)
