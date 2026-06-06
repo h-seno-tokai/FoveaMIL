@@ -2,7 +2,7 @@
 
 ``log`` で 1 サンプルずつ予測クラス・正解クラス（任意で確率）を蓄積し，``get_summary``
 で accuracy / F1（weighted・macro・per-class）/ precision・recall（weighted・macro・
-per-class）/ kappa（二次重み付け）/ AUC（確率があれば OvR per-class，多クラスでは
+per-class）/ kappa（重みなし・名義クラス）/ AUC（確率があれば OvR per-class，多クラスでは
 macro・weighted）をまとめた辞書を返す``get_confusion_matrix`` で混同行列を返す
 数値が安定して出ない場合は当該指標を安全に省きログに残す
 """
@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 
 # 既定のクラス数
 DEFAULT_N_CLS = 3
-# 二次重み付け kappa の weights 指定
-KAPPA_WEIGHTS = "quadratic"
+# Cohen's kappa の weights 指定（名義クラスは順序を持たないため重みなし）
+KAPPA_WEIGHTS = None
 # precision/recall/F1 のゼロ割時の値
 ZERO_DIVISION = 0
 # 多クラス AUC を計算する最小クラス数

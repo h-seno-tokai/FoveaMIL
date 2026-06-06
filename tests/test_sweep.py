@@ -12,11 +12,29 @@ from foveamil.training.sweep import (
     SWEEP_DETAILED_CSV,
     Combo,
     SweepRunner,
+    _result_complete,
+    _write_json,
     expand_combos,
     run_jobs_on_gpu_memory_pool,
     run_jobs_on_gpu_pool,
     varying_axis_keys,
 )
+
+
+def test_result_complete_rejects_corrupt_and_atomic_write(tmp_path):
+    # 中断で半端に書かれた結果 JSON を完了扱いせず再実行対象にする（silent fold loss 防止）
+    good = str(tmp_path / "good.json")
+    _write_json(good, {"weighted_f1": 0.5})
+    assert _result_complete(good) is True
+    bad = str(tmp_path / "bad.json")
+    with open(bad, "w", encoding="utf-8") as handle:
+        handle.write('{"weighted_f1": 0.5')   # 切れた JSON
+    assert _result_complete(bad) is False
+    assert _result_complete(str(tmp_path / "absent.json")) is False
+    # アトミック書き込みは .tmp を残さない
+    import glob
+
+    assert glob.glob(str(tmp_path / "*.tmp")) == []
 
 ENCODERS_4 = ["ResNet50", "UNI2-h", "Virchow2", "Virchow2-mini-dinov2"]
 FEATURE_TYPES_3 = ["mean", "cls", "concat"]

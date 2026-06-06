@@ -72,8 +72,12 @@ class ModelSaver:
             summary: ``val_loss`` と ``val_weighted_f1`` を含む辞書
             epoch: 現在のエポック（best 更新時に記録する）
         """
+        # best 未保存（初回）は指標値に依らず必ず保存する 全エポックで val 指標が
+        # 改善しない退化 combo でも best 重みが存在し test が last で黙って評価される
+        # 事故を防ぐ
+        first = self.best_epoch is None
         if self.save_metric == SAVE_METRIC_LOSS:
-            if summary["val_loss"] < self.best_loss:
+            if first or summary["val_loss"] < self.best_loss:
                 logger.info(
                     "val_loss improved (%.6f -> %.6f), saving best model",
                     self.best_loss,
@@ -84,7 +88,7 @@ class ModelSaver:
                 self.best_epoch = epoch
                 self.best_value = float(summary["val_loss"])
         else:
-            if summary["val_weighted_f1"] > self.best_f1:
+            if first or summary["val_weighted_f1"] > self.best_f1:
                 logger.info(
                     "val_weighted_f1 improved (%.6f -> %.6f), saving best model",
                     self.best_f1,

@@ -74,9 +74,17 @@ def _foveamil_version() -> Optional[str]:
 
 
 def _write_json(path: str, payload: Any) -> None:
-    """辞書を JSON で保存する"""
-    with open(path, "w", encoding="utf-8") as handle:
+    """辞書を JSON でアトミックに保存する
+
+    同一ファイルシステムの一時ファイルへ書き ``fsync`` 後 ``os.replace`` で原子的に
+    置き換える中断で半端な JSON が残り resume の完了マーカと誤認されるのを防ぐ
+    """
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
 
 
 def _read_split(split_csv: str) -> Dict[str, List[str]]:

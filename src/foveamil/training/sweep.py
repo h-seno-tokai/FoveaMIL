@@ -605,7 +605,7 @@ def _run_fold_job(
         サブプロセス終了コード（スキップ時は 0）
     """
     result_path = os.path.join(fold_dir, FOLD_RESULT_JSON)
-    if os.path.exists(result_path):
+    if _result_complete(result_path):
         return 0
 
     os.makedirs(fold_dir, exist_ok=True)
@@ -668,7 +668,7 @@ def run_jobs_on_gpu_pool(
 
     def _execute(job: Dict[str, Any]) -> int:
         result_path = os.path.join(job["fold_dir"], FOLD_RESULT_JSON)
-        if os.path.exists(result_path):
+        if _result_complete(result_path):
             return 0
         gpu = slots.get()
         try:
@@ -787,7 +787,7 @@ def run_jobs_on_gpu_memory_pool(
             with cond:
                 while position < len(pending):
                     index, job = pending[position]
-                    if os.path.exists(
+                    if _result_complete(
                         os.path.join(job["fold_dir"], FOLD_RESULT_JSON)
                     ):
                         results[index] = 0
@@ -877,10 +877,30 @@ def _read_json(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _result_complete(path: str) -> bool:
+    """結果 JSON が存在し完全に読めるなら ``True``
+
+    存在のみで判定すると中断で半端に書かれた marker を完了扱いしスキップしてしまう
+    ため，読めない（壊れた）marker は未完了とみなし再実行対象にする
+    """
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            json.load(handle)
+        return True
+    except Exception:  # noqa: BLE001 - 壊れた marker は再実行する
+        return False
+
+
 def _write_json(path: str, payload: Any) -> None:
-    """辞書を JSON で保存する"""
-    with open(path, "w", encoding="utf-8") as handle:
+    """辞書を JSON でアトミックに保存する（tmp へ書き fsync 後 os.replace）"""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
 
 
 class SweepRunner:

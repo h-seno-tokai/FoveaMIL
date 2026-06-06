@@ -70,10 +70,16 @@ def build_model(config: Dict[str, Any]) -> FoveaMIL:
     """run_meta の config から FoveaMIL を ``Trainer.__init__`` と同一引数で構築する
 
     モデル組立は ``build_foveamil_from_config`` を共有し，正規化器・選択コントローラ・
-    top-k 引数の写像のズレを防ぐ
+    top-k 引数の写像のズレを防ぐ``zoom_driver`` も構築して MCTS の policy/value
+    モジュールを model へ付加し，保存 state_dict（``search_policy.*`` 等を含む）を
+    そのままロードできるようにする
     """
+    from foveamil.training.zoom_driver import build_zoom_driver
+
     cfg = _train_config_from_dict(config)
-    return build_foveamil_from_config(cfg, len(cfg.magnifications))
+    model = build_foveamil_from_config(cfg, len(cfg.magnifications))
+    build_zoom_driver(cfg, model)
+    return model
 
 
 def resolve_best_combo(
