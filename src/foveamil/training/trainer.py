@@ -457,6 +457,7 @@ class Trainer:
                 {
                     "val_loss": val_loss,
                     "val_weighted_f1": val_metrics["weighted_f1"],
+                    "val_macro_f1": val_metrics["macro_f1"],
                 },
                 epoch=epoch,
             )
