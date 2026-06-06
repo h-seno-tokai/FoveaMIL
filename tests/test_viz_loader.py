@@ -75,3 +75,23 @@ def test_build_model_topk_kwargs_roundtrip():
     a = build_model(CONFIG)
     b = build_model(CONFIG)
     b.load_state_dict(a.state_dict())  # 例外なし＝形状一致
+
+
+_MCTS_CONFIG = {
+    **CONFIG,
+    "magnifications": [1.25, 2.5, 5.0],
+    "zoom_driver": "mcts",
+    "mcts_planner": "gumbel",
+    "mcts_simulations": 8,
+    "mcts_max_considered": 4,
+}
+
+
+def test_build_model_mcts_reconstructs_policy_value():
+    # MCTS combo の保存重みを loader が再構築できる（policy/value を付加し strict load 可）
+    model = build_model(_MCTS_CONFIG)
+    keys = list(model.state_dict().keys())
+    assert any("search_policy" in k for k in keys)
+    assert any("search_value" in k for k in keys)
+    other = build_model(_MCTS_CONFIG)
+    other.load_state_dict(model.state_dict())  # 学習側 state_dict と整合（例外なし）

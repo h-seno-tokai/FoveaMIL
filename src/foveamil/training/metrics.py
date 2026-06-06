@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 
 # 既定のクラス数
 DEFAULT_N_CLS = 3
-# 二次重み付け kappa の weights 指定
-KAPPA_WEIGHTS = "quadratic"
+# Cohen's kappa の weights 指定（名義クラスは順序を持たないため重みなし）
+KAPPA_WEIGHTS = None
 # precision/recall/F1 のゼロ割時の値
 ZERO_DIVISION = 0
 # 多クラス AUC を計算する最小クラス数
