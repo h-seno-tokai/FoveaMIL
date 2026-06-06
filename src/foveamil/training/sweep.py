@@ -731,10 +731,10 @@ def run_jobs_on_gpu_memory_pool(
     """各 GPU の空き VRAM を見ながらジョブを動的に投入する
 
     ジョブごとに ``per_job_mem_mb`` を予約し，``空き - headroom_mb - 予約済`` が
-    ``per_job_mem_mb`` 以上ある GPU へ投入する空きは ``mem_query`` で実測し
-    ``poll_interval`` 秒ごとに更新する起動直後の確保前ぶんは予約量が二重に効くため
-    安全側に振れる``max_per_gpu`` を与えると空きに余裕があっても GPU あたりの同時数を
-    抑える``fold_dir`` に ``test_metrics.json`` がある job は GPU を取らずスキップする
+    ``per_job_mem_mb`` 以上ある GPU へ投入する，空きは ``mem_query`` で実測し
+    ``poll_interval`` 秒ごとに更新する，起動直後の確保前ぶんは予約量が二重に効くため
+    安全側に振れる，``max_per_gpu`` を与えると空きに余裕があっても GPU あたりの同時数を
+    抑える，``fold_dir`` に ``test_metrics.json`` がある job は GPU を取らずスキップする
 
     Args:
         jobs: ジョブ辞書の列（各々 ``fold_dir`` を持つ）
@@ -819,9 +819,10 @@ def run_jobs_on_gpu_memory_pool(
                         threads.append(thread)
                         placed = True
                 if not placed:
-                    if position < len(pending) and not any(
-                        running[gpu] for gpu in gpu_list
-                    ):
+                    if any(running[gpu] for gpu in gpu_list):
+                        # 走行中ジョブの完了で空きが増えるのを待つ
+                        cond.wait(timeout=poll_interval)
+                    elif position < len(pending):
                         # 走行中ジョブが無いと空きは増えない 強制再取得して再判定し，
                         # どの GPU にも収まらなければ当該ジョブを失敗として進める
                         free_cache["at"] = 0.0
@@ -840,8 +841,6 @@ def run_jobs_on_gpu_memory_pool(
                             )
                             results[index] = 1
                             position += 1
-                            continue
-                    cond.wait(timeout=poll_interval)
     except KeyboardInterrupt:
         logger.warning("interrupted; waiting for running jobs to finish")
         raise
