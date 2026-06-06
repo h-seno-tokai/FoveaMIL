@@ -1,7 +1,7 @@
 # 11 クラス（FL グレード分割を主眼）本番 sweep ― ベースライン ＋ A/B/D アブレーション
 # foveamil-sweep --config configs/sweep_11class_virchow2.yaml \
 #   --out experiments/11class_virchow2/abd \
-#   --weights-out /Dataset/Kurume_Dataset/seno/FoveaMIL/11class_virchow2/abd \
+#   --weights-out /path/to/weights/11class_virchow2/abd \
 #   --gpu-ids 0,1,2 --jobs-per-gpu 12
 #
 # 内訳（sweep 健全化の自動畳み込みで 1 config に集約）:

@@ -1,7 +1,7 @@
 # 11 クラス本番 sweep ― C（MCTS 探索駆動）単独
 # foveamil-sweep --config configs/sweep_11class_virchow2_mcts.yaml \
 #   --out experiments/11class_virchow2/mcts \
-#   --weights-out /Dataset/Kurume_Dataset/seno/FoveaMIL/11class_virchow2/mcts \
+#   --weights-out /path/to/weights/11class_virchow2/mcts \
 #   --gpu-ids 0,1,2 --jobs-per-gpu 4
 #
 # C は探索駆動（policy/value + MCTS）で A/B/D とは別パラダイムのため単独評価する
