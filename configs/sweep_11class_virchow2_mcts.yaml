@@ -2,11 +2,12 @@
 # foveamil-sweep --config configs/sweep_11class_virchow2_mcts.yaml \
 #   --out experiments/11class_virchow2/mcts \
 #   --weights-out /path/to/weights/11class_virchow2/mcts \
-#   --gpu-ids 0,1,2 --jobs-per-gpu 4
+#   --gpu-ids 0,1,2 --mem-per-job-mb 4000
 #
 # C は探索駆動（policy/value + MCTS）で A/B/D とは別パラダイムのため単独評価する
-#   多倍率 [10,20,40] と [1.25..40] × zoom_driver=mcts = 2 combo × 10 fold = 20 job
-# A/B/D は既定（off）MCTS は 1 bag ごとに探索するため重い jobs_per_gpu は控えめにする
+#   多倍率 [10,20,40] と [1.25..40] × k_sample(3) = 6 combo × 10 fold = 60 job
+# MCTS は 1 bag ごとに探索するため VRAM が読めない 1 ジョブ smoke で実測してから
+# --mem-per-job-mb を設定し，メモリ動的スケジューラに安全に詰めさせる
 
 resolve:
   n_cls: 11
@@ -20,6 +21,7 @@ sweep:
   magnifications:
     - [10.0, 20.0, 40.0]
     - [1.25, 2.5, 5.0, 10.0, 20.0, 40.0]
+  k_sample: [1, 4, 8]             # 探索駆動の選定の広さ
 
 fixed:
   zoom_driver: mcts               # C: 探索駆動
@@ -29,9 +31,9 @@ fixed:
   policy_loss_weight: 1.0
   value_loss_weight: 1.0
   topk_method: perturbed
-  k_sample: 15
+  k_sigma: 0.002
   lr: 1.0e-4
-  drop_out: 0.6
+  drop_out: 0.5
   fusion: sum
   seed: 42
   max_epochs: 50
@@ -44,4 +46,4 @@ fixed:
 
 parallel:
   gpu_ids: [0, 1, 2]
-  jobs_per_gpu: 4                 # MCTS は重いので控えめ
+  mem_per_job_mb: 4000            # smoke 実測後に調整する

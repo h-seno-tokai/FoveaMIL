@@ -1,22 +1,24 @@
-# 11 クラス（FL グレード分割を主眼）本番 sweep ― ベースライン ＋ A/B/D アブレーション
+# 11 クラス（FL グレード分割を主眼）本番 sweep ― ベースライン ＋ A/B/D アブレーション（大規模）
 # foveamil-sweep --config configs/sweep_11class_virchow2.yaml \
 #   --out experiments/11class_virchow2/abd \
 #   --weights-out /path/to/weights/11class_virchow2/abd \
-#   --gpu-ids 0,1,2 --jobs-per-gpu 12
+#   --gpu-ids 0,1,2 --mem-per-job-mb 1500
 #
+# GPU メモリ動的スケジューラ（--mem-per-job-mb）で全ジョブを一括投入する想定
 # 内訳（sweep 健全化の自動畳み込みで 1 config に集約）:
-#   単一倍率 [40]/[20]/[10] × instance_loss{false,true}
-#       = ABMIL(false) / CLAM(true) のベースライン 各 3 倍率 = 6 combo
-#       （多倍率専用の A/B/D 軸は単一倍率では畳まれる）
-#   多倍率 [10,20,40] と [1.25..40] × A(脱相関) × B(スパース) × D(DPP) の on/off
-#       = 2 倍率セット × 2^3 = 16 combo（instance_loss は多倍率では畳まれる）
-#   合計 22 combo × 10 fold = 220 job
+#   単一倍率 [40]/[20]/[10] × instance_loss{false,true} × lr(2) × drop_out(2)
+#       = ABMIL/CLAM ベースライン 3 倍率 × 4 HP = 24 combo
+#       （多倍率専用の A/B/D/k 系は単一倍率では畳まれる）
+#   多倍率 [10,20,40] と [1.25..40] × A × B × D × k_sample(3) × k_sigma(2)
+#       × topk_method(2) × lr(2) × drop_out(2)
+#       = 2 × 2^3 × 3 × 2 × 2 × 2 × 2 = 768 combo
+#   合計 792 combo × 10 fold = 7920 job
 # C（MCTS 探索駆動）は別パラダイムのため単独で configs/sweep_11class_virchow2_mcts.yaml
 
 resolve:
-  n_cls: 11                       # labels_11class.csv と splits/11class/cv10 を解決
+  n_cls: 11
   folds: 10
-  feature_root: ${FEATURE_ROOT}   # 特徴ルートの base .env で渡す
+  feature_root: ${FEATURE_ROOT}   # cls-only ステージ先を .env / 環境変数で渡す
   cohort_root: cohort
 
 sweep:
@@ -30,16 +32,16 @@ sweep:
     - [1.25, 2.5, 5.0, 10.0, 20.0, 40.0]   # 多倍率 ZoomMIL（全 6 倍率・低倍 start）
   instance_loss: [false, true]    # 単一倍率のみ有効 false=ABMIL / true=CLAM
   decorrelation_weight: [0.0, 0.1]   # A: 倍率間脱相関正則化 off/on（多倍率のみ）
-  aux_norm: [softmax, entmax]     # B: スパース補助アテンション off(softmax)/on(entmax α=1.5)
-  selector: [topk, dpp]           # D: 多様性選択 off(topk)/on(dpp cosine)
+  aux_norm: [softmax, entmax]     # B: スパース補助アテンション off/on（多倍率のみ）
+  selector: [topk, dpp]           # D: 多様性選択 off/on（多倍率のみ）
+  k_sample: [1, 8, 12]            # 選定の広さ（多倍率のみ）
+  k_sigma: [0.002, 0.005]         # top-k 平滑化（多倍率のみ）
+  topk_method: [perturbed, fast_sparse]   # 微分可能 top-k 手法（多倍率のみ）
+  lr: [1.0e-4, 1.0e-3]
+  drop_out: [0.0, 0.5]
 
 fixed:
   zoom_driver: differentiable     # C(mcts) は別 config で単独評価する
-  topk_method: perturbed
-  k_sample: 15                    # ズーム選択数 k（多倍率のみ有効）
-  k_sigma: 0.002
-  lr: 1.0e-4
-  drop_out: 0.6
   fusion: sum
   seed: 42
   max_epochs: 50
@@ -50,7 +52,7 @@ fixed:
   is_weighted_sampler: true       # 11 クラスの不均衡に対応
   num_workers: 1
 
-# 環境に合わせて --gpu-ids / --jobs-per-gpu で上書きする（動的 GPU キューで割り当て）
+# メモリ動的スケジューラ（--mem-per-job-mb で有効化）環境に合わせて上書きする
 parallel:
   gpu_ids: [0, 1, 2]
-  jobs_per_gpu: 12
+  mem_per_job_mb: 1500
