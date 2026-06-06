@@ -1,44 +1,56 @@
-# 11 クラス（FL グレード分割を主眼）向け sweep 設定
-# foveamil-sweep --config configs/sweep_11class_virchow2.yaml --out experiments/11class_virchow2 --weights-out /path/to/weights
-# Virchow2 の cls / concat のみ（探索が効くかを高倍率で検証する用）
-# 展開数: feature_type(2) × magnifications(2) × topk_method(2) × k_sample(3) × k_sigma(2) = 48 combo
-#         × 10 fold = 480 job lr / drop_out を広げると比例して増える
+# 11 クラス（FL グレード分割を主眼）本番 sweep ― ベースライン ＋ A/B/D アブレーション
+# foveamil-sweep --config configs/sweep_11class_virchow2.yaml \
+#   --out experiments/11class_virchow2/abd \
+#   --weights-out /Dataset/Kurume_Dataset/seno/FoveaMIL/11class_virchow2/abd \
+#   --gpu-ids 0,1,2 --jobs-per-gpu 12
+#
+# 内訳（sweep 健全化の自動畳み込みで 1 config に集約）:
+#   単一倍率 [40]/[20]/[10] × instance_loss{false,true}
+#       = ABMIL(false) / CLAM(true) のベースライン 各 3 倍率 = 6 combo
+#       （多倍率専用の A/B/D 軸は単一倍率では畳まれる）
+#   多倍率 [10,20,40] と [1.25..40] × A(脱相関) × B(スパース) × D(DPP) の on/off
+#       = 2 倍率セット × 2^3 = 16 combo（instance_loss は多倍率では畳まれる）
+#   合計 22 combo × 10 fold = 220 job
+# C（MCTS 探索駆動）は別パラダイムのため単独で configs/sweep_11class_virchow2_mcts.yaml
 
-# 解決の起点
 resolve:
-  n_cls: 11                       # labels_11class.csv と splits/11class/ を解決
-  folds: 10                       # 推奨 10
+  n_cls: 11                       # labels_11class.csv と splits/11class/cv10 を解決
+  folds: 10
   feature_root: ${FEATURE_ROOT}   # 特徴ルートの base .env で渡す
   cohort_root: cohort
 
-# 展開する軸
 sweep:
   encoder: [Virchow2]
-  feature_type: [cls, concat]     # Virchow2 は has_cls=True 両方有効 concat は次元 2 倍(2560)
-  # 倍率セットが探索の核 高倍率まで含めるほど高倍率パッチ選定の余地が増える
-  # 低→高の順 先頭が base(低倍率で全ロード) 以降が選定で拡大する候補
+  feature_type: [cls]             # Virchow2 の CLS トークン特徴（1280 次元）
   magnifications:
-    - [2.5, 5.0, 10.0]
-    - [1.25, 2.5, 5.0, 10.0, 20.0, 40.0]
-  topk_method: [perturbed]
-  k_sample: [8, 15, 25]           # ズーム選択数 k
-  k_sigma: [0.002, 0.005]         # top-k 平滑化
-  lr: [1.0e-4]                    # 広げる場合は [1.0e-4, 1.0e-3]
-  drop_out: [0.6]                 # 広げる場合は [0.3, 0.6, 0.7]
-  fusion: [sum]
+    - [40.0]                      # 単一倍率ベースライン（ABMIL / CLAM）
+    - [20.0]
+    - [10.0]
+    - [10.0, 20.0, 40.0]          # 多倍率 ZoomMIL（3 倍率）
+    - [1.25, 2.5, 5.0, 10.0, 20.0, 40.0]   # 多倍率 ZoomMIL（全 6 倍率・低倍 start）
+  instance_loss: [false, true]    # 単一倍率のみ有効 false=ABMIL / true=CLAM
+  decorrelation_weight: [0.0, 0.1]   # A: 倍率間脱相関正則化 off/on（多倍率のみ）
+  aux_norm: [softmax, entmax]     # B: スパース補助アテンション off(softmax)/on(entmax α=1.5)
+  selector: [topk, dpp]           # D: 多様性選択 off(topk)/on(dpp cosine)
 
-# 全 combo 共通スカラ
 fixed:
+  zoom_driver: differentiable     # C(mcts) は別 config で単独評価する
+  topk_method: perturbed
+  k_sample: 15                    # ズーム選択数 k（多倍率のみ有効）
+  k_sigma: 0.002
+  lr: 1.0e-4
+  drop_out: 0.6
+  fusion: sum
   seed: 42
   max_epochs: 50
   scheduler_patience: 10
   scheduler_decay_rate: 0.8
   reg: 1.0e-4
-  save_metric: f1
-  is_weighted_sampler: true       # クラス不均衡(11クラスは偏りあり)に対応
+  save_metric: f1                 # val weighted-F1 最大でモデル選択
+  is_weighted_sampler: true       # 11 クラスの不均衡に対応
   num_workers: 1
 
-# 並列実行 環境に合わせて上書き（--gpu-ids / --jobs-per-gpu）
+# 環境に合わせて --gpu-ids / --jobs-per-gpu で上書きする（動的 GPU キューで割り当て）
 parallel:
   gpu_ids: [0, 1, 2]
-  jobs_per_gpu: 36
+  jobs_per_gpu: 12
