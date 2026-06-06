@@ -8,10 +8,12 @@ import pytest
 
 from foveamil.training.resolve import ResolvedPaths
 from foveamil.training.sweep import (
+    FOLD_RESULT_JSON,
     SWEEP_DETAILED_CSV,
     Combo,
     SweepRunner,
     expand_combos,
+    run_jobs_on_gpu_pool,
     varying_axis_keys,
 )
 
@@ -510,3 +512,95 @@ def test_val_selection_and_test_oracle(tmp_path):
     df = pd.read_csv(os.path.join(out, SWEEP_DETAILED_CSV))
     assert len(df) == 8
     assert set(df["split"]) == {"val", "test"}
+
+
+# --- 動的 GPU キュー（スロット割り当て） ---
+
+
+def _make_jobs(tmp_path, n):
+    jobs = []
+    for i in range(n):
+        d = tmp_path / f"job{i}"
+        d.mkdir()
+        jobs.append({"fold_dir": str(d), "combo_index": i, "fold": 1})
+    return jobs
+
+
+def test_dynamic_pool_respects_per_gpu_capacity_and_uses_all_gpus(tmp_path):
+    import collections
+    import threading
+    import time
+
+    gpu_ids = [0, 1]
+    jobs_per_gpu = 2
+    running = collections.Counter()
+    peak = collections.Counter()
+    lock = threading.Lock()
+    global_cur = [0]
+    global_peak = [0]
+
+    def fake_run(job, gpu):
+        with lock:
+            running[gpu] += 1
+            global_cur[0] += 1
+            peak[gpu] = max(peak[gpu], running[gpu])
+            global_peak[0] = max(global_peak[0], global_cur[0])
+        time.sleep(0.02)
+        with lock:
+            running[gpu] -= 1
+            global_cur[0] -= 1
+        return 0
+
+    jobs = _make_jobs(tmp_path, 12)
+    results = run_jobs_on_gpu_pool(jobs, gpu_ids, jobs_per_gpu, fake_run)
+
+    assert len(results) == 12
+    assert all(rc == 0 for rc in results.values())
+    # GPU あたり同時実行は jobs_per_gpu を超えない
+    for gpu in gpu_ids:
+        assert peak[gpu] <= jobs_per_gpu
+    # 全スロットが埋まる（GPU が遊ばない）
+    assert global_peak[0] == len(gpu_ids) * jobs_per_gpu
+    # 両 GPU が使われる
+    assert peak[0] > 0 and peak[1] > 0
+
+
+def test_dynamic_pool_skips_done_jobs_without_acquiring_gpu(tmp_path):
+    done = tmp_path / "done"
+    done.mkdir()
+    (done / FOLD_RESULT_JSON).write_text("{}", encoding="utf-8")
+    todo = tmp_path / "todo"
+    todo.mkdir()
+
+    called = []
+
+    def fake_run(job, gpu):
+        called.append(job["fold_dir"])
+        return 0
+
+    jobs = [{"fold_dir": str(done)}, {"fold_dir": str(todo)}]
+    results = run_jobs_on_gpu_pool(jobs, [0], 1, fake_run)
+
+    assert results == {0: 0, 1: 0}
+    # 既存結果のある job は run_fn を呼ばない
+    assert called == [str(todo)]
+
+
+def test_dynamic_pool_records_failures_without_aborting(tmp_path):
+    def fake_run(job, gpu):
+        if job["fold_dir"].endswith("bad"):
+            raise RuntimeError("boom")
+        return 7 if job["fold_dir"].endswith("rc") else 0
+
+    ok = tmp_path / "ok"
+    ok.mkdir()
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    rc = tmp_path / "rc"
+    rc.mkdir()
+    jobs = [{"fold_dir": str(ok)}, {"fold_dir": str(bad)}, {"fold_dir": str(rc)}]
+    results = run_jobs_on_gpu_pool(jobs, [0], 1, fake_run)
+
+    assert results[0] == 0
+    assert results[1] == 1  # 例外は終了コード 1 に正規化
+    assert results[2] == 7  # 非ゼロ終了コードを保持

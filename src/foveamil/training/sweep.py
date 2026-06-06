@@ -15,10 +15,11 @@ import dataclasses
 import json
 import logging
 import os
+import queue
 import re
 import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -626,6 +627,74 @@ def _run_fold_job(
     return completed.returncode
 
 
+def run_jobs_on_gpu_pool(
+    jobs: Sequence[Dict[str, Any]],
+    gpu_ids: Sequence[int],
+    jobs_per_gpu: int,
+    run_fn,
+) -> Dict[int, int]:
+    """各 GPU に ``jobs_per_gpu`` スロットを持つ動的キューで jobs を実行する
+
+    GPU スロットトークンを ``jobs_per_gpu`` 個ずつキューへ入れ，worker は次の job ごと
+    に空きトークンを取得して ``run_fn(job, gpu_id)`` を実行し終了後にトークンを戻す
+    job が終わるたびに空いた GPU へ次の pending job が割り当てられるため GPU が遊ばず，
+    GPU あたり同時実行数は ``jobs_per_gpu`` を超えない``fold_dir`` に
+    ``test_metrics.json`` が既にある job は GPU を取らずスキップする実行は
+    ``CUDA_VISIBLE_DEVICES`` を介す ``foveamil-train`` サブプロセスで GIL を解放するため
+    スレッドプールで足りる
+
+    Args:
+        jobs: ジョブ辞書の列（各々 ``fold_dir`` を持つ）
+        gpu_ids: 使用 GPU 一覧
+        jobs_per_gpu: GPU あたり同時実行数
+        run_fn: ``(job, gpu_id) -> returncode`` の実行関数
+
+    Returns:
+        ジョブ添字 → 終了コード（例外は終了コード 1 に正規化）
+    """
+    gpu_list = list(gpu_ids) if gpu_ids else list(DEFAULT_GPU_IDS)
+    per_gpu = max(1, int(jobs_per_gpu))
+    slots: "queue.Queue[int]" = queue.Queue()
+    for gpu in gpu_list:
+        for _ in range(per_gpu):
+            slots.put(gpu)
+    max_workers = len(gpu_list) * per_gpu
+
+    def _execute(job: Dict[str, Any]) -> int:
+        result_path = os.path.join(job["fold_dir"], FOLD_RESULT_JSON)
+        if os.path.exists(result_path):
+            return 0
+        gpu = slots.get()
+        try:
+            return run_fn(job, gpu)
+        finally:
+            slots.put(gpu)
+
+    results: Dict[int, int] = {}
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        futures = {
+            executor.submit(_execute, job): index for index, job in enumerate(jobs)
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                returncode = future.result()
+            except Exception as exc:  # noqa: BLE001 - job 失敗で止めない
+                logger.error("job %d (%s) raised: %s", index, jobs[index].get("fold_dir"), exc)
+                returncode = 1
+            results[index] = returncode
+    except KeyboardInterrupt:
+        logger.warning("interrupted; cancelling pending jobs")
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False)
+        raise
+    finally:
+        executor.shutdown(wait=True)
+    return results
+
+
 def _pick_rank_metric(aggregate: Dict[str, Any]) -> tuple:
     """集計から優先順位順に最初に存在する指標名と mean を返す"""
     for metric in RANK_METRICS:
@@ -701,9 +770,8 @@ class SweepRunner:
         return path
 
     def _build_jobs(self) -> List[Dict[str, Any]]:
-        """全 (combo, fold) ジョブを GPU 割当付きで組み立てる"""
+        """全 (combo, fold) ジョブを組み立てる（GPU は動的キューが実行時に割り当てる）"""
         jobs: List[Dict[str, Any]] = []
-        i = 0
         for combo in self.combos:
             config_path = self._write_combo_config(combo)
             combo_dir = self._combo_dir(combo)
@@ -719,19 +787,16 @@ class SweepRunner:
                         "fold_dir": os.path.join(combo_dir, fold_name),
                         "weights_dir": os.path.join(weights_combo, fold_name),
                         "split_csv": split_csv,
-                        "gpu_id": self.gpu_ids[i % len(self.gpu_ids)],
                     }
                 )
-                i += 1
         return jobs
 
     def run(self) -> Dict[str, Any]:
-        """全 job を並列実行し combo ごとに集計してランキング要約を返す"""
+        """全 job を動的 GPU キューで並列実行し combo ごとに集計してランキング要約を返す"""
         os.makedirs(self.out_root, exist_ok=True)
         jobs = self._build_jobs()
-        max_workers = max(1, len(self.gpu_ids) * self.jobs_per_gpu)
         logger.info(
-            "sweep: %d combos x %d folds = %d jobs, gpu_ids=%s, jobs_per_gpu=%d",
+            "sweep: %d combos x %d folds = %d jobs, gpu_ids=%s, jobs_per_gpu=%d (dynamic queue)",
             len(self.combos),
             len(self.split_files),
             len(jobs),
@@ -739,42 +804,27 @@ class SweepRunner:
             self.jobs_per_gpu,
         )
 
+        def run_fn(job: Dict[str, Any], gpu_id: int) -> int:
+            return _run_fold_job(
+                job["combo_config"],
+                job["fold_dir"],
+                job["weights_dir"],
+                job["split_csv"],
+                gpu_id,
+            )
+
+        returncodes = run_jobs_on_gpu_pool(
+            jobs, self.gpu_ids, self.jobs_per_gpu, run_fn
+        )
+
         failures: Dict[int, List[int]] = {}
-        executor = ProcessPoolExecutor(max_workers=max_workers)
-        try:
-            futures = {}
-            for job in jobs:
-                future = executor.submit(
-                    _run_fold_job,
-                    job["combo_config"],
-                    job["fold_dir"],
-                    job["weights_dir"],
-                    job["split_csv"],
-                    job["gpu_id"],
+        for index, job in enumerate(jobs):
+            if returncodes.get(index, 1) != 0:
+                logger.error(
+                    "combo %03d fold %d failed (returncode=%s)",
+                    job["combo_index"], job["fold"], returncodes.get(index),
                 )
-                futures[future] = job
-            for future in as_completed(futures):
-                job = futures[future]
-                try:
-                    returncode = future.result()
-                except Exception as exc:  # noqa: BLE001 - job 失敗で止めない
-                    logger.error(
-                        "combo %03d fold %d raised: %s",
-                        job["combo_index"], job["fold"], exc,
-                    )
-                    returncode = 1
-                if returncode != 0:
-                    logger.error(
-                        "combo %03d fold %d failed (returncode=%d)",
-                        job["combo_index"], job["fold"], returncode,
-                    )
-                    failures.setdefault(job["combo_index"], []).append(job["fold"])
-        except KeyboardInterrupt:
-            logger.warning("interrupted; shutting down workers")
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        finally:
-            executor.shutdown(wait=True)
+                failures.setdefault(job["combo_index"], []).append(job["fold"])
 
         results = [self._collect_combo(combo, failures.get(combo.index, []))
                    for combo in self.combos]
