@@ -46,7 +46,9 @@ def test_policy_finite_nonzero_gradient():
     pol = PolicyNetwork(feat_dim=8, hidden_dim=4)
     pol.train()
     x = torch.randn(1, 10, 8, requires_grad=True)
-    pol(x).sum().backward()
+    # softmax 分布の和は定数なので重み付き和で勾配を評価する
+    weight = torch.linspace(0.1, 1.0, 10)
+    (pol(x) * weight).sum().backward()
     grads = [p.grad for p in pol.parameters()]
     assert all(g is not None and torch.isfinite(g).all() for g in grads)
     assert sum(g.abs().sum().item() for g in grads) > 0
