@@ -2,7 +2,7 @@
 
 ``log`` で 1 サンプルずつ予測クラス・正解クラス（任意で確率）を蓄積し，``get_summary``
 で accuracy / F1（weighted・macro・per-class）/ precision・recall（weighted・macro・
-per-class）/ kappa（二次重み付け）/ AUC（確率があれば OvR per-class，多クラスでは
+per-class）/ kappa（重みなし・名義クラス）/ AUC（確率があれば OvR per-class，多クラスでは
 macro・weighted）をまとめた辞書を返す``get_confusion_matrix`` で混同行列を返す
 数値が安定して出ない場合は当該指標を安全に省きログに残す
 """
