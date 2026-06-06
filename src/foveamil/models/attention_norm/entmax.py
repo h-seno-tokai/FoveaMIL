@@ -117,6 +117,8 @@ class Entmax(nn.Module):
 
     def forward(self, scores: Tensor) -> Tensor:
         """スコア ``[B, N]`` を α-entmax 正規化した ``[B, N]`` を返す"""
+        if scores.shape[_NORM_AXIS] == 0:
+            return scores
         if abs(self.alpha - _ALPHA_MIN) < _ALPHA_SOFTMAX_TOL:
             return F.softmax(scores, dim=_NORM_AXIS)
         return _EntmaxFunction.apply(scores, self.alpha, self.max_iter)

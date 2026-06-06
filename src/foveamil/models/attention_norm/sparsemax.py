@@ -45,6 +45,8 @@ class Sparsemax(nn.Module):
 
     def forward(self, scores: Tensor) -> Tensor:
         """スコア ``[B, N]`` を sparsemax 正規化した ``[B, N]`` を返す"""
+        if scores.shape[_NORM_AXIS] == 0:
+            return scores
         tau = _threshold_and_support(scores)
         return torch.clamp(scores - tau, min=_FLOOR)
 
