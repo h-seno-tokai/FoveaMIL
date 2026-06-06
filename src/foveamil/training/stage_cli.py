@@ -19,6 +19,7 @@ from typing import List, Optional, Sequence
 import pandas as pd
 
 from foveamil.cohort.labels import load_slide_ids
+from foveamil.training.accessor import FEATURE_TYPES
 from foveamil.training.staging import STAGE_DIR_ENV, FeatureStager
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,11 @@ def run(args: argparse.Namespace) -> int:
     )
     stager = FeatureStager(cache_dir=cache_dir)
     staged_root = stager.stage_set(
-        args.feature_root, args.encoder, args.magnifications, slide_ids
+        args.feature_root,
+        args.encoder,
+        args.magnifications,
+        slide_ids,
+        feature_type=args.feature_type,
     )
     logger.info("staged root: %s", staged_root)
     return 0
@@ -101,6 +106,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="CSV with a slide_id column, or a text file with one id per line.",
     )
 
+    parser.add_argument(
+        "--feature-type",
+        choices=FEATURE_TYPES,
+        default=None,
+        help="Stage only this feature's datasets (cls/mean keep that feature "
+        "+ coords, halving size); default copies the full h5.",
+    )
     parser.add_argument(
         "--cache-dir",
         default=None,
