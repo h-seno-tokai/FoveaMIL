@@ -733,3 +733,20 @@ def test_memory_pool_serializes_when_only_one_fits(tmp_path):
         mem_query=lambda: {0: 5000},
     )
     assert peak[0] == 1
+
+
+def test_memory_pool_fails_job_that_fits_no_gpu(tmp_path):
+    # per_job がどの GPU 空きより大きい誤設定 -> ハングせず失敗で進める
+    called = []
+
+    def fake(job, gpu):
+        called.append(gpu)
+        return 0
+
+    jobs = _make_jobs(tmp_path, 2)
+    results = run_jobs_on_gpu_memory_pool(
+        jobs, [0], fake, per_job_mem_mb=100000, headroom_mb=0, poll_interval=0.01,
+        mem_query=lambda: {0: 10000},
+    )
+    assert results == {0: 1, 1: 1}  # 配置不能なジョブは失敗扱い
+    assert called == []  # run_fn は呼ばれない

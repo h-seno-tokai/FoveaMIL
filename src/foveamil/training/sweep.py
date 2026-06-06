@@ -819,6 +819,28 @@ def run_jobs_on_gpu_memory_pool(
                         threads.append(thread)
                         placed = True
                 if not placed:
+                    if position < len(pending) and not any(
+                        running[gpu] for gpu in gpu_list
+                    ):
+                        # 走行中ジョブが無いと空きは増えない 強制再取得して再判定し，
+                        # どの GPU にも収まらなければ当該ジョブを失敗として進める
+                        free_cache["at"] = 0.0
+                        free = _free_now()
+                        index, job = pending[position]
+                        fits = any(
+                            (free.get(gpu, 0) - headroom_mb) >= per_job_mem_mb
+                            for gpu in gpu_list
+                        )
+                        if not fits:
+                            logger.error(
+                                "job %d (%s) fits no GPU "
+                                "(per_job=%dMB headroom=%dMB); marking failed",
+                                index, job.get("fold_dir"),
+                                per_job_mem_mb, headroom_mb,
+                            )
+                            results[index] = 1
+                            position += 1
+                            continue
                     cond.wait(timeout=poll_interval)
     except KeyboardInterrupt:
         logger.warning("interrupted; waiting for running jobs to finish")
