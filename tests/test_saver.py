@@ -29,6 +29,18 @@ def test_best_updates_on_improvement(tmp_path):
     assert abs(saver.best_value - 0.5) < 1e-9
 
 
+def test_macro_f1_selection_ignores_weighted(tmp_path):
+    # save_metric=macro_f1 は val_macro_f1 で選択し weighted の改善に釣られない
+    saver = ModelSaver(str(tmp_path), save_metric="macro_f1")
+    model = nn.Linear(2, 2)
+    saver(model, {"val_loss": 1.0, "val_weighted_f1": 0.8, "val_macro_f1": 0.3}, epoch=0)
+    saver(model, {"val_loss": 1.0, "val_weighted_f1": 0.9, "val_macro_f1": 0.5}, epoch=1)
+    saver(model, {"val_loss": 1.0, "val_weighted_f1": 0.95, "val_macro_f1": 0.4}, epoch=2)
+    assert saver.best_epoch == 1                       # macro最大のep1（weighted最大のep2でない）
+    assert abs(saver.best_value - 0.5) < 1e-9
+    assert os.path.exists(os.path.join(str(tmp_path), "model_best_macro_f1.pt"))
+
+
 def test_best_saved_first_epoch_for_loss_metric(tmp_path):
     # loss 指標でも初回は必ず保存される
     saver = ModelSaver(str(tmp_path), save_metric="loss")
