@@ -118,3 +118,56 @@ def test_stage_falls_back_when_too_large(tmp_path):
     stager = FeatureStager(cache_dir=str(tmp_path / "cache"), free_space_margin=1.0)
     staged = stager.stage_set(root, _ENCODER, [_MAG], slides, feature_type="cls")
     assert staged == root
+
+
+def test_resolve_copy_workers_precedence(monkeypatch):
+    from foveamil.training.staging import (
+        DEFAULT_COPY_WORKERS,
+        STAGE_WORKERS_ENV,
+        _resolve_copy_workers,
+    )
+
+    monkeypatch.delenv(STAGE_WORKERS_ENV, raising=False)
+    assert _resolve_copy_workers(None) == DEFAULT_COPY_WORKERS  # 既定
+    assert _resolve_copy_workers(4) == 4                        # 引数優先
+    assert _resolve_copy_workers(0) == 1                        # 下限 1
+    monkeypatch.setenv(STAGE_WORKERS_ENV, "3")
+    assert _resolve_copy_workers(None) == 3                     # 環境変数
+    assert _resolve_copy_workers(5) == 5                        # 引数 > 環境変数
+
+
+def test_stage_parallel_copies_all_slides(tmp_path):
+    # プロセス並列パス（copy_workers>1）で全スライドが正しく縮小コピーされる
+    slides = tuple(f"s{i}" for i in range(5))
+    root, slide_ids = _make_root(tmp_path, slides=slides)
+    cache = str(tmp_path / "cache")
+    stager = FeatureStager(cache_dir=cache, copy_workers=2)
+    staged = stager.stage_set(root, _ENCODER, [_MAG], slide_ids, feature_type="cls")
+    assert staged == cache
+    for s in slides:
+        path = os.path.join(cache, _ENCODER, f"{_MAG}x", f"{s}.h5")
+        with h5py.File(path, "r") as handle:
+            assert CLS_DATASET in handle and COORDS_DATASET in handle
+            assert POOLED_DATASET not in handle
+
+
+def test_required_bytes_sampled_estimate_close_to_exact(tmp_path):
+    # サイズの異なる多数スライドで サンプル推定が全件合計に近いことを確認
+    root = str(tmp_path / "feat")
+    slides = [f"s{i}" for i in range(80)]
+    for i, s in enumerate(slides):
+        _write_feature_h5(
+            os.path.join(root, _ENCODER, f"{_MAG}x", f"{s}.h5"), n=_N + i
+        )
+    stager = FeatureStager(cache_dir=str(tmp_path / "cache"))
+    rels = stager._target_files(root, _ENCODER, [_MAG], slides)
+    keep = {CLS_DATASET, COORDS_DATASET}
+    estimate = stager._required_bytes(root, rels, keep)
+
+    exact = 0
+    for rel in rels:
+        with h5py.File(os.path.join(root, rel), "r") as handle:
+            for name in keep:
+                dataset = handle[name]
+                exact += dataset.dtype.itemsize * dataset.size
+    assert 0.8 * exact <= estimate <= 1.2 * exact

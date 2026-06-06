@@ -20,7 +20,11 @@ import pandas as pd
 
 from foveamil.cohort.labels import load_slide_ids
 from foveamil.training.accessor import FEATURE_TYPES
-from foveamil.training.staging import STAGE_DIR_ENV, FeatureStager
+from foveamil.training.staging import (
+    STAGE_DIR_ENV,
+    STAGE_WORKERS_ENV,
+    FeatureStager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +66,7 @@ def run(args: argparse.Namespace) -> int:
     cache_dir = (
         args.cache_dir or os.environ.get(STAGE_DIR_ENV) or DEFAULT_CACHE_DIR
     )
-    stager = FeatureStager(cache_dir=cache_dir)
+    stager = FeatureStager(cache_dir=cache_dir, copy_workers=args.workers)
     staged_root = stager.stage_set(
         args.feature_root,
         args.encoder,
@@ -118,6 +122,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"Local SSD destination; falls back to env {STAGE_DIR_ENV} "
         f"then {DEFAULT_CACHE_DIR}.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Parallel copy workers (processes); falls back to env "
+        f"{STAGE_WORKERS_ENV} then the built-in default.",
     )
     parser.add_argument(
         "--verbose", action="store_true", help="Enable DEBUG logging."
