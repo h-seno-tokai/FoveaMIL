@@ -216,12 +216,6 @@ class FeatureAccessor:
             )
         return int(handle[POOLED_DATASET].shape[CONCAT_AXIS])
 
-    def num_patches(self, magnification: float) -> int:
-        """指定倍率のパッチ数を返す"""
-        handle = self._file(magnification)
-        key = CLS_DATASET if self.feature_type == FEATURE_TYPE_CLS else POOLED_DATASET
-        return int(handle[key].shape[0])
-
     def close(self) -> None:
         """キャッシュした全ファイルハンドルを閉じる"""
         for handle in self._handles.values():
