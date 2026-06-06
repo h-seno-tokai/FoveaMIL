@@ -95,7 +95,7 @@ def _copy_atomic(src: str, dst: str, keep: Optional[Set[str]] = None) -> None:
 
     ``dst`` が既にあれば再利用しコピーしない``keep`` 指定時は h5 全体でなく
     指定データセット（+ root/データセット属性）のみを書いた縮小 h5 を作る``None``
-    なら h5 全体を複製するプロセス並列ワーカから呼べるようモジュール関数にしている
+    なら h5 全体を複製する
     """
     if os.path.exists(dst):
         return
@@ -173,12 +173,10 @@ class FeatureStager:
         rels: Sequence[str],
         keep: Optional[Set[str]],
     ) -> None:
-        """対象ファイル列をワーカ数に応じて直列/プロセス並列でコピーする
+        """対象ファイル列をコピーする
 
-        ``copy_workers <= 1`` か対象が 1 件以下なら直列h5 の再シリアライズは
-        h5py のグローバルロックでスレッド並列が効かないためプロセス並列にする
-        spawn コンテキストで子に HDF5 状態を継承させず安全に並列化する各
-        ``_copy_atomic`` は冪等なので既存ファイルはワーカ側で即スキップされる
+        ``copy_workers <= 1`` か対象が 1 件以下なら直列，それ以外は ``spawn`` の
+        プロセスプールで並列にコピーする各コピーは冪等で既存はスキップされる
         """
         tasks = [
             (
@@ -210,8 +208,7 @@ class FeatureStager:
 
         ``keep`` 指定時は h5 を等間隔に最大 ``_SIZE_SAMPLE_FILES`` 件サンプルし
         該当データセットの論理サイズ（``shape × itemsize``）の平均×件数で推定する
-        （全件メタ走査だと数万ファイルで数十分かかるため）``None`` なら h5 全体の
-        ファイルサイズを合計する
+        ``None`` なら h5 全体のファイルサイズを合計する
         """
         if keep is None:
             return sum(
@@ -224,7 +221,8 @@ class FeatureStager:
 
         sample_n = min(_SIZE_SAMPLE_FILES, count)
         step = count / sample_n
-        indices = sorted({int(i * step) for i in range(sample_n)})
+        # 各区間の中点を取り単調増加サイズでの先頭偏り（過小評価）を避ける
+        indices = sorted({int((i + 0.5) * step) for i in range(sample_n)})
         sampled = 0
         for idx in indices:
             with h5py.File(os.path.join(feature_root, rels[idx]), "r") as handle:
