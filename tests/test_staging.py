@@ -87,6 +87,31 @@ def test_required_bytes_cls_is_about_half_of_full(tmp_path):
     assert 0 < cls_only < full
 
 
+def test_stage_mean_only_drops_cls(tmp_path):
+    root, slides = _make_root(tmp_path)
+    cache = str(tmp_path / "cache")
+    stager = FeatureStager(cache_dir=cache)
+    stager.stage_set(root, _ENCODER, [_MAG], slides, feature_type="mean")
+    with h5py.File(os.path.join(cache, _ENCODER, f"{_MAG}x", "s0.h5"), "r") as handle:
+        assert POOLED_DATASET in handle and COORDS_DATASET in handle
+        assert CLS_DATASET not in handle
+
+
+def test_stage_subset_tolerates_absent_dataset(tmp_path):
+    # cls 特徴の無い h5（pooled + coords のみ）に対し cls ステージしても壊れない
+    root = str(tmp_path / "feat")
+    path = os.path.join(root, _ENCODER, f"{_MAG}x", "s0.h5")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset(POOLED_DATASET, data=np.zeros((4, _DIM), np.float32))
+        handle.create_dataset(COORDS_DATASET, data=np.zeros((4, 2), np.int64))
+    cache = str(tmp_path / "cache")
+    stager = FeatureStager(cache_dir=cache)
+    stager.stage_set(root, _ENCODER, [_MAG], ["s0"], feature_type="cls")
+    with h5py.File(os.path.join(cache, _ENCODER, f"{_MAG}x", "s0.h5"), "r") as handle:
+        assert COORDS_DATASET in handle and CLS_DATASET not in handle
+
+
 def test_stage_falls_back_when_too_large(tmp_path):
     root, slides = _make_root(tmp_path)
     # 空きのほぼ全量をマージンに取れば必ず収まらない -> NAS 直読フォールバック

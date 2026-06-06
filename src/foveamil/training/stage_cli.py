@@ -19,6 +19,7 @@ from typing import List, Optional, Sequence
 import pandas as pd
 
 from foveamil.cohort.labels import load_slide_ids
+from foveamil.training.accessor import FEATURE_TYPES
 from foveamil.training.staging import STAGE_DIR_ENV, FeatureStager
 
 logger = logging.getLogger(__name__)
@@ -107,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--feature-type",
-        choices=("mean", "cls", "concat"),
+        choices=FEATURE_TYPES,
         default=None,
         help="Stage only this feature's datasets (cls/mean keep that feature "
         "+ coords, halving size); default copies the full h5.",
