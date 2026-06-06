@@ -74,9 +74,16 @@ def _resolve_copy_workers(copy_workers: Optional[int]) -> int:
     return max(1, int(copy_workers))
 
 
-def _write_subset_h5(src: str, dst: str, keep: Set[str]) -> None:
-    """``src`` の ``keep`` データセットと属性のみを ``dst`` の h5 へ書く"""
+def _write_subset_h5(
+    src: str, dst: str, keep: Set[str], store_fp16: bool = False
+) -> None:
+    """``src`` の ``keep`` データセットと属性のみを ``dst`` の h5 へ書く
+
+    ``store_fp16`` 指定時は浮動小数のデータセットを float16 で書く（整数の座標等は
+    元 dtype を保つ）
+    """
     import h5py
+    import numpy as np
 
     with h5py.File(src, "r") as fsrc, h5py.File(dst, "w") as fdst:
         for key, value in fsrc.attrs.items():
@@ -85,17 +92,25 @@ def _write_subset_h5(src: str, dst: str, keep: Set[str]) -> None:
             if name not in fsrc:
                 continue
             source = fsrc[name]
-            out = fdst.create_dataset(name, data=source[()])
+            data = source[()]
+            if store_fp16 and np.issubdtype(data.dtype, np.floating):
+                data = data.astype(np.float16)
+            out = fdst.create_dataset(name, data=data)
             for key, value in source.attrs.items():
                 out.attrs[key] = value
 
 
-def _copy_atomic(src: str, dst: str, keep: Optional[Set[str]] = None) -> None:
+def _copy_atomic(
+    src: str,
+    dst: str,
+    keep: Optional[Set[str]] = None,
+    store_fp16: bool = False,
+) -> None:
     """``src`` を ``dst`` へアトミックにコピーする（tmp 名→rename・冪等）
 
     ``dst`` が既にあれば再利用しコピーしない``keep`` 指定時は h5 全体でなく
     指定データセット（+ root/データセット属性）のみを書いた縮小 h5 を作る``None``
-    なら h5 全体を複製する
+    なら h5 全体を複製する（``store_fp16`` は ``keep`` 指定時のみ有効）
     """
     if os.path.exists(dst):
         return
@@ -104,7 +119,7 @@ def _copy_atomic(src: str, dst: str, keep: Optional[Set[str]] = None) -> None:
     if keep is None:
         shutil.copy2(src, tmp)
     else:
-        _write_subset_h5(src, tmp, keep)
+        _write_subset_h5(src, tmp, keep, store_fp16=store_fp16)
     os.replace(tmp, dst)
 
 
@@ -118,6 +133,7 @@ class FeatureStager:
         free_space_margin: 空き容量の安全マージン（例 ``0.1`` で空きの 90% まで使う）
         copy_workers: コピーの並列ワーカ数``None`` のとき環境変数
             ``FOVEAMIL_STAGE_WORKERS`` を読み，それも無ければ ``DEFAULT_COPY_WORKERS``
+        store_fp16: 縮小コピー時に浮動小数の特徴を float16 で書く（座標は元 dtype）
     """
 
     def __init__(
@@ -125,12 +141,14 @@ class FeatureStager:
         cache_dir: Optional[str] = None,
         free_space_margin: float = DEFAULT_FREE_MARGIN,
         copy_workers: Optional[int] = None,
+        store_fp16: bool = False,
     ) -> None:
         if cache_dir is None:
             cache_dir = os.environ.get(STAGE_DIR_ENV) or _default_cache_dir()
         self.cache_dir = cache_dir
         self.free_space_margin = free_space_margin
         self.copy_workers = _resolve_copy_workers(copy_workers)
+        self.store_fp16 = store_fp16
         self._staged = False
 
     def _target_files(
@@ -165,7 +183,7 @@ class FeatureStager:
         self, src: str, dst: str, keep: Optional[Set[str]] = None
     ) -> None:
         """単一ファイルをアトミックにコピーする（モジュール関数へ委譲）"""
-        _copy_atomic(src, dst, keep)
+        _copy_atomic(src, dst, keep, store_fp16=self.store_fp16)
 
     def _copy_many(
         self,
@@ -178,25 +196,27 @@ class FeatureStager:
         ``copy_workers <= 1`` か対象が 1 件以下なら直列，それ以外は ``spawn`` の
         プロセスプールで並列にコピーする各コピーは冪等で既存はスキップされる
         """
+        store_fp16 = self.store_fp16
         tasks = [
             (
                 os.path.join(feature_root, rel),
                 os.path.join(self.cache_dir, rel),
                 keep,
+                store_fp16,
             )
             for rel in rels
         ]
         if self.copy_workers <= 1 or len(tasks) <= 1:
-            for src, dst, sub in tasks:
-                _copy_atomic(src, dst, sub)
+            for src, dst, sub, fp16 in tasks:
+                _copy_atomic(src, dst, sub, store_fp16=fp16)
             return
         ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(
             max_workers=self.copy_workers, mp_context=ctx
         ) as pool:
             futures = [
-                pool.submit(_copy_atomic, src, dst, sub)
-                for src, dst, sub in tasks
+                pool.submit(_copy_atomic, src, dst, sub, fp16)
+                for src, dst, sub, fp16 in tasks
             ]
             for future in as_completed(futures):
                 future.result()
@@ -208,7 +228,8 @@ class FeatureStager:
 
         ``keep`` 指定時は h5 を等間隔に最大 ``_SIZE_SAMPLE_FILES`` 件サンプルし
         該当データセットの論理サイズ（``shape × itemsize``）の平均×件数で推定する
-        ``None`` なら h5 全体のファイルサイズを合計する
+        （``store_fp16`` 時は浮動小数を 2 バイト換算する）``None`` なら h5 全体の
+        ファイルサイズを合計する
         """
         if keep is None:
             return sum(
@@ -218,6 +239,7 @@ class FeatureStager:
         if count == 0:
             return 0
         import h5py
+        import numpy as np
 
         sample_n = min(_SIZE_SAMPLE_FILES, count)
         step = count / sample_n
@@ -229,9 +251,12 @@ class FeatureStager:
                 for name in keep:
                     if name in handle:
                         dataset = handle[name]
-                        sampled += int(dataset.dtype.itemsize) * int(
-                            dataset.size
-                        )
+                        itemsize = int(dataset.dtype.itemsize)
+                        if self.store_fp16 and np.issubdtype(
+                            dataset.dtype, np.floating
+                        ):
+                            itemsize = 2
+                        sampled += itemsize * int(dataset.size)
         return int(sampled / len(indices) * count)
 
     def stage_set(
@@ -282,9 +307,10 @@ class FeatureStager:
         self._staged = True
 
         logger.info(
-            "staged feature set (%s): need %.2fGB / free %.2fGB / %d files "
+            "staged feature set (%s, %s): need %.2fGB / free %.2fGB / %d files "
             "/ %d workers -> %s",
             feature_type or "full",
+            "fp16" if self.store_fp16 else "fp32",
             required / BYTES_PER_GB,
             free / BYTES_PER_GB,
             len(rels),

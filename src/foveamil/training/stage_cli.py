@@ -66,7 +66,9 @@ def run(args: argparse.Namespace) -> int:
     cache_dir = (
         args.cache_dir or os.environ.get(STAGE_DIR_ENV) or DEFAULT_CACHE_DIR
     )
-    stager = FeatureStager(cache_dir=cache_dir, copy_workers=args.workers)
+    stager = FeatureStager(
+        cache_dir=cache_dir, copy_workers=args.workers, store_fp16=args.fp16
+    )
     staged_root = stager.stage_set(
         args.feature_root,
         args.encoder,
@@ -129,6 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Parallel copy workers (processes); falls back to env "
         f"{STAGE_WORKERS_ENV} then the built-in default.",
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Store float feature datasets as float16 (coords keep their "
+        "dtype), halving size; the loader upcasts to float32 on read.",
     )
     parser.add_argument(
         "--verbose", action="store_true", help="Enable DEBUG logging."
