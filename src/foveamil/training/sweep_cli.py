@@ -22,6 +22,7 @@ import yaml
 
 from foveamil.training.resolve import resolve_paths, resolve_split_files, verify_n_cls
 from foveamil.training.sweep import (
+    DEFAULT_GPU_HEADROOM_MB,
     SWEEP_SUMMARY_MD,
     SweepRunner,
     expand_combos,
@@ -181,6 +182,10 @@ def run(args: argparse.Namespace) -> int:
 
     gpu_ids = _parse_int_list(args.gpu_ids) or parallel_block.get("gpu_ids")
     jobs_per_gpu = args.jobs_per_gpu or parallel_block.get("jobs_per_gpu")
+    mem_per_job_mb = args.mem_per_job_mb or parallel_block.get("mem_per_job_mb")
+    mem_headroom_mb = args.mem_headroom_mb or parallel_block.get(
+        "mem_headroom_mb", DEFAULT_GPU_HEADROOM_MB
+    )
 
     verify_feature_dims(combos)
 
@@ -204,6 +209,8 @@ def run(args: argparse.Namespace) -> int:
             weights_root=weights_out,
             gpu_ids=gpu_ids,
             jobs_per_gpu=jobs_per_gpu,
+            mem_per_job_mb=mem_per_job_mb,
+            mem_headroom_mb=mem_headroom_mb,
         )
         summary = runner.run()
     except Exception as exc:  # noqa: BLE001 - 通知後に再送出する
@@ -251,7 +258,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--jobs-per-gpu",
         type=int,
         default=None,
-        help="Parallel jobs per GPU overriding parallel.jobs_per_gpu.",
+        help="Parallel jobs per GPU overriding parallel.jobs_per_gpu; with "
+        "--mem-per-job-mb it caps concurrent jobs per GPU.",
+    )
+    parser.add_argument(
+        "--mem-per-job-mb",
+        type=int,
+        default=None,
+        help="Use the GPU-memory-aware scheduler, reserving this VRAM (MB) per "
+        "job; injects jobs onto GPUs with enough free memory.",
+    )
+    parser.add_argument(
+        "--mem-headroom-mb",
+        type=int,
+        default=None,
+        help="GPU free-memory safety margin (MB) for the memory-aware scheduler.",
     )
     parser.add_argument(
         "--dry-run",

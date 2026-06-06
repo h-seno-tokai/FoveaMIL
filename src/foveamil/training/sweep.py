@@ -19,6 +19,8 @@ import queue
 import re
 import subprocess
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
@@ -130,6 +132,10 @@ SWEEP_DETAILED_CSV = "sweep_detailed.csv"
 DEFAULT_GPU_IDS = (0,)
 # 既定の GPU あたり並列ジョブ数
 DEFAULT_JOBS_PER_GPU = 1
+# メモリ動的スケジューラの既定 GPU 空きメモリ安全マージン（MB）
+DEFAULT_GPU_HEADROOM_MB = 2000
+# メモリ動的スケジューラの GPU 空きメモリ再取得間隔（秒）
+DEFAULT_MEM_POLL_INTERVAL = 5.0
 # ランキングの主要指標（優先順位順に最初に見つかったものを使う）
 RANK_METRICS = ("macro_auc", "weighted_f1", "macro_f1", "accuracy", "kappa")
 
@@ -695,6 +701,134 @@ def run_jobs_on_gpu_pool(
     return results
 
 
+def query_gpu_free_mb(gpu_ids: Sequence[int]) -> Dict[int, int]:
+    """``nvidia-smi`` で各 GPU の空き VRAM(MB) を返す（取得不能な GPU は 0）"""
+    out = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,memory.free",
+            "--format=csv,noheader,nounits",
+        ]
+    ).decode()
+    free: Dict[int, int] = {}
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 2:
+            free[int(parts[0])] = int(parts[1])
+    return {gpu: free.get(gpu, 0) for gpu in gpu_ids}
+
+
+def run_jobs_on_gpu_memory_pool(
+    jobs: Sequence[Dict[str, Any]],
+    gpu_ids: Sequence[int],
+    run_fn,
+    per_job_mem_mb: int,
+    headroom_mb: int = DEFAULT_GPU_HEADROOM_MB,
+    poll_interval: float = DEFAULT_MEM_POLL_INTERVAL,
+    max_per_gpu: Optional[int] = None,
+    mem_query=None,
+) -> Dict[int, int]:
+    """各 GPU の空き VRAM を見ながらジョブを動的に投入する
+
+    ジョブごとに ``per_job_mem_mb`` を予約し，``空き - headroom_mb - 予約済`` が
+    ``per_job_mem_mb`` 以上ある GPU へ投入する空きは ``mem_query`` で実測し
+    ``poll_interval`` 秒ごとに更新する起動直後の確保前ぶんは予約量が二重に効くため
+    安全側に振れる``max_per_gpu`` を与えると空きに余裕があっても GPU あたりの同時数を
+    抑える``fold_dir`` に ``test_metrics.json`` がある job は GPU を取らずスキップする
+
+    Args:
+        jobs: ジョブ辞書の列（各々 ``fold_dir`` を持つ）
+        gpu_ids: 使用 GPU 一覧
+        run_fn: ``(job, gpu_id) -> returncode`` の実行関数
+        per_job_mem_mb: 1 ジョブが予約する VRAM(MB)
+        headroom_mb: GPU 空きメモリの安全マージン(MB)
+        poll_interval: 空きメモリの再取得間隔(秒)と空き待ちのポーリング間隔
+        max_per_gpu: GPU あたり同時実行数の上限``None`` で無制限（メモリのみで律速）
+        mem_query: ``() -> {gpu_id: free_mb}``テスト用に注入可（既定 ``nvidia-smi``）
+
+    Returns:
+        ジョブ添字 → 終了コード（例外は終了コード 1 に正規化）
+    """
+    gpu_list = list(gpu_ids) if gpu_ids else list(DEFAULT_GPU_IDS)
+    query = mem_query or (lambda: query_gpu_free_mb(gpu_list))
+    reserved = {gpu: 0 for gpu in gpu_list}
+    running = {gpu: 0 for gpu in gpu_list}
+    results: Dict[int, int] = {}
+    cond = threading.Condition()
+    threads: List[threading.Thread] = []
+    free_cache = {"at": 0.0, "free": {gpu: 0 for gpu in gpu_list}}
+
+    def _free_now() -> Dict[int, int]:
+        now = time.monotonic()
+        if now - free_cache["at"] >= poll_interval or free_cache["at"] == 0.0:
+            try:
+                free_cache["free"] = query()
+            except Exception as exc:  # noqa: BLE001 - 取得失敗は警告して前回値を使う
+                logger.warning("gpu memory query failed: %s", exc)
+            free_cache["at"] = now
+        return free_cache["free"]
+
+    def _worker(index: int, job: Dict[str, Any], gpu: int) -> None:
+        try:
+            returncode = run_fn(job, gpu)
+        except Exception as exc:  # noqa: BLE001 - job 失敗で止めない
+            logger.error("job %d (%s) raised: %s", index, job.get("fold_dir"), exc)
+            returncode = 1
+        with cond:
+            reserved[gpu] -= per_job_mem_mb
+            running[gpu] -= 1
+            results[index] = returncode
+            cond.notify_all()
+
+    pending = list(enumerate(jobs))
+    position = 0
+    try:
+        while position < len(pending) or any(running[gpu] for gpu in gpu_list):
+            with cond:
+                while position < len(pending):
+                    index, job = pending[position]
+                    if os.path.exists(
+                        os.path.join(job["fold_dir"], FOLD_RESULT_JSON)
+                    ):
+                        results[index] = 0
+                        position += 1
+                    else:
+                        break
+                placed = False
+                if position < len(pending):
+                    index, job = pending[position]
+                    free = _free_now()
+                    candidates = [
+                        gpu
+                        for gpu in gpu_list
+                        if (free.get(gpu, 0) - headroom_mb - reserved[gpu])
+                        >= per_job_mem_mb
+                        and (max_per_gpu is None or running[gpu] < max_per_gpu)
+                    ]
+                    if candidates:
+                        gpu = max(
+                            candidates, key=lambda g: free.get(g, 0) - reserved[g]
+                        )
+                        reserved[gpu] += per_job_mem_mb
+                        running[gpu] += 1
+                        position += 1
+                        thread = threading.Thread(
+                            target=_worker, args=(index, job, gpu), daemon=True
+                        )
+                        thread.start()
+                        threads.append(thread)
+                        placed = True
+                if not placed:
+                    cond.wait(timeout=poll_interval)
+    except KeyboardInterrupt:
+        logger.warning("interrupted; waiting for running jobs to finish")
+        raise
+    finally:
+        for thread in threads:
+            thread.join()
+    return results
+
+
 def _pick_rank_metric(aggregate: Dict[str, Any]) -> tuple:
     """集計から優先順位順に最初に存在する指標名と mean を返す"""
     for metric in RANK_METRICS:
@@ -739,6 +873,8 @@ class SweepRunner:
         weights_root: str,
         gpu_ids: Optional[Sequence[int]] = None,
         jobs_per_gpu: Optional[int] = None,
+        mem_per_job_mb: Optional[int] = None,
+        mem_headroom_mb: int = DEFAULT_GPU_HEADROOM_MB,
     ) -> None:
         """実行器を初期化する
 
@@ -748,14 +884,20 @@ class SweepRunner:
             out_root: ログ・結果の出力ルート（home）
             weights_root: 重みの出力ルート（Dataset）
             gpu_ids: 使用 GPU 一覧
-            jobs_per_gpu: GPU あたり並列ジョブ数
+            jobs_per_gpu: GPU あたり並列ジョブ数``mem_per_job_mb`` 指定時は GPU
+                あたり同時数の上限として使う（``None`` なら無制限でメモリのみ律速）
+            mem_per_job_mb: 指定すると GPU 空きメモリを見る動的スケジューラを使い
+                ジョブごとに予約する VRAM(MB)``None`` なら固定スロットキュー
+            mem_headroom_mb: メモリ動的時の GPU 空きメモリ安全マージン(MB)
         """
         self.combos = list(combos)
         self.split_files = list(split_files)
         self.out_root = out_root
         self.weights_root = weights_root
         self.gpu_ids = list(gpu_ids if gpu_ids else DEFAULT_GPU_IDS)
-        self.jobs_per_gpu = int(jobs_per_gpu or DEFAULT_JOBS_PER_GPU)
+        self.jobs_per_gpu = int(jobs_per_gpu) if jobs_per_gpu else None
+        self.mem_per_job_mb = mem_per_job_mb
+        self.mem_headroom_mb = mem_headroom_mb
 
     def _combo_dir(self, combo: Combo) -> str:
         return os.path.join(self.out_root, combo.name)
@@ -792,17 +934,13 @@ class SweepRunner:
         return jobs
 
     def run(self) -> Dict[str, Any]:
-        """全 job を動的 GPU キューで並列実行し combo ごとに集計してランキング要約を返す"""
+        """全 job を動的 GPU キューで並列実行し combo ごとに集計してランキング要約を返す
+
+        ``mem_per_job_mb`` 指定時は GPU 空きメモリを見るスケジューラで投入し，未指定なら
+        GPU あたり ``jobs_per_gpu`` の固定スロットキューで投入する
+        """
         os.makedirs(self.out_root, exist_ok=True)
         jobs = self._build_jobs()
-        logger.info(
-            "sweep: %d combos x %d folds = %d jobs, gpu_ids=%s, jobs_per_gpu=%d (dynamic queue)",
-            len(self.combos),
-            len(self.split_files),
-            len(jobs),
-            self.gpu_ids,
-            self.jobs_per_gpu,
-        )
 
         def run_fn(job: Dict[str, Any], gpu_id: int) -> int:
             return _run_fold_job(
@@ -813,9 +951,30 @@ class SweepRunner:
                 gpu_id,
             )
 
-        returncodes = run_jobs_on_gpu_pool(
-            jobs, self.gpu_ids, self.jobs_per_gpu, run_fn
-        )
+        if self.mem_per_job_mb is not None:
+            logger.info(
+                "sweep: %d combos x %d folds = %d jobs, gpu_ids=%s, "
+                "mem_per_job=%dMB headroom=%dMB max_per_gpu=%s (memory-aware queue)",
+                len(self.combos), len(self.split_files), len(jobs), self.gpu_ids,
+                self.mem_per_job_mb, self.mem_headroom_mb, self.jobs_per_gpu,
+            )
+            returncodes = run_jobs_on_gpu_memory_pool(
+                jobs, self.gpu_ids, run_fn,
+                per_job_mem_mb=self.mem_per_job_mb,
+                headroom_mb=self.mem_headroom_mb,
+                max_per_gpu=self.jobs_per_gpu,
+            )
+        else:
+            jobs_per_gpu = self.jobs_per_gpu or DEFAULT_JOBS_PER_GPU
+            logger.info(
+                "sweep: %d combos x %d folds = %d jobs, gpu_ids=%s, "
+                "jobs_per_gpu=%d (fixed-slot queue)",
+                len(self.combos), len(self.split_files), len(jobs), self.gpu_ids,
+                jobs_per_gpu,
+            )
+            returncodes = run_jobs_on_gpu_pool(
+                jobs, self.gpu_ids, jobs_per_gpu, run_fn
+            )
 
         failures: Dict[int, List[int]] = {}
         for index, job in enumerate(jobs):
