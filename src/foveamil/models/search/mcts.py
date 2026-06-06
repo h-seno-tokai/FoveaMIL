@@ -35,6 +35,8 @@ _SUM_FLOOR = 1e-12
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
     """数値安定な softmax を返す（最終軸）"""
+    if logits.size == 0:
+        return logits
     shifted = logits - np.max(logits)
     exp = np.exp(shifted)
     total = exp.sum()

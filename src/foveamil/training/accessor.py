@@ -122,6 +122,23 @@ class FeatureAccessor:
         )
         return np.concatenate([pooled, cls], axis=CONCAT_AXIS)
 
+    def num_patches(self, magnification: float) -> int:
+        """指定倍率のパッチ数を返す（データを読まず shape のみ参照）
+
+        座標データセットの行数をパッチ数とみなす特徴抽出が空（パッチ 0）の
+        スライド検出に使う
+
+        Args:
+            magnification: 倍率
+
+        Returns:
+            パッチ数（座標が無ければ 0）
+        """
+        handle = self._file(magnification)
+        if COORDS_DATASET in handle:
+            return int(handle[COORDS_DATASET].shape[0])
+        return 0
+
     def load_all(self, magnification: float) -> Tensor:
         """指定倍率の全特徴 ``(N, dim) float32`` テンソルを返す
 
@@ -198,12 +215,6 @@ class FeatureAccessor:
                 + handle[CLS_DATASET].shape[CONCAT_AXIS]
             )
         return int(handle[POOLED_DATASET].shape[CONCAT_AXIS])
-
-    def num_patches(self, magnification: float) -> int:
-        """指定倍率のパッチ数を返す"""
-        handle = self._file(magnification)
-        key = CLS_DATASET if self.feature_type == FEATURE_TYPE_CLS else POOLED_DATASET
-        return int(handle[key].shape[0])
 
     def close(self) -> None:
         """キャッシュした全ファイルハンドルを閉じる"""

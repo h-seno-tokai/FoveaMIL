@@ -19,7 +19,14 @@ from foveamil.models.search.mcts import (
     PuctPlanner,
     _completed_q,
     _sequential_halving_schedule,
+    _softmax,
 )
+
+
+def test_softmax_empty_input_does_not_crash():
+    # 空抽出スライド（候補 0）で np.max が空配列で落ちていた 空を返すこと
+    out = _softmax(np.array([], dtype=np.float64))
+    assert out.size == 0
 
 
 # --- 方策ネット ---

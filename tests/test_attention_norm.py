@@ -52,6 +52,16 @@ def test_outputs_nonnegative_and_sum_to_one(name):
     assert torch.allclose(out.sum(dim=-1), torch.ones(4), atol=_SUM_TOL)
 
 
+# --- 空入力（パッチ 0 のバッグ）---
+
+
+@pytest.mark.parametrize("name", ALL_NORMS + ["softmax"])
+def test_empty_input_returns_empty_without_crashing(name):
+    # 空抽出スライド（パッチ 0）で entmax の max が落ちていた 全正規化器が空を返すこと
+    out = _norm(name)(torch.zeros(1, 0))
+    assert out.shape == (1, 0)
+
+
 # --- スパース性（鋭い入力で厳密 0）---
 
 

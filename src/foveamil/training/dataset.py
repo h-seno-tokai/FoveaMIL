@@ -134,18 +134,44 @@ class FeatureBagDataset(Dataset):
 
         samples: List[Tuple[str, int]] = []
         skipped = 0
+        empty = 0
         for slide_id, label in zip(df["slide_id"], df["label"]):
             if slide_id not in wanted:
                 continue
             if label not in self.label_dict:
                 skipped += 1
                 continue
+            if self._is_empty_bag(slide_id):
+                empty += 1
+                continue
             samples.append((slide_id, self.label_dict[label]))
 
         if skipped:
             logger.info("skipped %d slides with labels outside label_dict", skipped)
+        if empty:
+            logger.warning(
+                "skipped %d slides with empty feature bag at %sx (no patches)",
+                empty,
+                self.base_mag,
+            )
         logger.info("FeatureBagDataset: %d slides selected", len(samples))
         return samples
+
+    def _is_empty_bag(self, slide_id: str) -> bool:
+        """最低倍率のパッチ数が 0 なら ``True``（空抽出スライドの除外判定）
+
+        特徴ファイルが無い/読めない場合も学習に使えないため空とみなす
+        """
+        try:
+            accessor = FeatureAccessor(
+                self.feature_root, self.encoder, slide_id, self.feature_type
+            )
+            try:
+                return accessor.num_patches(self.base_mag) == 0
+            finally:
+                accessor.close()
+        except (OSError, KeyError):
+            return True
 
     def __len__(self) -> int:
         return len(self.samples)
