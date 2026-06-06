@@ -215,7 +215,7 @@ class FeatureStager:
             max_workers=self.copy_workers, mp_context=ctx
         ) as pool:
             futures = [
-                pool.submit(_copy_atomic, src, dst, sub, fp16)
+                pool.submit(_copy_atomic, src, dst, sub, store_fp16=fp16)
                 for src, dst, sub, fp16 in tasks
             ]
             for future in as_completed(futures):

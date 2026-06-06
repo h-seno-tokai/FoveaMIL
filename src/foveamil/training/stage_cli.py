@@ -136,7 +136,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--fp16",
         action="store_true",
         help="Store float feature datasets as float16 (coords keep their "
-        "dtype), halving size; the loader upcasts to float32 on read.",
+        "dtype), halving size; the loader upcasts to float32 on read. "
+        "Effective only with --feature-type cls/mean (subset staging); "
+        "no effect on a full/concat copy.",
     )
     parser.add_argument(
         "--verbose", action="store_true", help="Enable DEBUG logging."

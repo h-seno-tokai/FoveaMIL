@@ -179,6 +179,23 @@ def test_stage_fp16_stores_half_precision_and_loads_float32(tmp_path):
     assert np.allclose(feats.numpy(), orig, atol=1e-2)   # fp16 丸め以内
 
 
+def test_accessor_upcasts_fp16_features_to_float32(tmp_path):
+    # fp16 安全性の要: accessor が fp16 保存の特徴を float32 へ復元する契約を直接固定する
+    path = os.path.join(tmp_path, _ENCODER, f"{_MAG}x", "s0.h5")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset(
+            CLS_DATASET, data=np.random.rand(_N, _DIM).astype(np.float16)
+        )
+        handle.create_dataset(
+            COORDS_DATASET, data=np.zeros((_N, 2), np.int64)
+        )
+    acc = FeatureAccessor(str(tmp_path), _ENCODER, "s0", feature_type="cls")
+    assert acc.load_all(_MAG).numpy().dtype == np.float32
+    assert acc.load_patches(_MAG, np.array([0, 2, 1])).numpy().dtype == np.float32
+    acc.close()
+
+
 def test_required_bytes_fp16_smaller_than_fp32(tmp_path):
     root, slides = _make_root(tmp_path)
     keep = {CLS_DATASET, COORDS_DATASET}
