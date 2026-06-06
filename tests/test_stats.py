@@ -7,11 +7,43 @@ import pytest
 from scipy import stats
 
 from foveamil.evaluation.stats import (
+    adjust_pvalues,
     mean_ci_bootstrap,
     mean_ci_t,
     nadeau_bengio_corrected_t,
     wilcoxon_signed_rank,
 )
+
+
+def test_adjust_pvalues_holm():
+    # Holm-Bonferroni step-down（手計算: sorted 0.01,0.03,0.04 → 0.03,0.06,0.06）
+    r = adjust_pvalues([0.01, 0.04, 0.03], method="holm", alpha=0.05)
+    assert r["adjusted"] == pytest.approx([0.03, 0.06, 0.06])
+    assert r["reject"] == [True, False, False]
+    assert r["n"] == 3
+
+
+def test_adjust_pvalues_fdr_bh():
+    # Benjamini-Hochberg step-up（手計算: → 0.03,0.04,0.04）
+    r = adjust_pvalues([0.01, 0.04, 0.03], method="fdr_bh", alpha=0.05)
+    assert r["adjusted"] == pytest.approx([0.03, 0.04, 0.04])
+    assert r["reject"] == [True, True, True]
+
+
+def test_adjust_pvalues_nan_excluded_and_capped():
+    # NaN は族から除外し NaN のまま 補正後は 1.0 で打ち止め
+    r = adjust_pvalues([0.01, float("nan"), 0.5], method="holm", alpha=0.05)
+    assert r["n"] == 2
+    assert r["adjusted"][0] == pytest.approx(0.02)
+    assert math.isnan(r["adjusted"][1])
+    assert r["reject"] == [True, False, False]
+    capped = adjust_pvalues([0.6, 0.7], method="holm")
+    assert capped["adjusted"] == pytest.approx([1.0, 1.0])
+
+
+def test_adjust_pvalues_invalid_method():
+    with pytest.raises(ValueError):
+        adjust_pvalues([0.1], method="bonferroni")
 
 
 def test_mean_ci_t_matches_manual():

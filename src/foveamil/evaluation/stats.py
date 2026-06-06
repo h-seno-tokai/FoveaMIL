@@ -154,3 +154,67 @@ def nadeau_bengio_corrected_t(
         "t": float(t_stat), "pvalue": pvalue, "df": df,
         "mean_diff": mean_diff, "ci_low": mean_diff - half, "ci_high": mean_diff + half,
     }
+
+
+# 多重比較補正法
+ADJUST_HOLM = "holm"
+ADJUST_FDR_BH = "fdr_bh"
+ADJUST_METHODS = (ADJUST_HOLM, ADJUST_FDR_BH)
+
+
+def adjust_pvalues(
+    pvalues: Sequence[float],
+    method: str = ADJUST_HOLM,
+    alpha: float = DEFAULT_ALPHA,
+) -> Dict[str, Any]:
+    """複数の p 値に多重比較補正をかける
+
+    ``holm``（Holm-Bonferroni・FWER 制御）または ``fdr_bh``（Benjamini-Hochberg・
+    FDR 制御）``nan`` の p 値は族から除外し ``nan`` のまま返す（縮退検定を族に入れない）
+    補正後 p は入力順で返し ``reject`` は補正後 p ≤ alpha の真偽列
+
+    Args:
+        pvalues: 補正対象の p 値列（``nan`` 可）
+        method: ``"holm"`` / ``"fdr_bh"``
+        alpha: 有意水準
+
+    Returns:
+        ``{"adjusted", "reject", "method", "n"}``（n は有効族サイズ）
+    """
+    if method not in ADJUST_METHODS:
+        raise ValueError(
+            f"method must be one of {ADJUST_METHODS}, got '{method}'"
+        )
+    p = np.asarray(pvalues, dtype=float)
+    adjusted = np.full(p.shape, _NAN, dtype=float)
+    idx = np.where(~np.isnan(p))[0]
+    m = int(idx.size)
+    if m == 0:
+        return {
+            "adjusted": adjusted.tolist(),
+            "reject": [False] * int(p.size),
+            "method": method,
+            "n": 0,
+        }
+    pv = p[idx]
+    order = np.argsort(pv, kind="stable")
+    ps = pv[order]
+    adj = np.empty(m, dtype=float)
+    if method == ADJUST_HOLM:
+        running = 0.0  # step-down: 昇順に (m-i)*p の累積最大
+        for i in range(m):
+            running = max(running, (m - i) * ps[i])
+            adj[i] = min(running, 1.0)
+    else:  # fdr_bh step-up: 降順に (m/(i+1))*p の累積最小
+        running = 1.0
+        for i in range(m - 1, -1, -1):
+            running = min(running, (m / (i + 1)) * ps[i])
+            adj[i] = min(running, 1.0)
+    restored = np.empty(m, dtype=float)
+    restored[order] = adj
+    adjusted[idx] = restored
+    reject = [
+        bool((not np.isnan(adjusted[i])) and adjusted[i] <= alpha)
+        for i in range(int(p.size))
+    ]
+    return {"adjusted": adjusted.tolist(), "reject": reject, "method": method, "n": m}
