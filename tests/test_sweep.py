@@ -13,6 +13,7 @@ from foveamil.training.sweep import (
     Combo,
     SweepRunner,
     expand_combos,
+    run_jobs_on_gpu_memory_pool,
     run_jobs_on_gpu_pool,
     varying_axis_keys,
 )
@@ -604,3 +605,148 @@ def test_dynamic_pool_records_failures_without_aborting(tmp_path):
     assert results[0] == 0
     assert results[1] == 1  # 例外は終了コード 1 に正規化
     assert results[2] == 7  # 非ゼロ終了コードを保持
+
+
+# --- メモリ動的 GPU スケジューラ ---
+
+
+def test_memory_pool_respects_reserved_memory(tmp_path):
+    import collections
+    import threading
+    import time
+
+    free = {0: 10000, 1: 10000}
+    running = collections.Counter()
+    peak = collections.Counter()
+    lock = threading.Lock()
+
+    def fake(job, gpu):
+        with lock:
+            running[gpu] += 1
+            peak[gpu] = max(peak[gpu], running[gpu])
+        time.sleep(0.03)
+        with lock:
+            running[gpu] -= 1
+        return 0
+
+    jobs = _make_jobs(tmp_path, 18)
+    results = run_jobs_on_gpu_memory_pool(
+        jobs, [0, 1], fake, per_job_mem_mb=3000, headroom_mb=1000,
+        poll_interval=0.01, mem_query=lambda: dict(free),
+    )
+    assert len(results) == 18 and all(rc == 0 for rc in results.values())
+    # 空き 10000 - headroom 1000 = 9000 / 3000 = GPU あたり最大 3
+    for gpu in (0, 1):
+        assert peak[gpu] <= 3
+    assert peak[0] > 0 and peak[1] > 0
+    assert max(peak.values()) == 3  # 充填上限まで使う
+
+
+def test_memory_pool_max_per_gpu_caps_concurrency(tmp_path):
+    import collections
+    import threading
+    import time
+
+    running = collections.Counter()
+    peak = collections.Counter()
+    lock = threading.Lock()
+
+    def fake(job, gpu):
+        with lock:
+            running[gpu] += 1
+            peak[gpu] = max(peak[gpu], running[gpu])
+        time.sleep(0.02)
+        with lock:
+            running[gpu] -= 1
+        return 0
+
+    jobs = _make_jobs(tmp_path, 12)
+    # メモリは潤沢でも max_per_gpu=3 で同時数を抑える
+    run_jobs_on_gpu_memory_pool(
+        jobs, [0], fake, per_job_mem_mb=100, headroom_mb=0, poll_interval=0.01,
+        max_per_gpu=3, mem_query=lambda: {0: 100000},
+    )
+    assert peak[0] == 3
+
+
+def test_memory_pool_skips_done_jobs(tmp_path):
+    done = tmp_path / "done"
+    done.mkdir()
+    (done / FOLD_RESULT_JSON).write_text("{}", encoding="utf-8")
+    todo = tmp_path / "todo"
+    todo.mkdir()
+    called = []
+
+    def fake(job, gpu):
+        called.append(job["fold_dir"])
+        return 0
+
+    jobs = [{"fold_dir": str(done)}, {"fold_dir": str(todo)}]
+    results = run_jobs_on_gpu_memory_pool(
+        jobs, [0], fake, per_job_mem_mb=100, headroom_mb=0, poll_interval=0.01,
+        mem_query=lambda: {0: 100000},
+    )
+    assert results == {0: 0, 1: 0}
+    assert called == [str(todo)]
+
+
+def test_memory_pool_records_failures(tmp_path):
+    def fake(job, gpu):
+        if job["fold_dir"].endswith("bad"):
+            raise RuntimeError("boom")
+        return 0
+
+    ok = tmp_path / "ok"
+    ok.mkdir()
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    results = run_jobs_on_gpu_memory_pool(
+        [{"fold_dir": str(ok)}, {"fold_dir": str(bad)}], [0], fake,
+        per_job_mem_mb=100, headroom_mb=0, poll_interval=0.01,
+        mem_query=lambda: {0: 100000},
+    )
+    assert results[0] == 0 and results[1] == 1
+
+
+def test_memory_pool_serializes_when_only_one_fits(tmp_path):
+    import collections
+    import threading
+    import time
+
+    running = collections.Counter()
+    peak = collections.Counter()
+    lock = threading.Lock()
+
+    def fake(job, gpu):
+        with lock:
+            running[gpu] += 1
+            peak[gpu] = max(peak[gpu], running[gpu])
+        time.sleep(0.02)
+        with lock:
+            running[gpu] -= 1
+        return 0
+
+    jobs = _make_jobs(tmp_path, 5)
+    # 空き 5000 - headroom 1000 = 4000 / per_job 4000 = GPU あたり 1（直列化）
+    run_jobs_on_gpu_memory_pool(
+        jobs, [0], fake, per_job_mem_mb=4000, headroom_mb=1000, poll_interval=0.01,
+        mem_query=lambda: {0: 5000},
+    )
+    assert peak[0] == 1
+
+
+def test_memory_pool_fails_job_that_fits_no_gpu(tmp_path):
+    # per_job がどの GPU 空きより大きい誤設定 -> ハングせず失敗で進める
+    called = []
+
+    def fake(job, gpu):
+        called.append(gpu)
+        return 0
+
+    jobs = _make_jobs(tmp_path, 2)
+    results = run_jobs_on_gpu_memory_pool(
+        jobs, [0], fake, per_job_mem_mb=100000, headroom_mb=0, poll_interval=0.01,
+        mem_query=lambda: {0: 10000},
+    )
+    assert results == {0: 1, 1: 1}  # 配置不能なジョブは失敗扱い
+    assert called == []  # run_fn は呼ばれない
