@@ -28,7 +28,9 @@
 
 set -euo pipefail
 
-CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../configs" && pwd)"
+# 実験 config は頻繁に変わるため git 追跡しない configs/local/ に置く（汎用雛形は
+# configs/sweep.example.yaml）CONFIG_DIR を環境変数で上書きも可
+CONFIG_DIR="${CONFIG_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../configs/local" && pwd)}"
 ABD_CONFIG="${CONFIG_DIR}/sweep_11class_virchow2.yaml"
 MCTS_CONFIG="${CONFIG_DIR}/sweep_11class_virchow2_mcts.yaml"
 

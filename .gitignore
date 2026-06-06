@@ -60,3 +60,6 @@ venv/
 
 # --- ローカル設定 ---
 .claude/
+
+# 実験 sweep config（頻繁に変わるため非追跡 雛形は configs/sweep.example.yaml）
+configs/local/
