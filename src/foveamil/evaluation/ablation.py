@@ -1,24 +1,33 @@
 """sweep 出力をアブレーション表に集計する
 
-各 combo の ``config.yaml`` から手法タグ（ABMIL / CLAM / ZoomMIL ベースライン / A・B・D
-の組合せ / MCTS）と倍率レジームを判定し，``cv_summary.json`` の test 集計から指標の
-mean±std と信頼区間を読む同一倍率レジーム内で多倍率ベースライン（手法すべて off）との
-差分 Δ を付けた markdown 表を作る複数の sweep 出力ルートをまたいで集計できる
-（A/B/D と MCTS を別ルートで回した場合に 1 表へまとめる）
+各 combo の ``config.yaml`` から手法タグ（ABMIL / CLAM / 多倍率ベースライン
+``FoveaMIL(no-A/B/C/D)`` / A・B・D の組合せ / MCTS）と倍率レジームを判定し，
+``cv_summary.json`` の集計から指標の mean±std と信頼区間を読む同一倍率レジーム内で
+多倍率ベースライン（成分すべて off）との差分 Δ・対応 fold 差からの NB 補正 t の p・
+多重比較補正後 p を付け，group-F1（指定クラス集合の非加重平均）も指標にできる
+複数の sweep 出力ルートをまたいで集計できる（成分群と MCTS を別ルートで回した場合に
+1 表へまとめる）素集計（:func:`collect_ablation`）は後方互換で残す
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
+
+from foveamil.evaluation.group_metrics import group_f1_summary
+from foveamil.evaluation.stats import adjust_pvalues, nadeau_bengio_corrected_t
 
 # combo ディレクトリ内のファイル名
 COMBO_CONFIG_NAME = "config.yaml"
 CV_SUMMARY_JSON = "cv_summary.json"
-# 多倍率ベースライン（A/B/D すべて off の差分可能駆動）のラベル
-BASELINE_LABEL = "ZoomMIL(baseline)"
+# 多倍率ベースライン（A/B/C/D すべて off の差分可能駆動）のラベル
+BASELINE_LABEL = "FoveaMIL(no-A/B/C/D)"
+# 成分タグの接頭辞（自前アーキの構成を表す）
+METHOD_PREFIX = "FoveaMIL+"
+# 探索駆動（C）のラベル
+MCTS_LABEL = "FoveaMIL+MCTS(C)"
 # 単一倍率のラベル
 ABMIL_LABEL = "ABMIL"
 CLAM_LABEL = "CLAM"
@@ -58,7 +67,7 @@ def tag_combo(config: Dict[str, Any]) -> Tuple[str, str]:
 
     regime = "multi-" + "/".join(_fmt_mag(m) for m in mags) + "x"
     if config.get(ZOOM_DRIVER_KEY) == ZOOM_DRIVER_MCTS:
-        return regime, "ZoomMIL+MCTS(C)"
+        return regime, MCTS_LABEL
 
     methods = []
     if float(config.get(DECORRELATION_WEIGHT_KEY, 0.0)) > 0.0:
@@ -69,7 +78,7 @@ def tag_combo(config: Dict[str, Any]) -> Tuple[str, str]:
         methods.append("D")
     if not methods:
         return regime, BASELINE_LABEL
-    return regime, "ZoomMIL+" + "".join(methods)
+    return regime, METHOD_PREFIX + "".join(methods)
 
 
 def _fmt_mag(mag: float) -> str:
@@ -144,10 +153,184 @@ def collect_ablation(
     return rows
 
 
+# group-F1 を指す擬似メトリクス名（クラス集合を併せて指定する）
+GROUP_F1_METRIC = "group_f1"
+
+
+def _per_fold(summary: Dict[str, Any], split: str) -> List[Dict[str, float]]:
+    """cv_summary から当該 split の per_fold 指標列を取り出す"""
+    return summary.get(split, {}).get("per_fold", [])
+
+
+def _metric_per_fold(
+    summary: Dict[str, Any],
+    split: str,
+    metric: str,
+    group_classes: Optional[Sequence[int]] = None,
+) -> List[float]:
+    """combo の per_fold から ``metric`` の fold ごとの値列を作る
+
+    ``metric == GROUP_F1_METRIC`` のときは ``group_classes`` の非加重平均（group-F1）を
+    fold ごとに算出する通常指標は per_fold 辞書のキーをそのまま読む（欠損 fold は除外）
+
+    Args:
+        summary: combo の ``cv_summary.json`` 辞書
+        split: ``test`` / ``val``
+        metric: 指標名または ``GROUP_F1_METRIC``
+        group_classes: group-F1 のクラス index 集合
+
+    Returns:
+        fold ごとの値列（group-F1 では nan を含み得る）
+    """
+    folds = _per_fold(summary, split)
+    if metric == GROUP_F1_METRIC:
+        return group_f1_summary(folds, group_classes or [])["per_fold"]
+    return [float(m[metric]) for m in folds if metric in m]
+
+
+def _row_mean_std(values: Sequence[float]) -> Tuple[float, float, int]:
+    """nan を除いた値列の ``(mean, std, n)`` を返す有効値なしは nan"""
+    import numpy as np
+
+    valid = [v for v in values if not np.isnan(v)]
+    if not valid:
+        return float("nan"), float("nan"), 0
+    return float(np.mean(valid)), float(np.std(valid)), len(valid)
+
+
+def collect_ablation_rows(
+    out_roots: List[str],
+    metric: str,
+    split: str = "test",
+    group_classes: Optional[Sequence[int]] = None,
+) -> List[Dict[str, Any]]:
+    """per_fold を保持した combo 行を集める（差分・検定の素材）
+
+    各 combo の per_fold から ``metric``（または group-F1）の fold 値列を取り出し，
+    mean/std と共に保持する``cv_summary`` の per_fold に当該指標が無い combo は飛ばす
+    （group-F1 は全 fold で構成クラスが欠損なら飛ばす）
+
+    Args:
+        out_roots: sweep の ``--out`` ルートの列
+        metric: 指標名または ``GROUP_F1_METRIC``
+        split: 集計する split（``test`` / ``val``）
+        group_classes: group-F1 のクラス index 集合
+
+    Returns:
+        行辞書の列（``regime`` / ``label`` / ``per_fold`` / ``mean`` / ``std`` /
+        ``n`` / ``combo`` / ``root``）
+    """
+    import numpy as np
+
+    rows: List[Dict[str, Any]] = []
+    for root in out_roots:
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            combo_dir = os.path.join(root, name)
+            config = _read_yaml(os.path.join(combo_dir, COMBO_CONFIG_NAME))
+            summary = _read_json(os.path.join(combo_dir, CV_SUMMARY_JSON))
+            if config is None or summary is None:
+                continue
+            values = _metric_per_fold(summary, split, metric, group_classes)
+            if not values or all(np.isnan(v) for v in values):
+                continue
+            mean, std, n = _row_mean_std(values)
+            regime, label = tag_combo(config)
+            rows.append(
+                {
+                    "regime": regime,
+                    "label": label,
+                    "per_fold": list(values),
+                    "mean": mean,
+                    "std": std,
+                    "n": n,
+                    "combo": name,
+                    "root": root,
+                }
+            )
+    return rows
+
+
+def compare_to_baseline(
+    rows: List[Dict[str, Any]],
+    n_train: int,
+    n_test: int,
+    baseline_label: str = BASELINE_LABEL,
+    adjust_method: str = "holm",
+) -> List[Dict[str, Any]]:
+    """各レジーム内で baseline 行に対する Δ・NB 補正 t の p・補正後 p を付与する
+
+    レジームごとに ``baseline_label`` の行を基準にし，各 method の対応 fold 差
+    （method - baseline・共通 fold 数まで）から平均差 Δ と Nadeau-Bengio 補正 t の
+    p 値を求める同一レジームの method 群の p に :func:`adjust_pvalues` で多重比較補正を
+    かけ補正後 p を付ける baseline が無いレジーム・baseline 自身・fold 数不一致の縮退では
+    Δ/p を ``None``/``nan`` にする入力 ``rows`` は :func:`collect_ablation_rows` の行
+
+    Args:
+        rows: per_fold を持つ combo 行
+        n_train: 1 fold の訓練サンプル数（NB 補正用）
+        n_test: 1 fold の test サンプル数（NB 補正用）
+        baseline_label: 基準とする手法ラベル
+        adjust_method: 多重比較補正法（``holm`` / ``fdr_bh``）
+
+    Returns:
+        ``rows`` の各行に ``delta`` / ``pvalue`` / ``pvalue_adj`` を加えた新しい行列
+    """
+    by_regime: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        by_regime.setdefault(row["regime"], []).append(row)
+
+    enriched: List[Dict[str, Any]] = []
+    for regime in sorted(by_regime):
+        group = by_regime[regime]
+        baseline = next(
+            (r for r in group if r["label"] == baseline_label), None
+        )
+        base_fold = baseline["per_fold"] if baseline is not None else None
+
+        pvalues: List[float] = []
+        targets: List[Dict[str, Any]] = []
+        out_group: List[Dict[str, Any]] = []
+        for row in group:
+            new_row = dict(row)
+            new_row["delta"] = None
+            new_row["pvalue"] = float("nan")
+            new_row["pvalue_adj"] = float("nan")
+            if base_fold is not None and row["label"] != baseline_label:
+                diffs = _paired_diffs(row["per_fold"], base_fold)
+                if diffs:
+                    new_row["delta"] = float(sum(diffs) / len(diffs))
+                    res = nadeau_bengio_corrected_t(diffs, n_train, n_test)
+                    new_row["pvalue"] = res["pvalue"]
+                    pvalues.append(res["pvalue"])
+                    targets.append(new_row)
+            out_group.append(new_row)
+
+        if pvalues:
+            adjusted = adjust_pvalues(pvalues, method=adjust_method)["adjusted"]
+            for target, adj in zip(targets, adjusted):
+                target["pvalue_adj"] = adj
+        enriched.extend(out_group)
+    return enriched
+
+
+def _paired_diffs(a: Sequence[float], b: Sequence[float]) -> List[float]:
+    """共通 fold まで対応差 ``a - b`` を取り両方有効な fold のみ残す"""
+    import numpy as np
+
+    n = min(len(a), len(b))
+    diffs: List[float] = []
+    for i in range(n):
+        if not (np.isnan(a[i]) or np.isnan(b[i])):
+            diffs.append(float(a[i] - b[i]))
+    return diffs
+
+
 def format_markdown(rows: List[Dict[str, Any]], metric: str, split: str = "test") -> str:
     """アブレーション行を倍率レジームごとの markdown 表に整形する
 
-    各レジーム内で多倍率ベースライン（``ZoomMIL(baseline)``）との差分 Δ を付けるベース
+    各レジーム内で多倍率ベースライン（``FoveaMIL(no-A/B/C/D)``）との差分 Δ を付けるベース
     ラインが無いレジーム（単一倍率など）では Δ 欄を空にする
 
     Args:
@@ -187,6 +370,65 @@ def format_markdown(rows: List[Dict[str, Any]], metric: str, split: str = "test"
                 delta = "-"
             lines.append(
                 f"| {row['label']} | {mean_std} | {ci} | {delta} | {row['combo']} |"
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _fmt_p(value: Optional[float]) -> str:
+    """p 値（nan/None 可）を表示文字列にする"""
+    import numpy as np
+
+    if value is None or np.isnan(value):
+        return "-"
+    return f"{value:.4g}"
+
+
+def format_markdown_compare(
+    rows: List[Dict[str, Any]],
+    metric: str,
+    split: str = "test",
+    adjust_method: str = "holm",
+) -> str:
+    """Δ・補正 t の p・補正後 p を含むアブレーション表に整形する
+
+    入力は :func:`compare_to_baseline` の行（``delta`` / ``pvalue`` / ``pvalue_adj``
+    を持つ）レジームごとに mean±std・Δ・p・補正後 p を並べる
+
+    Args:
+        rows: 差分・検定を付与した combo 行
+        metric: 表に出す指標名
+        split: 集計 split（見出し用）
+        adjust_method: 補正後 p 列の見出しに出す補正法名
+
+    Returns:
+        markdown 文字列
+    """
+    if not rows:
+        return f"# Ablation ({metric}, {split})\n\n(no combos found)\n"
+
+    regimes: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        regimes.setdefault(row["regime"], []).append(row)
+
+    lines = [f"# Ablation ({metric}, {split})", ""]
+    for regime in sorted(regimes):
+        group = sorted(regimes[regime], key=lambda r: r["mean"], reverse=True)
+        lines.append(f"## {regime}")
+        lines.append("")
+        lines.append(
+            f"| method | {metric} (mean ± std) | Δ vs baseline | p (NB) | "
+            f"p ({adjust_method}) | combo |"
+        )
+        lines.append("|---|---|---|---|---|---|")
+        for row in group:
+            mean_std = f"{row['mean']:.4f} ± {row['std']:.4f}"
+            delta = f"{row['delta']:+.4f}" if row.get("delta") is not None else "-"
+            p_raw = _fmt_p(row.get("pvalue"))
+            p_adj = _fmt_p(row.get("pvalue_adj"))
+            lines.append(
+                f"| {row['label']} | {mean_std} | {delta} | {p_raw} | {p_adj} | "
+                f"{row['combo']} |"
             )
         lines.append("")
     return "\n".join(lines)
