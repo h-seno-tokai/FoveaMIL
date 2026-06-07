@@ -115,7 +115,20 @@
 
 ## heads.py（識別器）
 
-`LinearClassifierHead(in_dim, n_cls)`．`forward(x: [B, in_dim]) -> logits: [B, n_cls]`．融合と分離した独立部品．
+融合済み特徴 `[B, in_dim]` をクラスロジット `[B, n_cls]` へ写す部品群．融合と分離した独立部品で，出力契約 `[B, n_cls]` は全ヘッド共通．
+
+- `LinearClassifierHead(in_dim, n_cls)`：`Linear(in_dim, n_cls)` の線形ヘッド．`forward(x: [B, in_dim]) -> logits: [B, n_cls]`．
+- `MLPClassifierHead(in_dim, n_cls, hidden_dim=None, dropout=None)`：`Linear → LayerNorm → ReLU → Dropout → Linear` の 2 層 MLP ヘッド．LayerNorm を非線形の前に置き活性前の分布を安定させる．`hidden_dim=None` で既定中間次元（`DEFAULT_MLP_HIDDEN_DIM=512`），`dropout=None` で Dropout なし．
+
+### 公開 API
+
+- `build_head(name, in_dim, n_cls, hidden_dim=None, dropout=None) -> nn.Module`：レジストリ `HEAD_METHODS` から識別器ヘッドを構築する．未登録名は `KeyError`．`hidden_dim` / `dropout` は `"mlp"` のときのみ有効で，`"linear"` はこれらを受け取らず既定の `LinearClassifierHead` と数値一致する．
+- 登録済み：`"linear"`，`"mlp"`．
+
+### 新しいヘッドの追加
+
+1. `nn.Module` を継承し，`forward(x: [B, in_dim]) -> [B, n_cls]` を実装する．
+2. `heads.py` の `HEAD_METHODS` に `"name": クラス` を追加する（追加引数を取る場合は `build_head` の分岐に手当てする）．
 
 ## instance.py（インスタンス補助損失）
 
