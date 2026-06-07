@@ -78,16 +78,46 @@ class BagMixup:
         return self.alpha > MIXUP_DISABLED_ALPHA
 
     def _sample_lam(self, device: torch.device) -> Tensor:
-        """Beta(alpha, alpha) から補間係数 λ を引く"""
-        beta = torch.distributions.Beta(self.alpha, self.alpha)
-        if self.generator is not None:
-            # Beta は generator を取らないため一様 2 本から決定的に合成する
-            u = torch.rand(2, generator=self.generator)
-            g1 = u[0].clamp_min(torch.finfo(torch.float32).tiny).log().neg()
-            g2 = u[1].clamp_min(torch.finfo(torch.float32).tiny).log().neg()
-            lam = g1 / (g1 + g2)
-            return lam.to(device)
-        return beta.sample().to(device)
+        """Beta(alpha, alpha) から補間係数 λ を引く
+
+        ``torch.distributions.Beta`` は generator を取らず global RNG を汚すため
+        generator 付きで Gamma(alpha, 1) を 2 本引き λ=g1/(g1+g2) として Beta(α,α) を
+        合成する（Gamma 比＝Beta の定義）generator が無い場合のみ Beta.sample に委譲する
+        """
+        if self.generator is None:
+            return torch.distributions.Beta(self.alpha, self.alpha).sample().to(device)
+        g1 = self._sample_gamma(self.alpha)
+        g2 = self._sample_gamma(self.alpha)
+        total = (g1 + g2).clamp_min(torch.finfo(torch.float32).tiny)
+        return (g1 / total).to(device)
+
+    def _sample_gamma(self, shape: float) -> Tensor:
+        """generator 付きで Gamma(shape, 1)（scale=1）を 1 サンプル引く
+
+        Marsaglia-Tsang 法（shape>=1）で引き shape<1 は boost で補正する
+        （Gamma(α)=Gamma(α+1)·U^(1/α)）global RNG を汚さず決定的に動く
+        """
+        # shape<1 は boost: Gamma(α+1) を引いて U^(1/α) を掛ける
+        if shape < 1.0:
+            g = self._sample_gamma(shape + 1.0)
+            u = torch.rand(1, generator=self.generator)[0]
+            u = u.clamp_min(torch.finfo(torch.float32).tiny)
+            return g * u.pow(1.0 / shape)
+        # Marsaglia-Tsang（shape>=1）棄却採択で 1 サンプル得るまで反復する
+        d = shape - 1.0 / 3.0
+        c = 1.0 / (9.0 * d) ** 0.5
+        while True:
+            x = torch.randn(1, generator=self.generator)[0]
+            v = (1.0 + c * x) ** 3
+            if v <= 0:
+                continue
+            u = torch.rand(1, generator=self.generator)[0]
+            x2 = x * x
+            # 採択条件（簡易版を先に試し 不成立なら対数版で判定）
+            if u < 1.0 - 0.0331 * x2 * x2:
+                return d * v
+            if u.log() < 0.5 * x2 + d * (1.0 - v + v.log()):
+                return d * v
 
     def _one_hot(self, target: Tensor) -> Tensor:
         """ラベル整数 ``[B]`` を one-hot ``[B, n_cls]``（float）にする"""

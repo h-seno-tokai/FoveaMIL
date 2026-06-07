@@ -128,6 +128,71 @@ def test_mixup_deterministic_with_seeded_generator():
     assert torch.equal(run(), run())
 
 
+def _lam_samples(alpha, n, seed=0):
+    # generator 経路（本番経路）で λ を n 本引く
+    gen = torch.Generator()
+    gen.manual_seed(seed)
+    mixup = BagMixup(alpha=alpha, n_cls=2, generator=gen)
+    return torch.stack(
+        [mixup._sample_lam(torch.device("cpu")) for _ in range(n)]
+    )
+
+
+def test_mixup_lam_variance_decreases_monotonically_in_alpha():
+    # Beta(α,α) の分散 1/(4(2α+1)) は α 増で単調減少 generator 経路で再現すること
+    n = 8000
+    alphas = [0.2, 0.5, 1.0, 2.0, 5.0]
+    variances = [_lam_samples(a, n).var().item() for a in alphas]
+    for lo, hi in zip(variances, variances[1:]):
+        assert hi < lo, f"var が単調減少でない: {variances}"
+
+
+def test_mixup_lam_variance_close_to_beta_theory():
+    # generator 経路の var が Beta(α,α) 理論値に近接（旧バグでは α 非依存の一様だった）
+    n = 12000
+    for alpha in (0.5, 1.0, 3.0):
+        var = _lam_samples(alpha, n).var().item()
+        theory = 1.0 / (4.0 * (2.0 * alpha + 1.0))
+        assert abs(var - theory) < 0.015, (
+            f"alpha={alpha}: var={var:.5f} theory={theory:.5f}"
+        )
+
+
+def test_mixup_lam_not_uniform_for_concentrated_alpha():
+    # α 大は λ が 0.5 付近に集中（旧バグの一様 var=1/12 とは明確に異なる）
+    # 旧バグでは α に依らず var≈1/12 だったため この差が回帰を捕える
+    var = _lam_samples(5.0, 12000).var().item()
+    assert var < 1.0 / 12.0 - 0.03
+
+
+def test_mixup_lam_alpha_one_is_uniform():
+    # α=1 で Beta(1,1)=Uniform var≈1/12
+    var = _lam_samples(1.0, 12000).var().item()
+    assert abs(var - 1.0 / 12.0) < 0.01
+
+
+def test_mixup_lam_deterministic_same_seed():
+    # 同一 seed で λ 列が完全一致（決定的・global RNG 非汚染）
+    assert torch.equal(_lam_samples(0.3, 200, seed=7), _lam_samples(0.3, 200, seed=7))
+
+
+def test_mixup_lam_does_not_pollute_global_rng():
+    # generator 経路は global RNG を進めない（汚染しない）
+    torch.manual_seed(0)
+    before = torch.rand(3)
+    torch.manual_seed(0)
+    _lam_samples(0.4, 100)
+    after = torch.rand(3)
+    assert torch.equal(before, after)
+
+
+def test_mixup_lam_finite_and_in_unit_interval():
+    # α<1（境界）でも λ は有限かつ (0,1) に収まる
+    lams = _lam_samples(0.1, 3000)
+    assert torch.isfinite(lams).all()
+    assert (lams >= 0.0).all() and (lams <= 1.0).all()
+
+
 # --- ordinal 補助損失 ---
 
 
