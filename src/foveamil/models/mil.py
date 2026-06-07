@@ -11,7 +11,8 @@
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Tuple
+import re
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -56,6 +57,11 @@ _ATTENTION_N_CLS = 1
 _SCORE_AXIS = 1
 # Y_hat 抽出時に取り出す上位ロジット数
 _TOP1 = 1
+# 集約器導入前の旧 checkpoint の主アテンションキー（``attentions.<i>.<rest>``）
+# ``aux_attentions.*`` を巻き込まないよう先頭一致で捉える
+_LEGACY_PRIMARY_RE = re.compile(r"^attentions\.(\d+)\.(.+)$")
+# 旧キーの remap 先（``abmil`` 集約器の ``aggregators.<i>.attention.<rest>``）
+_AGGREGATOR_ATTENTION_FMT = "aggregators.{idx}.attention.{rest}"
 
 
 def _build_projection(
@@ -66,6 +72,45 @@ def _build_projection(
     if dropout is not None:
         layers.append(nn.Dropout(dropout))
     return nn.Sequential(*layers)
+
+
+def remap_legacy_aggregator_keys(
+    state_dict: Dict[str, Tensor], prefix: str, target_keys: set
+) -> List[Tuple[str, str]]:
+    """集約器導入前の旧主アテンションキーを ``abmil`` 集約器のキーへ改名する
+
+    集約器導入で主アテンションの state_dict キーが ``attentions.<i>.<rest>`` から
+    ``aggregators.<i>.attention.<rest>`` へ改名された旧 checkpoint は全て ``abmil``
+    相当のため，旧キーを新キーへ写してから strict ロードできるようにする``state_dict``
+    を in-place で書き換える``aux_attentions.*`` は新旧で不変なので触れない
+
+    Args:
+        state_dict: ロード対象の state_dict（``prefix`` 付きキー）in-place で改名される
+        prefix: この module の state_dict 接頭辞（root なら空文字）
+        target_keys: 改名先の妥当性を判定する許容キー集合（``prefix`` 付き）
+            旧→新の写し先がここに含まれる時だけ改名する（``abmil`` 限定の根拠）
+
+    Returns:
+        ``(旧キー, 新キー)`` の対応リスト（決定的に旧キー名でソート）
+    """
+    remapped: List[Tuple[str, str]] = []
+    for old_key in sorted(state_dict.keys()):
+        if not old_key.startswith(prefix):
+            continue
+        local = old_key[len(prefix):]
+        match = _LEGACY_PRIMARY_RE.match(local)
+        if match is None:
+            continue
+        new_local = _AGGREGATOR_ATTENTION_FMT.format(
+            idx=match.group(1), rest=match.group(2)
+        )
+        new_key = prefix + new_local
+        # 写し先が現モデルのキーに無い（=非 abmil 集約器）なら改名しない
+        if new_key not in target_keys:
+            continue
+        state_dict[new_key] = state_dict.pop(old_key)
+        remapped.append((old_key, new_key))
+    return remapped
 
 
 class FoveaMIL(nn.Module):
@@ -163,6 +208,22 @@ class FoveaMIL(nn.Module):
             InstanceClusteringLoss(out_feat_dim, n_cls, inst_k, inst_subtyping)
             if instance_loss
             else None
+        )
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, *args, **kwargs
+    ):
+        """ロード直前に旧 checkpoint の主アテンションキーを remap する
+
+        集約器導入で ``attentions.<i>.<rest>`` → ``aggregators.<i>.attention.<rest>``
+        とキー名が変わったため，旧キーを持つ checkpoint をそのまま strict ロードすると
+        失敗する写し先が現モデルのキーに在る時だけ（=``abmil`` 集約器の時だけ）改名し，
+        新キーの checkpoint はそのまま通す
+        """
+        target_keys = {prefix + k for k in self.state_dict().keys()}
+        remap_legacy_aggregator_keys(state_dict, prefix, target_keys)
+        return super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, *args, **kwargs
         )
 
     def _project_and_pool(

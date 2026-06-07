@@ -269,3 +269,87 @@ def test_forward_with_instance_loss_shares_one_forward():
 def test_instance_loss_requires_single_magnification():
     with pytest.raises(ValueError, match="single magnification"):
         FoveaMIL(in_feat_dim=8, out_feat_dim=12, n_cls=3, num_layers=2, instance_loss=True)
+
+
+# --- 旧 checkpoint キーの remap（集約器導入による後方互換破壊の修正）---
+
+
+def _legacy_state_dict(model):
+    """新 state_dict から旧 checkpoint 相当の主アテンションキーを合成する
+
+    ``aggregators.<i>.attention.<rest>`` → ``attentions.<i>.<rest>`` と巻き戻し，
+    その他（projections / aux_attentions / head）は不変のまま返す
+    """
+    legacy = {}
+    for key, value in model.state_dict().items():
+        if key.startswith("aggregators."):
+            idx = key.split(".")[1]
+            rest = key.split(".", 3)[3]  # aggregators.<i>.attention. 以降
+            legacy[f"attentions.{idx}.{rest}"] = value.clone()
+        else:
+            legacy[key] = value.clone()
+    return legacy
+
+
+def test_load_state_dict_remaps_legacy_keys_strict():
+    # 旧キーの state_dict を新 FoveaMIL に strict ロードでき，重みが bit 一致する
+    src = _build_model(num_layers=2)
+    legacy = _legacy_state_dict(src)
+    assert any(k.startswith("attentions.") for k in legacy)
+    dst = _build_model(num_layers=2)
+    dst.load_state_dict(legacy)  # strict=True 既定で例外が出ない
+    for key, value in src.state_dict().items():
+        assert torch.equal(value, dst.state_dict()[key]), key
+
+
+def test_load_state_dict_accepts_new_keys_unchanged():
+    # 新キーの state_dict はそのまま strict ロードできる（remap で壊さない）
+    src = _build_model(num_layers=2)
+    dst = _build_model(num_layers=2)
+    dst.load_state_dict(src.state_dict())
+    for key, value in src.state_dict().items():
+        assert torch.equal(value, dst.state_dict()[key]), key
+
+
+def test_legacy_remap_does_not_touch_aux_attentions():
+    # aux_attentions.* は新旧で不変remap の先頭一致が aux_ を巻き込まない
+    from foveamil.models.mil import remap_legacy_aggregator_keys
+
+    model = _build_model(num_layers=2)
+    aux_key = "aux_attentions.0.attention_a.0.weight"
+    state = {aux_key: torch.zeros_like(model.state_dict()[aux_key])}
+    remapped = remap_legacy_aggregator_keys(state, "", set(model.state_dict().keys()))
+    assert remapped == []
+    assert aux_key in state
+
+
+def test_legacy_remap_limited_to_abmil_aggregator():
+    # 非 abmil 集約器（self_attn）では写し先が無いため旧キーを remap しない
+    from foveamil.models.mil import remap_legacy_aggregator_keys
+
+    model = FoveaMIL(
+        in_feat_dim=8,
+        hidden_feat_dim=16,
+        out_feat_dim=12,
+        n_cls=3,
+        num_layers=2,
+        aggregator="self_attn",
+    )
+    state = {"attentions.0.attention_a.0.weight": torch.zeros(16, 12)}
+    remapped = remap_legacy_aggregator_keys(state, "", set(model.state_dict().keys()))
+    assert remapped == []
+    assert "attentions.0.attention_a.0.weight" in state
+
+
+def test_legacy_remap_is_deterministic():
+    # 同じ入力で remap 結果（旧→新の対応）が決定的に一致する
+    from foveamil.models.mil import remap_legacy_aggregator_keys
+
+    model = _build_model(num_layers=2)
+    target = set(model.state_dict().keys())
+    first = remap_legacy_aggregator_keys(_legacy_state_dict(model), "", target)
+    second = remap_legacy_aggregator_keys(_legacy_state_dict(model), "", target)
+    assert first == second
+    assert first  # 主アテンション分の対応が存在する
+    assert all(old.startswith("attentions.") for old, _ in first)
+    assert all(new.startswith("aggregators.") for _, new in first)
