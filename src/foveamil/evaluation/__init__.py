@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+from foveamil.evaluation.calibration import (
+    apply_calibration,
+    calibrate_val_to_test,
+    evaluate_predictions,
+    extract_logits,
+    fit_class_deltas,
+    fit_temperature,
+)
 from foveamil.evaluation.curves import (
     epoch_curve,
     per_class_f1_bars,
@@ -35,6 +43,12 @@ __all__ = [
     "load_predictions",
     "pool_predictions",
     "compute_ece",
+    "extract_logits",
+    "fit_temperature",
+    "fit_class_deltas",
+    "apply_calibration",
+    "evaluate_predictions",
+    "calibrate_val_to_test",
     "plot_roc",
     "plot_pr",
     "plot_calibration",
