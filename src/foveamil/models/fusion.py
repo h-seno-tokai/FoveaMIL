@@ -127,7 +127,9 @@ class ScaleSelfAttentionFusion(Fusion):
 
     L 個のスケール表現を ``[B, L, dim]`` のトークン列とみなし，少数層の自己
     アテンションでスケール間の相互作用を通したのちスケール軸で平均し ``[B, dim]``
-    を返す単一倍率ではトークン 1 個の自己アテンションを経て ``M`` を返す（縮退安全）
+    を返す単一倍率では L=1 でも自己アテンション層を通すため恒等ではないが
+    出力形状 ``[B, dim]`` の契約は保つ
+    ``dim`` が ``num_heads`` で割り切れない場合は 1 ヘッドへフォールバックする
 
     Args:
         dim: 各倍率の表現次元
@@ -135,9 +137,6 @@ class ScaleSelfAttentionFusion(Fusion):
         attention_layers: 自己アテンション層数
         num_heads: アテンションヘッド数
         dropout: Dropout 率``None`` なら 0
-
-    Raises:
-        ValueError: ``dim`` が ``num_heads`` で割り切れない場合
     """
 
     def __init__(
