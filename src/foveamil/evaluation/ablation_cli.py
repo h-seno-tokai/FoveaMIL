@@ -4,7 +4,9 @@
 レジームごとに多倍率ベースラインとの差分 Δ を付けた markdown 表を標準出力（と任意の
 ファイル）へ書く``--baseline`` 指定時は対応 fold 差から NB 補正 t の p と多重比較
 補正後 p を付け，``--metric group_f1 --group-classes ...`` で group-F1 を集計できる
-学習はしない（保存済みの ``cv_summary.json`` を読むだけ）
+``--pooled --baseline ... --group-classes ...`` 指定時は全 fold の保存済み予測を
+プールし，baseline との対応症例上でプール group-F1 の Δ・並べ替え検定 p・クラス層化
+bootstrap CI を出す学習はしない（保存済みの ``cv_summary.json`` / 予測 CSV を読むだけ）
 """
 
 from __future__ import annotations
@@ -20,8 +22,16 @@ from foveamil.evaluation.ablation import (
     compare_to_baseline,
     format_markdown,
     format_markdown_compare,
+    format_markdown_pooled,
+    pooled_group_f1_compare,
 )
-from foveamil.evaluation.stats import ADJUST_HOLM, ADJUST_METHODS
+from foveamil.evaluation.stats import (
+    ADJUST_HOLM,
+    ADJUST_METHODS,
+    DEFAULT_N_BOOT,
+    DEFAULT_N_PERM,
+    DEFAULT_SEED,
+)
 
 # 既定の集計指標
 DEFAULT_METRIC = "weighted_f1"
@@ -74,6 +84,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Multiple-comparison correction for the p column.",
     )
     parser.add_argument(
+        "--pooled", action="store_true",
+        help="Pool fold predictions for group-F1 permutation test and "
+        "stratified bootstrap CI vs --baseline (needs --group-classes).",
+    )
+    parser.add_argument(
+        "--n-perm", type=int, default=DEFAULT_N_PERM,
+        help="Permutation iterations for --pooled.",
+    )
+    parser.add_argument(
+        "--n-boot", type=int, default=DEFAULT_N_BOOT,
+        help="Bootstrap iterations for --pooled.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=DEFAULT_SEED,
+        help="Random seed for --pooled (deterministic).",
+    )
+    parser.add_argument(
         "--out", default=None, help="Optional path to write the markdown table."
     )
     return parser
@@ -83,7 +110,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
     group_classes = _parse_group_classes(args.group_classes)
 
-    if args.baseline:
+    if args.pooled:
+        if not args.baseline:
+            raise SystemExit("--pooled requires --baseline")
+        if not group_classes:
+            raise SystemExit("--pooled requires --group-classes")
+        rows = collect_ablation_rows(
+            args.inputs, GROUP_F1_METRIC, args.split, group_classes=group_classes
+        )
+        enriched = pooled_group_f1_compare(
+            rows, group_classes, split=args.split, baseline_label=args.baseline,
+            n_perm=args.n_perm, n_boot=args.n_boot, seed=args.seed,
+        )
+        table = format_markdown_pooled(enriched, args.split)
+    elif args.baseline:
         if args.n_train is None or args.n_test is None:
             raise SystemExit("--baseline requires --n-train and --n-test")
         rows = collect_ablation_rows(

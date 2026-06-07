@@ -1,19 +1,31 @@
-"""保存済み per-fold 指標から指定クラス集合の group-F1 を算出する
+"""保存済み per-fold 指標と保存済み予測から指定クラス集合の group-F1 を算出する
 
 ``cv_summary.json`` の per_fold に格納された per-class F1（``class_i_f1``）を読み，
 指定したクラス index 集合の非加重平均（macro 相当）を fold ごとに求める集合内の
-per-class 値も併記できる空集合・欠損クラスでは ``nan`` を返し例外を投げない学習や
+per-class 値も併記できる空集合・欠損クラスでは ``nan`` を返し例外を投げない
+保存済み予測（``predictions_{split}.csv`` の ``y_true`` / ``y_pred``）を全 fold で
+プールし，同じクラス集合の非加重平均 F1 を 1 値として算出することもできる学習や
 再推論はせず保存済み値を二次利用するだけ
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence
+import os
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
+import pandas as pd
+from sklearn.metrics import f1_score
+
+from foveamil.evaluation.report import FOLD_DIR_PREFIX, pool_predictions
 
 # per-fold 指標辞書での per-class F1 キーの書式
 CLASS_F1_KEY_TEMPLATE = "class_{i}_f1"
+# 予測 CSV の正解/予測クラス列名
+Y_TRUE_COL = "y_true"
+Y_PRED_COL = "y_pred"
+# f1_score のゼロ割時の値
+ZERO_DIVISION = 0
 
 _NAN = float("nan")
 
@@ -99,3 +111,89 @@ def group_f1_summary(
         "n": len(valid),
         "per_class": per_class,
     }
+
+
+def pooled_group_f1(
+    y_true: np.ndarray, y_pred: np.ndarray, class_indices: Sequence[int]
+) -> float:
+    """プールした正解/予測クラスから指定クラス集合の非加重平均 F1 を返す
+
+    fold をまたいでプールした全症例の予測に対し，``class_indices`` の各クラスの
+    F1（OvR・ゼロ割は 0）を求めその非加重平均を取るfold 平均ではなく全症例を
+    1 つに束ねた上での単一値である空集合・空標本では ``nan``
+
+    Args:
+        y_true: プールした正解クラス ``[N]``
+        y_pred: プールした予測クラス ``[N]``
+        class_indices: 平均対象のクラス index 集合
+
+    Returns:
+        プール group-F1（非加重平均）標本なし・空集合なら ``nan``
+    """
+    labels = list(class_indices)
+    if not labels or len(y_true) == 0:
+        return _NAN
+    per_class = f1_score(
+        y_true=y_true, y_pred=y_pred, labels=labels,
+        average=None, zero_division=ZERO_DIVISION,
+    )
+    return float(np.mean(per_class))
+
+
+def _fold_names(combo_dir: str) -> List[str]:
+    """combo 直下の ``fold*`` ディレクトリ名を昇順で返す"""
+    if not os.path.isdir(combo_dir):
+        return []
+    names = [
+        name
+        for name in os.listdir(combo_dir)
+        if name.startswith(FOLD_DIR_PREFIX)
+        and os.path.isdir(os.path.join(combo_dir, name))
+    ]
+    return sorted(names)
+
+
+def pool_combo_predictions(
+    combo_dirs: Sequence[str], split: str
+) -> Optional[pd.DataFrame]:
+    """複数 combo ディレクトリの全 fold 予測を縦結合する
+
+    各 combo 直下の ``fold*`` を自動検出し ``predictions_{split}.csv`` をプールする
+    （複数 out_root / seed の同一手法を 1 つに束ねる用途）読める予測が無ければ ``None``
+
+    Args:
+        combo_dirs: combo ディレクトリのパス列
+        split: ``test`` / ``val`` / ``train``
+
+    Returns:
+        プールした予測 DataFrame読めなければ ``None``
+    """
+    frames = []
+    for combo_dir in combo_dirs:
+        df = pool_predictions(combo_dir, split, _fold_names(combo_dir))
+        if df is not None and len(df):
+            frames.append(df)
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True)
+
+
+def pooled_group_f1_from_predictions(
+    df: pd.DataFrame, class_indices: Sequence[int]
+) -> float:
+    """予測 DataFrame の ``y_true`` / ``y_pred`` からプール group-F1 を返す
+
+    Args:
+        df: ``y_true`` / ``y_pred`` 列を持つプール済み予測
+        class_indices: 平均対象のクラス index 集合
+
+    Returns:
+        プール group-F1空・列欠損なら ``nan``
+    """
+    if df is None or len(df) == 0:
+        return _NAN
+    if Y_TRUE_COL not in df.columns or Y_PRED_COL not in df.columns:
+        return _NAN
+    y_true = df[Y_TRUE_COL].to_numpy()
+    y_pred = df[Y_PRED_COL].to_numpy()
+    return pooled_group_f1(y_true, y_pred, class_indices)

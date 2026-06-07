@@ -11,7 +11,9 @@ from foveamil.evaluation.stats import (
     mean_ci_bootstrap,
     mean_ci_t,
     nadeau_bengio_corrected_t,
+    paired_group_f1_permutation_test,
     repeated_cv_corrected_t,
+    stratified_bootstrap_group_f1_ci,
     wilcoxon_signed_rank,
 )
 
@@ -152,3 +154,99 @@ def test_repeated_cv_too_few_samples_is_nan():
     out = repeated_cv_corrected_t([0.02], 900, 100)
     assert math.isnan(out["t"])
     assert math.isnan(out["pvalue"])
+
+
+# --- pooled group-F1 の並べ替え検定 ---
+
+def test_perm_test_statistic_is_observed_pooled_diff():
+    y_true = np.array([0, 0, 1, 1, 2, 2])
+    y_a = np.array([0, 0, 1, 1, 2, 2])  # perfect
+    y_b = np.array([0, 1, 1, 0, 2, 2])  # class0,1 で誤り
+    out = paired_group_f1_permutation_test(y_true, y_a, y_b, [0, 1], n_perm=1000)
+    # 観測統計量は A と B のプール group-F1 差
+    from foveamil.evaluation.group_metrics import pooled_group_f1
+    expect = pooled_group_f1(y_true, y_a, [0, 1]) - pooled_group_f1(y_true, y_b, [0, 1])
+    assert out["statistic"] == pytest.approx(expect)
+    assert out["n"] == 6
+    assert 0.0 <= out["pvalue"] <= 1.0
+
+
+def test_perm_test_is_deterministic():
+    rng = np.random.default_rng(1)
+    y_true = rng.integers(0, 3, size=40)
+    y_a = rng.integers(0, 3, size=40)
+    y_b = rng.integers(0, 3, size=40)
+    a = paired_group_f1_permutation_test(y_true, y_a, y_b, [0, 1], n_perm=500, seed=7)
+    b = paired_group_f1_permutation_test(y_true, y_a, y_b, [0, 1], n_perm=500, seed=7)
+    assert a == b  # 同 seed で完全一致
+
+
+def test_perm_test_identical_predictions_high_p():
+    # A と B が全症例で同一 → 差 0・帰無の下で全 perm も差 0 → p = 1.0
+    y_true = np.array([0, 0, 1, 1, 2, 2])
+    y = np.array([0, 1, 1, 0, 2, 2])
+    out = paired_group_f1_permutation_test(y_true, y, y, [0, 1], n_perm=500)
+    assert out["statistic"] == pytest.approx(0.0)
+    assert out["pvalue"] == pytest.approx(1.0)
+
+
+def test_perm_test_large_separation_small_p():
+    # A が一貫して良い大標本では小さい p（exchangeable 帰無を強く棄却）
+    rng = np.random.default_rng(0)
+    n = 200
+    y_true = rng.integers(0, 2, size=n)
+    y_a = y_true.copy()  # A は完璧
+    y_b = y_true.copy()
+    flip = rng.choice(n, size=n // 3, replace=False)
+    y_b[flip] = 1 - y_b[flip]  # B は 1/3 を誤る
+    out = paired_group_f1_permutation_test(y_true, y_a, y_b, [0, 1], n_perm=2000)
+    assert out["pvalue"] < 0.05
+
+
+def test_perm_test_degenerate_empty_is_nan():
+    out = paired_group_f1_permutation_test([], [], [], [0, 1], n_perm=100)
+    assert math.isnan(out["pvalue"])
+    empty_cls = paired_group_f1_permutation_test([0, 1], [0, 1], [1, 0], [], n_perm=100)
+    assert math.isnan(empty_cls["pvalue"])
+
+
+# --- クラス層化 bootstrap CI ---
+
+def test_bootstrap_ci_single_brackets_estimate():
+    rng = np.random.default_rng(2)
+    y_true = rng.integers(0, 3, size=120)
+    y_pred = y_true.copy()
+    flip = rng.choice(120, size=30, replace=False)
+    y_pred[flip] = (y_pred[flip] + 1) % 3
+    out = stratified_bootstrap_group_f1_ci(y_true, y_pred, [0, 1, 2], n_boot=1000, seed=3)
+    assert out["ci_low"] <= out["estimate"] <= out["ci_high"]
+    assert out["n"] == 120
+
+
+def test_bootstrap_ci_is_deterministic():
+    rng = np.random.default_rng(4)
+    y_true = rng.integers(0, 3, size=60)
+    y_pred = rng.integers(0, 3, size=60)
+    a = stratified_bootstrap_group_f1_ci(y_true, y_pred, [0, 1], n_boot=500, seed=9)
+    b = stratified_bootstrap_group_f1_ci(y_true, y_pred, [0, 1], n_boot=500, seed=9)
+    assert a == b
+
+
+def test_bootstrap_ci_diff_estimate_is_a_minus_b():
+    from foveamil.evaluation.group_metrics import pooled_group_f1
+    y_true = np.array([0, 0, 1, 1, 2, 2])
+    y_a = np.array([0, 0, 1, 1, 2, 2])
+    y_b = np.array([0, 1, 1, 0, 2, 2])
+    out = stratified_bootstrap_group_f1_ci(
+        y_true, y_a, [0, 1], y_pred_b=y_b, n_boot=500, seed=1
+    )
+    expect = pooled_group_f1(y_true, y_a, [0, 1]) - pooled_group_f1(y_true, y_b, [0, 1])
+    assert out["estimate"] == pytest.approx(expect)
+    assert out["ci_low"] <= out["estimate"] <= out["ci_high"]
+
+
+def test_bootstrap_ci_degenerate_empty_is_nan():
+    out = stratified_bootstrap_group_f1_ci([], [], [0, 1], n_boot=100)
+    assert math.isnan(out["ci_low"]) and math.isnan(out["ci_high"])
+    empty_cls = stratified_bootstrap_group_f1_ci([0, 1], [0, 1], [], n_boot=100)
+    assert math.isnan(empty_cls["ci_low"])

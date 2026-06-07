@@ -16,8 +16,19 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
-from foveamil.evaluation.group_metrics import group_f1_summary
-from foveamil.evaluation.stats import adjust_pvalues, nadeau_bengio_corrected_t
+from foveamil.evaluation.group_metrics import (
+    Y_PRED_COL,
+    Y_TRUE_COL,
+    group_f1_summary,
+    pool_combo_predictions,
+    pooled_group_f1,
+)
+from foveamil.evaluation.stats import (
+    adjust_pvalues,
+    nadeau_bengio_corrected_t,
+    paired_group_f1_permutation_test,
+    stratified_bootstrap_group_f1_ci,
+)
 
 # combo ディレクトリ内のファイル名
 COMBO_CONFIG_NAME = "config.yaml"
@@ -325,6 +336,196 @@ def _paired_diffs(a: Sequence[float], b: Sequence[float]) -> List[float]:
         if not (np.isnan(a[i]) or np.isnan(b[i])):
             diffs.append(float(a[i] - b[i]))
     return diffs
+
+
+# 予測 CSV のスライド識別列
+SLIDE_ID_COL = "slide_id"
+
+
+def _combo_dirs_for_label(
+    rows: List[Dict[str, Any]], regime: str, label: str
+) -> List[str]:
+    """同一レジーム・同一手法ラベルの combo ディレクトリ群を集める
+
+    同手法が複数 out_root / seed に跨る場合に全 combo を束ねる用途
+    """
+    return [
+        os.path.join(row["root"], row["combo"])
+        for row in rows
+        if row["regime"] == regime and row["label"] == label
+    ]
+
+
+def pooled_group_f1_compare(
+    rows: List[Dict[str, Any]],
+    group_classes: Sequence[int],
+    split: str = "test",
+    baseline_label: str = BASELINE_LABEL,
+    n_perm: int = 10000,
+    n_boot: int = 10000,
+    seed: int = 0,
+) -> List[Dict[str, Any]]:
+    """各レジーム内で baseline に対するプール group-F1 の Δ・並べ替え p・bootstrap CI を付与する
+
+    fold（必要なら複数 out_root / seed）の予測をプールし，baseline と各手法を
+    ``slide_id`` で対応付けて同一テスト症例集合に揃える単一 CV では各 slide が
+    test に 1 度だけ現れるため対応は 1 対 1 になる対応した予測に対し，プール
+    group-F1 の差 Δ・対応あり並べ替え検定の p・クラス層化 bootstrap の差の CI を求める
+
+    baseline が無いレジーム・baseline 自身・対応症例が無い縮退では Δ/p/CI を
+    ``None``/``nan`` にする入力 ``rows`` は :func:`collect_ablation_rows` の行
+    （``regime`` / ``label`` / ``root`` / ``combo`` を用いる）
+
+    Args:
+        rows: combo 行（``regime`` / ``label`` / ``root`` / ``combo`` を持つ）
+        group_classes: group-F1 を構成するクラス index 集合
+        split: 読む予測 split（``test`` / ``val``）
+        baseline_label: 基準とする手法ラベル
+        n_perm: 並べ替え反復数
+        n_boot: bootstrap 反復数
+        seed: 乱数シード（再現性のため固定）
+
+    Returns:
+        ``rows`` の各行に ``pooled_gf1`` / ``pooled_delta`` / ``perm_pvalue`` /
+        ``boot_ci_low`` / ``boot_ci_high`` を加えた新しい行列
+    """
+    import numpy as np
+
+    labels = list(group_classes)
+    by_regime: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        by_regime.setdefault(row["regime"], []).append(row)
+
+    enriched: List[Dict[str, Any]] = []
+    for regime in sorted(by_regime):
+        group = by_regime[regime]
+        base_dirs = _combo_dirs_for_label(group, regime, baseline_label)
+        base_df = (
+            pool_combo_predictions(base_dirs, split) if base_dirs else None
+        )
+
+        seen_labels: set = set()
+        for row in group:
+            new_row = dict(row)
+            new_row["pooled_gf1"] = float("nan")
+            new_row["pooled_delta"] = None
+            new_row["perm_pvalue"] = float("nan")
+            new_row["boot_ci_low"] = float("nan")
+            new_row["boot_ci_high"] = float("nan")
+
+            label = row["label"]
+            # 同手法が複数 combo に跨っても各ラベルにつき 1 度だけ集計する
+            if label in seen_labels:
+                enriched.append(new_row)
+                continue
+            seen_labels.add(label)
+
+            method_dirs = _combo_dirs_for_label(group, regime, label)
+            method_df = pool_combo_predictions(method_dirs, split)
+            if method_df is not None and len(method_df):
+                new_row["pooled_gf1"] = pooled_group_f1(
+                    method_df[Y_TRUE_COL].to_numpy(),
+                    method_df[Y_PRED_COL].to_numpy(),
+                    labels,
+                )
+
+            if (
+                base_df is None
+                or method_df is None
+                or label == baseline_label
+                or not labels
+            ):
+                enriched.append(new_row)
+                continue
+
+            merged = method_df.merge(
+                base_df, on=SLIDE_ID_COL, suffixes=("_m", "_b")
+            )
+            if not len(merged):
+                enriched.append(new_row)
+                continue
+            y_true = merged[f"{Y_TRUE_COL}_m"].to_numpy()
+            y_pred_m = merged[f"{Y_PRED_COL}_m"].to_numpy()
+            y_pred_b = merged[f"{Y_PRED_COL}_b"].to_numpy()
+
+            gf1_m = pooled_group_f1(y_true, y_pred_m, labels)
+            gf1_b = pooled_group_f1(y_true, y_pred_b, labels)
+            if not (np.isnan(gf1_m) or np.isnan(gf1_b)):
+                new_row["pooled_delta"] = float(gf1_m - gf1_b)
+            perm = paired_group_f1_permutation_test(
+                y_true, y_pred_m, y_pred_b, labels, n_perm=n_perm, seed=seed
+            )
+            new_row["perm_pvalue"] = perm["pvalue"]
+            ci = stratified_bootstrap_group_f1_ci(
+                y_true, y_pred_m, labels, y_pred_b=y_pred_b,
+                n_boot=n_boot, seed=seed,
+            )
+            new_row["boot_ci_low"] = ci["ci_low"]
+            new_row["boot_ci_high"] = ci["ci_high"]
+            enriched.append(new_row)
+    return enriched
+
+
+def format_markdown_pooled(
+    rows: List[Dict[str, Any]], split: str = "test"
+) -> str:
+    """プール group-F1 の Δ・並べ替え p・bootstrap CI を markdown 表に整形する
+
+    入力は :func:`pooled_group_f1_compare` の行レジームごとにプール group-F1・
+    Δ・並べ替え p・bootstrap CI を並べる
+
+    Args:
+        rows: プール比較を付与した combo 行
+        split: 集計 split（見出し用）
+
+    Returns:
+        markdown 文字列
+    """
+    import numpy as np
+
+    if not rows:
+        return f"# Pooled group-F1 ({split})\n\n(no combos found)\n"
+
+    regimes: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        regimes.setdefault(row["regime"], []).append(row)
+
+    lines = [f"# Pooled group-F1 ({split})", ""]
+    for regime in sorted(regimes):
+        group = sorted(
+            regimes[regime],
+            key=lambda r: (-1.0 if np.isnan(r["pooled_gf1"]) else r["pooled_gf1"]),
+            reverse=True,
+        )
+        lines.append(f"## {regime}")
+        lines.append("")
+        lines.append(
+            "| method | pooled group-F1 | Δ vs baseline | p (perm) | "
+            "95% CI (Δ) | combo |"
+        )
+        lines.append("|---|---|---|---|---|---|")
+        for row in group:
+            gf1 = (
+                "-" if np.isnan(row["pooled_gf1"]) else f"{row['pooled_gf1']:.4f}"
+            )
+            delta = (
+                f"{row['pooled_delta']:+.4f}"
+                if row.get("pooled_delta") is not None
+                else "-"
+            )
+            p_perm = _fmt_p(row.get("perm_pvalue"))
+            lo, hi = row.get("boot_ci_low"), row.get("boot_ci_high")
+            ci = (
+                f"[{lo:.4f}, {hi:.4f}]"
+                if not (np.isnan(lo) or np.isnan(hi))
+                else "-"
+            )
+            lines.append(
+                f"| {row['label']} | {gf1} | {delta} | {p_perm} | {ci} | "
+                f"{row['combo']} |"
+            )
+        lines.append("")
+    return "\n".join(lines)
 
 
 def format_markdown(rows: List[Dict[str, Any]], metric: str, split: str = "test") -> str:
