@@ -91,6 +91,12 @@ foveamil-ablation --in experiments/11class_virchow2/abd experiments/11class_virc
 補正係数の標本数を渡す）．`--metric group_f1 --group-classes 4,5,6` でクラス部分集合の group-F1 を
 同じ Δ・p 経路で集計できる（aggregate に無いため per-fold から算出する）．
 
+`--pooled --baseline <手法タグ> --group-classes 4,5,6` を渡すと 全 fold（複数ルートも）の保存済み
+予測（`predictions_{split}.csv`）をプールし，baseline と各手法を `slide_id` で対応付けた同一テスト
+症例集合上で，プール group-F1 の Δ・対応あり並べ替え検定の p・クラス層化 bootstrap の差の CI を出す．
+fold 平均ではなく全症例を 1 つに束ねた単一値で，クラス不均衡時に少数クラスへ寄与した予測を直接評価
+できる．並べ替え/bootstrap は `--n-perm` / `--n-boot` / `--seed`（決定的）で制御する．
+
 ## `calibration.py` / `foveamil-calibrate`
 
 保存済み予測の logit/prob を二次利用し，全 fold の val をプールした 1 標本で事後較正パラメタを

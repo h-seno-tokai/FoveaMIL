@@ -25,10 +25,17 @@ from foveamil.evaluation.report import (
     plot_roc,
     pool_predictions,
 )
+from foveamil.evaluation.group_metrics import (
+    pool_combo_predictions,
+    pooled_group_f1,
+    pooled_group_f1_from_predictions,
+)
 from foveamil.evaluation.stats import (
     mean_ci_bootstrap,
     mean_ci_t,
     nadeau_bengio_corrected_t,
+    paired_group_f1_permutation_test,
+    stratified_bootstrap_group_f1_ci,
     wilcoxon_signed_rank,
 )
 
@@ -56,4 +63,9 @@ __all__ = [
     "mean_ci_bootstrap",
     "wilcoxon_signed_rank",
     "nadeau_bengio_corrected_t",
+    "paired_group_f1_permutation_test",
+    "stratified_bootstrap_group_f1_ci",
+    "pooled_group_f1",
+    "pooled_group_f1_from_predictions",
+    "pool_combo_predictions",
 ]
