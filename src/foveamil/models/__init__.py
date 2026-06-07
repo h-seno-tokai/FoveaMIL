@@ -3,7 +3,11 @@ from __future__ import annotations
 from foveamil.models.attention import GatedAttention
 from foveamil.models.attention_norm import available_attention_norms, build_attention_norm
 from foveamil.models.fusion import Fusion, SumFusion, build_fusion
-from foveamil.models.heads import LinearClassifierHead
+from foveamil.models.heads import (
+    LinearClassifierHead,
+    MLPClassifierHead,
+    build_head,
+)
 from foveamil.models.instance import InstanceClusteringLoss
 from foveamil.models.mil import FoveaMIL
 from foveamil.models.regularizers import (
@@ -31,6 +35,8 @@ __all__ = [
     "SumFusion",
     "build_fusion",
     "LinearClassifierHead",
+    "MLPClassifierHead",
+    "build_head",
     "InstanceClusteringLoss",
     "FoveaMIL",
     "ForwardContext",
