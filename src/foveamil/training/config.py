@@ -135,7 +135,7 @@ class TrainConfig:
         dpp_rbf_gamma: DPP RBF 帯域（``selector=="dpp"`` かつ ``dpp_similarity=="rbf"`` 時のみ）
         dpp_use_gumbel: DPP 学習時に Gumbel 雑音で確率的に選ぶか（``selector=="dpp"`` 時のみ）
         dpp_diversity_weight: DPP 多様性正則化の重み（0 で無効，``selector=="dpp"`` 多倍率時のみ）
-        fusion: 融合名
+        fusion: 融合名（``"sum"`` で従来挙動，``"gated"`` でスライド依存ゲート加重和，``"scale_attention"`` でスケール間自己アテンション集約）
         instance_loss: インスタンス補助損失を加えるか（単一倍率のみ）
         bag_weight: bag 損失とインスタンス補助損失の重み（``bag·bag_weight + inst·(1-bag_weight)``）
         inst_k: インスタンス補助損失の pos/neg パッチ数

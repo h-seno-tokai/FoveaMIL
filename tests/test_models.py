@@ -120,6 +120,77 @@ def test_build_fusion_unknown_raises():
         build_fusion("does_not_exist", dim=8, num_layers=2)
 
 
+@pytest.mark.parametrize("name", ["sum", "gated", "scale_attention"])
+def test_fusion_out_dim_contract_and_shape(name):
+    # 全融合は out_dim == dim を保ちヘッドを不変にする
+    fus = build_fusion(name, dim=8, num_layers=3)
+    assert fus.out_dim == 8
+    m_list = [torch.randn(2, 1, 8) for _ in range(3)]
+    out = fus(m_list)
+    assert out.shape == (2, 8)
+
+
+@pytest.mark.parametrize("name", ["sum", "gated", "scale_attention"])
+def test_fusion_single_layer_degenerates(name):
+    # L=1 では縮退安全（形状契約を保つ）
+    fus = build_fusion(name, dim=8, num_layers=1)
+    out = fus([torch.randn(2, 1, 8)])
+    assert out.shape == (2, 8)
+
+
+def test_gated_fusion_single_layer_is_identity():
+    # softmax over 1 スケール = 1 なので加重和は M をそのまま返す
+    fus = build_fusion("gated", dim=8, num_layers=1)
+    m = torch.randn(2, 1, 8)
+    out = fus([m])
+    assert torch.allclose(out, m.squeeze(1), atol=1e-6)
+
+
+@pytest.mark.parametrize("name", ["gated", "scale_attention"])
+def test_fusion_propagates_gradient(name):
+    torch.manual_seed(0)
+    fus = build_fusion(name, dim=8, num_layers=3)
+    fus.train()
+    m_list = [torch.randn(2, 1, 8, requires_grad=True) for _ in range(3)]
+    out = fus(m_list)
+    # 重み付き和（スカラ化）で勾配を確認する
+    (out * torch.randn_like(out)).sum().backward()
+    for m in m_list:
+        assert m.grad is not None
+        assert torch.isfinite(m.grad).all()
+    assert any(m.grad.abs().sum().item() > 0 for m in m_list)
+
+
+@pytest.mark.parametrize("name", ["sum", "gated", "scale_attention"])
+def test_fusion_is_deterministic(name):
+    torch.manual_seed(0)
+    fus = build_fusion(name, dim=8, num_layers=3)
+    fus.eval()
+    m_list = [torch.randn(2, 1, 8) for _ in range(3)]
+    first = fus(m_list)
+    second = fus(m_list)
+    assert torch.allclose(first, second, atol=1e-6)
+
+
+def test_gated_fusion_weights_sum_to_one():
+    # ゲート重みはスケール軸で softmax = 加重和の重み総和は 1
+    fus = build_fusion("gated", dim=4, num_layers=3)
+    fus.eval()
+    tokens = torch.randn(2, 3, 4)
+    weights = torch.softmax(fus.gate(tokens).squeeze(-1), dim=-1)
+    assert torch.allclose(weights.sum(dim=-1), torch.ones(2), atol=1e-6)
+
+
+@pytest.mark.parametrize("name", ["gated", "scale_attention"])
+def test_fusion_default_sum_unaffected(name):
+    # 新融合の登録で既定 sum の数値が変わらない（bit 互換のガード）
+    torch.manual_seed(0)
+    m_list = [torch.randn(2, 1, 8) for _ in range(3)]
+    sum_out = build_fusion("sum", dim=8, num_layers=3)(m_list)
+    expected = sum(m.squeeze(1) for m in m_list)
+    assert torch.equal(sum_out, expected)
+
+
 # --- 識別器ヘッド ---
 
 
@@ -181,6 +252,27 @@ def test_forward_final_outputs():
     assert (Y_hat.squeeze(-1) == logits.argmax(dim=-1)).all()
     # 予測クラスは範囲内
     assert int(Y_hat.min()) >= 0 and int(Y_hat.max()) < 3
+
+
+@pytest.mark.parametrize("fusion", ["sum", "gated", "scale_attention"])
+def test_model_assembles_with_fusion(fusion):
+    # 融合方式を変えても out_dim 契約でヘッド形状は不変（logits は n_cls 次元）
+    model = FoveaMIL(
+        in_feat_dim=8,
+        hidden_feat_dim=16,
+        out_feat_dim=12,
+        k_sample=4,
+        n_cls=3,
+        num_layers=2,
+        topk_method="perturbed",
+        fusion=fusion,
+    )
+    model.eval()
+    M0, _, _, _ = model.forward_layer(torch.randn(2, 10, 8), layer_idx=0)
+    M1, _, _, _ = model.forward_layer(torch.randn(2, 7, 8), layer_idx=1)
+    logits, _, Y_prob = model.forward_final([M0, M1])
+    assert logits.shape == (2, 3)
+    assert torch.allclose(Y_prob.sum(dim=-1), torch.ones(2), atol=1e-6)
 
 
 def test_single_magnification_is_final_only():

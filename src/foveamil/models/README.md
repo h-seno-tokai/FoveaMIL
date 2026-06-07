@@ -100,11 +100,15 @@
 
 - `Fusion(nn.Module)` 基底：属性 `out_dim`，`forward(M_list) -> [B, out_dim]`．
 - `SumFusion(dim, num_layers)`：`out_dim = dim`，総和して squeeze する．
+- `GatedWeightedFusion(dim, num_layers)`：`out_dim = dim`，各 `M_i` から線形に作るゲートスコアをスケール軸で softmax し加重和する．重みはスライド内容に依存し総和 1．`L=1` では恒等．
+- `ScaleSelfAttentionFusion(dim, num_layers)`：`out_dim = dim`，`L` 個のスケールトークン列へ軽量自己アテンション（pre-norm + FFN を既定 2 層）をかけスケール軸で平均集約する．`L=1` では縮退安全．
+
+いずれも `out_dim == dim` を保ちヘッドを不変にする．
 
 ### 公開 API
 
 - `build_fusion(name, dim, num_layers) -> Fusion`：レジストリ `FUSION_METHODS` から融合器を構築する．未登録名は `KeyError`．
-- 登録済み：`"sum"`．`"concat"`，`"attention_pooling"` は将来追加．
+- 登録済み：`"sum"`，`"gated"`，`"scale_attention"`．
 
 ### 新しい融合の追加
 

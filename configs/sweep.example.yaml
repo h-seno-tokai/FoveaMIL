@@ -31,6 +31,7 @@ sweep:
   drop_out: [0.3, 0.6, 0.7]
   k_sample: [8, 15, 25]
   k_sigma: [0.002, 0.005]
+  # 融合方式 sum / gated / scale_attention（既定 sum）
   fusion: [sum]
   # インスタンス補助損失（単一倍率のみ有効）多倍率では自動で false に畳まれる
   instance_loss: [false, true]
