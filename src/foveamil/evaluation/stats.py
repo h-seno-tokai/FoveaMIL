@@ -156,6 +156,71 @@ def nadeau_bengio_corrected_t(
     }
 
 
+def repeated_cv_corrected_t(
+    diffs: Sequence[float],
+    n_train: int,
+    n_test: int,
+    alpha: float = DEFAULT_ALPHA,
+) -> Dict[str, Any]:
+    """反復交差検証の指標差に対する補正リサンプル t 検定（Bouckaert-Frank）
+
+    複数 seed × fold の全リサンプル（``m = len(diffs)`` 個）の対応差を 1 標本として
+    扱い，補正分散 ``var(diffs) * (1/m + n_test/n_train)`` ・自由度 ``m-1`` で検定する
+    （corrected resampled t-test）``diffs`` の並び順は問わない（seed と fold を平坦化
+    した全差を渡してよい）
+
+    Nadeau-Bengio の単一 CV 版が分母に fold 数 ``k`` を置くのに対し，本式は総リサンプル
+    数 ``m`` を置く反復で ``m`` が増えても訓練集合の重なり由来の項 ``n_test/n_train``
+    は残るため，平坦な対応 t（補正なし ``var/m``）より分散を大きく見積もり保守的になる
+    重なりを無視して標本数だけ増やすと第一種の過誤を過大に出すのを防ぐ
+
+    限界: 本式は訓練集合の重なり由来の単一相関 ``n_test/n_train`` のみを補正し，
+    seed×fold の二段（ブロック）相関は補正しない seed 効果が支配的な場合は
+    anti-conservative になり（第一種の過誤が ``alpha`` を超え）得る 主張に用いる p は
+    プール予測上の並べ替え/ブートストラップ か seed 単位に集計した二段検定で併せて確認する
+
+    縮退（標本 2 未満・全差同値で補正分散 0）では ``nan`` を返し例外を投げない
+
+    Args:
+        diffs: 全リサンプルの指標差（手法 A - 手法 B）を平坦化した列
+        n_train: 1 リサンプルの訓練サンプル数
+        n_test: 1 リサンプルの test サンプル数
+        alpha: 有意水準
+
+    Returns:
+        ``{"t", "pvalue", "df", "mean_diff", "ci_low", "ci_high", "m"}``
+    """
+    arr = np.asarray(diffs, dtype=float)
+    m = arr.size
+    mean_diff = float(np.mean(arr)) if m else _NAN
+    if m < MIN_SAMPLES:
+        return {
+            "t": _NAN, "pvalue": _NAN, "df": m - 1,
+            "mean_diff": mean_diff, "ci_low": _NAN, "ci_high": _NAN, "m": m,
+        }
+
+    variance = float(np.var(arr, ddof=1))
+    correction = (1.0 / m) + (float(n_test) / float(n_train))
+    corrected_var = variance * correction
+    df = m - 1
+
+    if corrected_var <= 0.0:
+        return {
+            "t": _NAN, "pvalue": _NAN, "df": df,
+            "mean_diff": mean_diff, "ci_low": _NAN, "ci_high": _NAN, "m": m,
+        }
+
+    se = math.sqrt(corrected_var)
+    t_stat = mean_diff / se
+    pvalue = float(2.0 * stats.t.sf(abs(t_stat), df))
+    half = se * float(stats.t.ppf(1.0 - alpha / 2.0, df))
+    return {
+        "t": float(t_stat), "pvalue": pvalue, "df": df,
+        "mean_diff": mean_diff, "ci_low": mean_diff - half,
+        "ci_high": mean_diff + half, "m": m,
+    }
+
+
 # 多重比較補正法
 ADJUST_HOLM = "holm"
 ADJUST_FDR_BH = "fdr_bh"
