@@ -98,6 +98,12 @@ DEFAULT_POLICY_LOSS_WEIGHT = 1.0
 DEFAULT_VALUE_LOSS_WEIGHT = 1.0
 # 既定の方策エントロピー損失重み（探索の早期収束を抑える既定は無効）
 DEFAULT_POLICY_ENTROPY_WEIGHT = 0.0
+# 既定の bag 表現 mixup の Beta 形状 α（0 で無効＝従来挙動）
+DEFAULT_MIXUP_ALPHA = 0.0
+# 既定のバランスサンプラ温度（1.0 で現行＝重み不変）
+DEFAULT_SAMPLER_TEMP = 1.0
+# 既定の ordinal 補助損失の重み（0 で無効＝寄与なし）
+DEFAULT_ORDINAL_AUX_WEIGHT = 0.0
 
 
 @dataclass
@@ -147,6 +153,9 @@ class TrainConfig:
         loss_ldam_max_margin: LDAM の最大マージン（``loss_type="ldam"`` のときのみ有効）
         decorrelation_weight: 倍率間冗長性罰則の重み（0 で無効，多倍率のみ有効）
         decorrelation_method: 倍率間冗長性罰則の手法（``"cosine"`` / ``"covariance"``）
+        mixup_alpha: bag 表現 mixup の Beta 形状 α（0 で無効＝従来挙動，バッチサイズ 1 のため直前サンプルと混ぜる）
+        sampler_temp: バランスサンプラ重みの温度（1.0 で現行，``<1`` で緩和 ``>1`` で強調，``is_weighted_sampler`` 時のみ有効）
+        ordinal_aux_weight: クラス順序を活かす ordinal 補助損失の重み（0 で無効，クラス index の並びを順序とみなす）
         is_weighted_sampler: train で WeightedRandomSampler を使うか
         num_workers: DataLoader ワーカ数
         pin_memory: DataLoader の pin_memory
@@ -206,6 +215,9 @@ class TrainConfig:
     loss_ldam_max_margin: float = DEFAULT_LOSS_LDAM_MAX_MARGIN
     decorrelation_weight: float = DEFAULT_DECORRELATION_WEIGHT
     decorrelation_method: str = DEFAULT_DECORRELATION_METHOD
+    mixup_alpha: float = DEFAULT_MIXUP_ALPHA
+    sampler_temp: float = DEFAULT_SAMPLER_TEMP
+    ordinal_aux_weight: float = DEFAULT_ORDINAL_AUX_WEIGHT
 
     is_weighted_sampler: bool = True
     num_workers: int = DEFAULT_NUM_WORKERS

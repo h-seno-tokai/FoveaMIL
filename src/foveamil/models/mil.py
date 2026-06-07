@@ -231,6 +231,37 @@ class FoveaMIL(nn.Module):
         A_aux = self.aux_norm(A_aux.squeeze(dim=-1))
         return A_primary, A_aux
 
+    def _instance_repr(self, x: Tensor, label: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+        """単一倍率の融合 bag 表現とインスタンス補助損失を同一テンソルから返す
+
+        射影と主アテンションを 1 度だけ計算しプーリング表現と補助損失の双方で同じ
+        ``x_fc`` / ``A_primary`` を共有する``instance_module`` を持たないなら補助損失は
+        ``None``
+        """
+        M, x_fc, A_primary = self._project_and_pool(x, 0)
+        fused = self.fuse_repr([M])
+        inst_loss = None
+        if self.instance_module is not None:
+            inst_loss = self.instance_module(x_fc, A_primary.squeeze(dim=1), label)
+        return fused, inst_loss
+
+    def forward_with_instance_repr(
+        self, x: Tensor, label: Tensor
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """単一倍率の融合 bag 表現とインスタンス補助損失を返す（mixup 介入点）
+
+        識別ヘッド直前の bag 表現を返し 学習ループ側が bag レベル mixup を挟んでから
+        :meth:`classify` で分類できるようにする単一倍率（``num_layers=1``）の学習時に使う
+
+        Args:
+            x: 最低倍率の特徴 ``[B, N, in_feat_dim]``
+            label: 正解クラス ``[B]``
+
+        Returns:
+            ``(fused[B, out_dim], inst_loss)````inst_loss`` はスカラまたは ``None``
+        """
+        return self._instance_repr(x, label)
+
     def forward_with_instance_loss(
         self, x: Tensor, label: Tensor
     ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
@@ -249,12 +280,36 @@ class FoveaMIL(nn.Module):
             ``(logits[B, n_cls], Y_hat[B, 1], Y_prob[B, n_cls], inst_loss)``
             ``inst_loss`` はスカラまたは ``None``
         """
-        M, x_fc, A_primary = self._project_and_pool(x, 0)
-        logits, Y_hat, Y_prob = self.forward_final([M])
-        inst_loss = None
-        if self.instance_module is not None:
-            inst_loss = self.instance_module(x_fc, A_primary.squeeze(dim=1), label)
+        fused, inst_loss = self._instance_repr(x, label)
+        logits, Y_hat, Y_prob = self.classify(fused)
         return logits, Y_hat, Y_prob, inst_loss
+
+    def fuse_repr(self, M_list: Sequence[Tensor]) -> Tensor:
+        """各倍率のプーリング表現を融合し bag 表現 ``[B, out_dim]`` を返す
+
+        識別ヘッド直前の bag 表現を切り出す部品（bag レベル mixup などが介入する）
+
+        Args:
+            M_list: 各倍率のプーリング表現 ``[B, 1, out_dim]`` のリスト
+
+        Returns:
+            融合後 bag 表現 ``[B, out_dim]``
+        """
+        return self.fusion(M_list)
+
+    def classify(self, fused: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        """bag 表現 ``[B, out_dim]`` を識別ヘッドへ通し予測を返す
+
+        Args:
+            fused: 融合後 bag 表現 ``[B, out_dim]``
+
+        Returns:
+            ``logits[B, n_cls]``，``Y_hat[B, 1]``，``Y_prob[B, n_cls]``
+        """
+        logits = self.head(fused)
+        Y_hat = torch.topk(logits, _TOP1, dim=-1).indices
+        Y_prob = F.softmax(logits, dim=-1)
+        return logits, Y_hat, Y_prob
 
     def forward_final(
         self, M_list: Sequence[Tensor]
@@ -268,8 +323,4 @@ class FoveaMIL(nn.Module):
             ``logits[B, n_cls]``，``Y_hat[B, 1]``（予測クラス），
             ``Y_prob[B, n_cls]``（softmax 確率）
         """
-        fused = self.fusion(M_list)
-        logits = self.head(fused)
-        Y_hat = torch.topk(logits, _TOP1, dim=-1).indices
-        Y_prob = F.softmax(logits, dim=-1)
-        return logits, Y_hat, Y_prob
+        return self.classify(self.fuse_repr(M_list))
