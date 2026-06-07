@@ -58,6 +58,12 @@ DEFAULT_DPP_USE_GUMBEL = False
 DEFAULT_DPP_DIVERSITY_WEIGHT = 0.0
 # 既定の融合名
 DEFAULT_FUSION = "sum"
+# 既定の集約器名（abmil は従来のゲート付きアテンションプーリングと bit 互換）
+DEFAULT_AGGREGATOR = "abmil"
+# 既定の自己アテンション集約器のヘッド数（aggregator="self_attn" のときのみ有効）
+DEFAULT_AGGREGATOR_NUM_HEADS = 4
+# 既定の自己アテンション集約器の landmark 数（aggregator="self_attn" のときのみ有効）
+DEFAULT_AGGREGATOR_NUM_LANDMARKS = 64
 # 既定のインスタンス補助損失の有効化
 DEFAULT_INSTANCE_LOSS = False
 # 既定の bag 損失とインスタンス補助損失の重み（bag 側）
@@ -136,6 +142,9 @@ class TrainConfig:
         dpp_use_gumbel: DPP 学習時に Gumbel 雑音で確率的に選ぶか（``selector=="dpp"`` 時のみ）
         dpp_diversity_weight: DPP 多様性正則化の重み（0 で無効，``selector=="dpp"`` 多倍率時のみ）
         fusion: 融合名
+        aggregator: 集約器名（``"abmil"`` で従来のゲート付きアテンションプーリングと bit 互換，``"self_attn"`` でパッチ間コンテキストを取り込む自己アテンション）
+        aggregator_num_heads: 自己アテンション集約器の注意ヘッド数（``aggregator="self_attn"`` のときのみ有効）
+        aggregator_num_landmarks: 自己アテンション集約器の Nyström landmark 数（``aggregator="self_attn"`` のときのみ有効パッチ数が landmark 以下なら厳密注意へ縮退）
         instance_loss: インスタンス補助損失を加えるか（単一倍率のみ）
         bag_weight: bag 損失とインスタンス補助損失の重み（``bag·bag_weight + inst·(1-bag_weight)``）
         inst_k: インスタンス補助損失の pos/neg パッチ数
@@ -195,6 +204,9 @@ class TrainConfig:
     dpp_use_gumbel: bool = DEFAULT_DPP_USE_GUMBEL
     dpp_diversity_weight: float = DEFAULT_DPP_DIVERSITY_WEIGHT
     fusion: str = DEFAULT_FUSION
+    aggregator: str = DEFAULT_AGGREGATOR
+    aggregator_num_heads: int = DEFAULT_AGGREGATOR_NUM_HEADS
+    aggregator_num_landmarks: int = DEFAULT_AGGREGATOR_NUM_LANDMARKS
     instance_loss: bool = DEFAULT_INSTANCE_LOSS
     bag_weight: float = DEFAULT_BAG_WEIGHT
     inst_k: int = DEFAULT_INST_K

@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from foveamil.models.aggregator import build_aggregator
 from foveamil.models.attention import GatedAttention
 from foveamil.models.attention_norm import build_attention_norm
 from foveamil.models.fusion import build_fusion
@@ -43,6 +44,8 @@ DEFAULT_AUX_NORM = "softmax"
 DEFAULT_SELECTOR = "topk"
 # 既定の融合名
 DEFAULT_FUSION = "sum"
+# 既定の集約器名（既定は従来のゲート付きアテンションプーリングと bit 互換）
+DEFAULT_AGGREGATOR = "abmil"
 # 既定のインスタンス補助損失の pos/neg パッチ数
 DEFAULT_INST_K = 8
 # インスタンス補助損失を許す倍率数（単一倍率のみ）
@@ -83,6 +86,9 @@ class FoveaMIL(nn.Module):
         selector: 選択コントローラ名（``build_selection_controller`` のレジストリ）
         selector_kwargs: 選択コントローラへ渡す追加引数
         fusion: 融合名（``build_fusion`` のレジストリ）
+        aggregator: 集約器名（``build_aggregator`` のレジストリ）既定 ``abmil`` は
+            従来のゲート付きアテンションプーリングと bit 互換
+        aggregator_kwargs: 集約器へ渡す追加引数
         instance_loss: インスタンス補助損失を持たせるか（単一倍率のみ）
         inst_k: インスタンス補助損失の pos/neg パッチ数
         inst_subtyping: インスタンス補助損失に out-of-class 枝を加えるか
@@ -107,6 +113,8 @@ class FoveaMIL(nn.Module):
         selector: str = DEFAULT_SELECTOR,
         selector_kwargs: Optional[dict] = None,
         fusion: str = DEFAULT_FUSION,
+        aggregator: str = DEFAULT_AGGREGATOR,
+        aggregator_kwargs: Optional[dict] = None,
         instance_loss: bool = False,
         inst_k: int = DEFAULT_INST_K,
         inst_subtyping: bool = True,
@@ -125,8 +133,14 @@ class FoveaMIL(nn.Module):
             _build_projection(in_feat_dim, out_feat_dim, dropout)
             for _ in range(num_layers)
         )
-        self.attentions = nn.ModuleList(
-            GatedAttention(out_feat_dim, hidden_feat_dim, dropout, n_cls=_ATTENTION_N_CLS)
+        self.aggregators = nn.ModuleList(
+            build_aggregator(
+                aggregator,
+                dim=out_feat_dim,
+                hidden_dim=hidden_feat_dim,
+                dropout=dropout,
+                **(aggregator_kwargs or {}),
+            )
             for _ in range(num_layers)
         )
         # 補助アテンションは最終層以外（次倍率へズームする層）に置く
@@ -154,16 +168,14 @@ class FoveaMIL(nn.Module):
     def _project_and_pool(
         self, x: Tensor, layer_idx: int
     ) -> Tuple[Tensor, Tensor, Tensor]:
-        """射影と主アテンションでプーリング表現を作り ``(M, x_fc, A_primary)`` を返す
+        """射影と集約器でプーリング表現を作り ``(M, x_fc, A_primary)`` を返す
 
-        ``A_primary`` は softmax 済みの主アテンション ``[B, 1, N]````x_fc`` は射影後の
-        特徴 ``[B, N, out_dim]``プーリングと補助損失で同一の ``x_fc`` / ``A_primary``
-        を共有するための内部部品
+        ``A_primary`` は集約器が返す正規化済みプーリング重み ``[B, 1, N]````x_fc`` は
+        射影後の特徴 ``[B, N, out_dim]``プーリングと補助損失で同一の ``x_fc`` /
+        ``A_primary`` を共有するための内部部品
         """
         x_fc = self.projections[layer_idx](x)
-        A_primary, _ = self.attentions[layer_idx](x_fc)
-        A_primary = F.softmax(A_primary.permute(0, 2, 1), dim=-1)
-        M = A_primary @ x_fc
+        M, A_primary = self.aggregators[layer_idx](x_fc)
         return M, x_fc, A_primary
 
     def forward_layer(
@@ -210,9 +222,9 @@ class FoveaMIL(nn.Module):
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """1 倍率分の主・補助アテンションの正規化重みを返す（可視化用）
 
-        主アテンションは softmax 後のプーリング重み ``[B, 1, N]``，補助アテンション
-        は softmax 後の選択スコア ``[B, N]`` を返す最終層は補助アテンションを持たない
-        ため aux 側は ``None``選択や勾配は伴わず重みの参照のみを返す
+        主アテンション側は集約器の正規化済みプーリング重み ``[B, 1, N]``，補助
+        アテンションは softmax 後の選択スコア ``[B, N]`` を返す最終層は補助アテンション
+        を持たないため aux 側は ``None``選択や勾配は伴わず重みの参照のみを返す
 
         Args:
             x: 現倍率の特徴 ``[B, N, in_feat_dim]``
@@ -223,8 +235,7 @@ class FoveaMIL(nn.Module):
             または最終層では ``None``
         """
         x_fc = self.projections[layer_idx](x)
-        A_primary, _ = self.attentions[layer_idx](x_fc)
-        A_primary = F.softmax(A_primary.permute(0, 2, 1), dim=-1)
+        _, A_primary = self.aggregators[layer_idx](x_fc)
         if layer_idx >= self.num_layers - 1:
             return A_primary, None
         A_aux, _ = self.aux_attentions[layer_idx](x_fc)

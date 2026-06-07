@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from foveamil.models.aggregator import (
+    Aggregator,
+    available_aggregators,
+    build_aggregator,
+)
 from foveamil.models.attention import GatedAttention
 from foveamil.models.attention_norm import available_attention_norms, build_attention_norm
 from foveamil.models.fusion import Fusion, SumFusion, build_fusion
@@ -24,6 +29,9 @@ from foveamil.models.selection import (
 from foveamil.models.topk import TopKSelector, build_topk
 
 __all__ = [
+    "Aggregator",
+    "available_aggregators",
+    "build_aggregator",
     "GatedAttention",
     "build_attention_norm",
     "available_attention_norms",
