@@ -9,6 +9,7 @@ import pytest
 from sklearn.metrics import f1_score
 
 from foveamil.evaluation.group_metrics import (
+    SOURCE_COL,
     class_f1_key,
     group_f1_from_fold,
     group_f1_per_fold,
@@ -108,6 +109,51 @@ def test_pooled_group_f1_empty_set_or_empty_sample_is_nan():
     y = np.array([0, 1, 2])
     assert math.isnan(pooled_group_f1(y, y, []))
     assert math.isnan(pooled_group_f1(np.array([]), np.array([]), [0, 1]))
+
+
+def test_pooled_group_f1_excludes_support0_class_matches_per_fold():
+    # 欠損クラス（support0）扱いを per-fold（存在クラスのみ平均）と一致させる
+    # class1 が y_true に出現しない → 集合 {0,1} は class0 のみで平均
+    y_true = np.array([0, 0, 0])
+    y_pred = np.array([0, 0, 0])  # class0 は完全一致 → F1=1.0
+    # support0 の class1 を 0.0 で算入しない＝1.0（per-fold の存在クラスのみ平均と一致）
+    assert pooled_group_f1(y_true, y_pred, [0, 1]) == pytest.approx(1.0)
+    # per-fold 側（group_f1_from_fold）も class1 キー不在なら class0 のみで 1.0
+    assert group_f1_from_fold(_fold({0: 1.0}), [0, 1]) == pytest.approx(1.0)
+    # 集合内クラスが全て support0 なら nan
+    assert math.isnan(pooled_group_f1(y_true, y_pred, [5, 6]))
+
+
+def test_pool_combo_predictions_attaches_source_column(tmp_path):
+    # 出所キー（source 列）を付与する省略時は combo_dir パス
+    combo = str(tmp_path / "combo_000")
+    os.makedirs(combo)
+    _write_fold_csv(combo, 0, ["a", "b"], [0, 1], [0, 1])
+    df = pool_combo_predictions([combo], "test")
+    assert SOURCE_COL in df.columns
+    assert set(df[SOURCE_COL]) == {combo}
+
+
+def test_pool_combo_predictions_explicit_source_labels(tmp_path):
+    # sources を渡すと各 combo_dir 由来の行にそのキーが付く
+    c1 = str(tmp_path / "r1" / "combo_000")
+    c2 = str(tmp_path / "r2" / "combo_000")
+    os.makedirs(c1)
+    os.makedirs(c2)
+    _write_fold_csv(c1, 0, ["a"], [0], [0])
+    _write_fold_csv(c2, 0, ["a"], [0], [0])
+    df = pool_combo_predictions([c1, c2], "test", sources=[42, 1])
+    assert set(df[SOURCE_COL]) == {42, 1}
+    # 同一 slide_id が seed ごとに 1 行ずつ
+    assert len(df) == 2
+
+
+def test_pool_combo_predictions_sources_length_mismatch_raises(tmp_path):
+    combo = str(tmp_path / "combo_000")
+    os.makedirs(combo)
+    _write_fold_csv(combo, 0, ["a"], [0], [0])
+    with pytest.raises(ValueError):
+        pool_combo_predictions([combo], "test", sources=[1, 2])
 
 
 def _write_fold_csv(combo_dir, fold_idx, slide_ids, y_true, y_pred, split="test"):

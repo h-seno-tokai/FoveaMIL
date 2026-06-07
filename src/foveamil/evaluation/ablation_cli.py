@@ -19,6 +19,7 @@ from foveamil.evaluation.ablation import (
     GROUP_F1_METRIC,
     collect_ablation,
     collect_ablation_rows,
+    collect_pooled_rows,
     compare_to_baseline,
     format_markdown,
     format_markdown_compare,
@@ -115,9 +116,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise SystemExit("--pooled requires --baseline")
         if not group_classes:
             raise SystemExit("--pooled requires --group-classes")
-        rows = collect_ablation_rows(
-            args.inputs, GROUP_F1_METRIC, args.split, group_classes=group_classes
-        )
+        # プールは予測 CSV ベースで集める（per-fold class F1 欠如での無言脱落を避ける）
+        rows = collect_pooled_rows(args.inputs, args.split)
         enriched = pooled_group_f1_compare(
             rows, group_classes, split=args.split, baseline_label=args.baseline,
             n_perm=args.n_perm, n_boot=args.n_boot, seed=args.seed,

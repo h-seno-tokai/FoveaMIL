@@ -24,6 +24,8 @@ CLASS_F1_KEY_TEMPLATE = "class_{i}_f1"
 # 予測 CSV の正解/予測クラス列名
 Y_TRUE_COL = "y_true"
 Y_PRED_COL = "y_pred"
+# プール時に各行へ付与する出所キー列（多 seed / 多 out_root のどの run 由来かを表す）
+SOURCE_COL = "source"
 # f1_score のゼロ割時の値
 ZERO_DIVISION = 0
 
@@ -40,8 +42,10 @@ def group_f1_from_fold(
 ) -> float:
     """1 fold の指標辞書から指定クラス集合の非加重平均 F1 を返す
 
-    集合内で辞書に存在するクラスの F1 のみを平均する有効な per-class F1 が 1 つも
-    無い（空集合・全クラス欠損）場合は ``nan``
+    集合内で辞書に存在するクラスの F1 のみを平均する（欠損クラスは除外）有効な
+    per-class F1 が 1 つも無い（空集合・全クラス欠損）場合は ``nan``この
+    「存在クラスのみ平均」の規約は :func:`pooled_group_f1` の欠損クラス扱い
+    （support0 クラスを除外）と一致する
 
     Args:
         fold_metrics: 1 fold の指標辞書（``class_i_f1`` を含む）
@@ -120,7 +124,12 @@ def pooled_group_f1(
 
     fold をまたいでプールした全症例の予測に対し，``class_indices`` の各クラスの
     F1（OvR・ゼロ割は 0）を求めその非加重平均を取るfold 平均ではなく全症例を
-    1 つに束ねた上での単一値である空集合・空標本では ``nan``
+    1 つに束ねた上での単一値である
+
+    欠損クラス（``y_true`` に出現しない＝support0 のクラス）は :func:`group_f1_from_fold`
+    と扱いを揃えて平均から除外する（存在クラスのみの非加重平均）これにより同じクラス
+    集合で per-fold（存在クラスのみ平均）とプールの欠損クラス扱いが一致する有効クラスが
+    1 つも無い・空集合・空標本では ``nan``
 
     Args:
         y_true: プールした正解クラス ``[N]``
@@ -128,13 +137,19 @@ def pooled_group_f1(
         class_indices: 平均対象のクラス index 集合
 
     Returns:
-        プール group-F1（非加重平均）標本なし・空集合なら ``nan``
+        プール group-F1（存在クラスのみの非加重平均）有効クラスなし・空集合・
+        標本なしなら ``nan``
     """
     labels = list(class_indices)
     if not labels or len(y_true) == 0:
         return _NAN
+    # support0 クラスは per-fold の欠損扱いに揃えて除外する
+    present = set(np.unique(np.asarray(y_true)).tolist())
+    eval_labels = [c for c in labels if c in present]
+    if not eval_labels:
+        return _NAN
     per_class = f1_score(
-        y_true=y_true, y_pred=y_pred, labels=labels,
+        y_true=y_true, y_pred=y_pred, labels=eval_labels,
         average=None, zero_division=ZERO_DIVISION,
     )
     return float(np.mean(per_class))
@@ -154,24 +169,38 @@ def _fold_names(combo_dir: str) -> List[str]:
 
 
 def pool_combo_predictions(
-    combo_dirs: Sequence[str], split: str
+    combo_dirs: Sequence[str],
+    split: str,
+    sources: Optional[Sequence[Any]] = None,
 ) -> Optional[pd.DataFrame]:
     """複数 combo ディレクトリの全 fold 予測を縦結合する
 
     各 combo 直下の ``fold*`` を自動検出し ``predictions_{split}.csv`` をプールする
     （複数 out_root / seed の同一手法を 1 つに束ねる用途）読める予測が無ければ ``None``
 
+    ``sources`` を渡すと各 combo_dir 由来の行に出所キー（``source`` 列）を付与する
+    多 seed / 多 out_root では同一 slide_id が run ごとに重複するため，対応付け
+    （paired 比較の merge）は ``[slide_id, source]`` を単位にしないと直積化して
+    対応が壊れるその単位を成立させるための列である``sources`` 省略時は combo_dir
+    パスを出所キーに使う
+
     Args:
         combo_dirs: combo ディレクトリのパス列
         split: ``test`` / ``val`` / ``train``
+        sources: 各 combo_dir に対応する出所キー列（``combo_dirs`` と同長）省略時は
+            combo_dir パスを使う
 
     Returns:
-        プールした予測 DataFrame読めなければ ``None``
+        ``source`` 列を含むプール予測 DataFrame読めなければ ``None``
     """
+    if sources is not None and len(sources) != len(combo_dirs):
+        raise ValueError("sources は combo_dirs と同長である必要がある")
     frames = []
-    for combo_dir in combo_dirs:
+    for i, combo_dir in enumerate(combo_dirs):
         df = pool_predictions(combo_dir, split, _fold_names(combo_dir))
         if df is not None and len(df):
+            df = df.copy()
+            df[SOURCE_COL] = sources[i] if sources is not None else combo_dir
             frames.append(df)
     if not frames:
         return None

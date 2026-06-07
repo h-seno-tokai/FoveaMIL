@@ -13,12 +13,16 @@ import pandas as pd
 from foveamil.evaluation.ablation import (
     BASELINE_LABEL,
     GROUP_F1_METRIC,
+    SLIDE_ID_COL,
+    SOURCE_COL,
     collect_ablation,
     collect_ablation_rows,
+    collect_pooled_rows,
     compare_to_baseline,
     format_markdown,
     format_markdown_compare,
     format_markdown_pooled,
+    pool_combo_predictions,
     pooled_group_f1_compare,
     tag_combo,
 )
@@ -358,3 +362,160 @@ def test_cli_pooled_requires_baseline_and_group_classes(tmp_path):
         ablation_main(["--in", root, "--pooled", "--group-classes", "0"])
     with pytest.raises(SystemExit):
         ablation_main(["--in", root, "--pooled", "--baseline", BASELINE_LABEL])
+
+
+# ---- 多 seed プールの直積 merge 回帰（レビュー指摘 #1）----
+
+
+def _write_seed_root(tmp_path, root_name, seed, label_kind, slide_ids, y_true, y_pred):
+    """1 out_root に baseline と method の combo を seed 付きで書く
+
+    同一 out_root（＝同一 seed の run）に同一スライド集合の baseline / method 予測を置く
+    ``label_kind`` は method 側のタグ（``selector="dpp"`` で +D）
+    """
+    root = str(tmp_path / root_name)
+    os.makedirs(root)
+    mags = [10.0, 20.0]
+    base_cfg = {"magnifications": mags, "zoom_driver": "differentiable", "seed": seed}
+    meth_cfg = {**base_cfg, **label_kind}
+    _write_combo_with_preds(
+        root, "combo_000__m2", base_cfg, [(slide_ids, y_true, y_pred[0])]
+    )
+    _write_combo_with_preds(
+        root, "combo_001__m2", meth_cfg, [(slide_ids, y_true, y_pred[1])]
+    )
+    return root
+
+
+def test_multiseed_pool_merge_is_one_to_one_not_direct_product(tmp_path):
+    # 同一スライド a,b,c が seed42 と seed1 の 2 run に現れる（多 seed プール）
+    slides = ["a", "b", "c"]
+    yt = [0, 1, 2]
+    # baseline は誤り含む／method は完全一致（両 seed 共通）
+    r1 = _write_seed_root(
+        tmp_path, "seed42", 42, {"selector": "dpp"}, slides, yt,
+        y_pred=([0, 0, 2], [0, 1, 2]),
+    )
+    r2 = _write_seed_root(
+        tmp_path, "seed1", 1, {"selector": "dpp"}, slides, yt,
+        y_pred=([1, 1, 2], [0, 1, 2]),
+    )
+
+    # 出所キー付きプール：(slide_id, source) が一意で直積化しない
+    method_dirs = [os.path.join(r1, "combo_001__m2"), os.path.join(r2, "combo_001__m2")]
+    base_dirs = [os.path.join(r1, "combo_000__m2"), os.path.join(r2, "combo_000__m2")]
+    from foveamil.evaluation.ablation import _combo_sources
+
+    method_df = pool_combo_predictions(method_dirs, "test", _combo_sources(method_dirs))
+    base_df = pool_combo_predictions(base_dirs, "test", _combo_sources(base_dirs))
+    # 2 seed × 3 slide = 6 行（直積なら 12）
+    assert len(method_df) == 6 and len(base_df) == 6
+    merged = method_df.merge(
+        base_df, on=[SLIDE_ID_COL, SOURCE_COL], suffixes=("_m", "_b")
+    )
+    # merged 行数 == 対応症例数（slide × seed）== 6直積（12）ではない
+    assert len(merged) == 6
+    # source（seed）で method-seed と同一 baseline-seed が対応する
+    assert set(merged[SOURCE_COL]) == {42, 1}
+
+    # paired 並べ替え検定の n は対応症例数（6）＝直積（12）由来の水増しでない
+    from foveamil.evaluation.stats import paired_group_f1_permutation_test
+
+    perm = paired_group_f1_permutation_test(
+        merged["y_true_m"].to_numpy(),
+        merged["y_pred_m"].to_numpy(),
+        merged["y_pred_b"].to_numpy(),
+        [0, 1], n_perm=200, seed=0,
+    )
+    assert perm["n"] == 6
+
+    rows = collect_pooled_rows([r1, r2], "test")
+    enriched = pooled_group_f1_compare(rows, [0, 1], n_perm=500, n_boot=500, seed=0)
+    # 同一ラベルは複数 combo に跨るが集計は 1 度だけ（残りは値なし）
+    d_rows = [r for r in enriched if r["label"] == "FoveaMIL+D"]
+    d = next(r for r in d_rows if r["pooled_delta"] is not None)
+    # paired 検定 n は対応症例数（6）で，直積（12）由来の過小 p にならない
+    # method 完全一致 vs baseline 誤りで Δ は正
+    assert d["pooled_delta"] > 0.0
+    assert 0.0 <= d["perm_pvalue"] <= 1.0
+
+
+def test_multiseed_pool_slide_only_merge_would_direct_product(tmp_path):
+    # 回帰の前提確認：slide_id だけで merge すると直積化する（修正前の挙動）
+    slides = ["a", "b", "c"]
+    yt = [0, 1, 2]
+    r1 = _write_seed_root(
+        tmp_path, "seed42", 42, {"selector": "dpp"}, slides, yt,
+        y_pred=([0, 0, 2], [0, 1, 2]),
+    )
+    r2 = _write_seed_root(
+        tmp_path, "seed1", 1, {"selector": "dpp"}, slides, yt,
+        y_pred=([1, 1, 2], [0, 1, 2]),
+    )
+    method_dirs = [os.path.join(r1, "combo_001__m2"), os.path.join(r2, "combo_001__m2")]
+    base_dirs = [os.path.join(r1, "combo_000__m2"), os.path.join(r2, "combo_000__m2")]
+    method_df = pool_combo_predictions(method_dirs, "test")
+    base_df = pool_combo_predictions(base_dirs, "test")
+    # source を含めず slide_id だけで merge すると各 slide 2×2=4 → 12 行（直積）
+    bad = method_df.merge(base_df, on=SLIDE_ID_COL, suffixes=("_m", "_b"))
+    assert len(bad) == 12  # 水増し
+    # source を含めれば 6 行に是正される（source は combo_dir パスで run を識別）
+    good = method_df.merge(
+        base_df, on=[SLIDE_ID_COL, SOURCE_COL], suffixes=("_m", "_b")
+    )
+    # 注：source 既定（combo_dir パス）は method/baseline で異なるため 0 行
+    # → 出所キーは _combo_sources（seed）で揃える必要がある（上のテストが本筋）
+    assert len(good) == 0
+
+
+def test_collect_pooled_rows_warns_on_missing_predictions(tmp_path, caplog):
+    # 予測 CSV を欠く combo は警告して脱落（無言 skip しない）
+    root = str(tmp_path / "miss")
+    os.makedirs(root)
+    mags = [10.0, 20.0]
+    # 予測ありの combo
+    _write_combo_with_preds(
+        root, "combo_000__m2",
+        {"magnifications": mags, "zoom_driver": "differentiable"},
+        [(["a", "b"], [0, 1], [0, 1])],
+    )
+    # config だけで予測 CSV を持たない combo
+    bad_dir = os.path.join(root, "combo_001__m2")
+    os.makedirs(bad_dir)
+    with open(os.path.join(bad_dir, "config.yaml"), "w", encoding="utf-8") as fh:
+        yaml.safe_dump(
+            {"magnifications": mags, "zoom_driver": "differentiable", "selector": "dpp"},
+            fh,
+        )
+    with caplog.at_level("WARNING"):
+        rows = collect_pooled_rows([root], "test")
+    # 予測ありの 1 combo のみ拾う
+    assert len(rows) == 1 and rows[0]["combo"] == "combo_000__m2"
+    # 脱落は警告として出る
+    assert any("予測 CSV が無く脱落" in rec.message for rec in caplog.records)
+
+
+def test_collect_pooled_rows_includes_combo_without_per_class_f1(tmp_path):
+    # per-fold class F1 が cv_summary に無くても予測があれば拾う（無言脱落しない）
+    root = str(tmp_path / "nopf")
+    os.makedirs(root)
+    mags = [10.0, 20.0]
+    combo_dir = os.path.join(root, "combo_000__m2")
+    os.makedirs(combo_dir)
+    with open(os.path.join(combo_dir, "config.yaml"), "w", encoding="utf-8") as fh:
+        yaml.safe_dump({"magnifications": mags, "zoom_driver": "differentiable"}, fh)
+    # per_fold に per-class F1 を一切持たない cv_summary
+    with open(os.path.join(combo_dir, "cv_summary.json"), "w", encoding="utf-8") as fh:
+        json.dump({"test": {"per_fold": [{"macro_auc": 0.9}], "aggregate": {}}}, fh)
+    fdir = os.path.join(combo_dir, "fold0")
+    os.makedirs(fdir)
+    pd.DataFrame(
+        {"slide_id": ["a", "b"], "y_true": [0, 1], "y_pred": [0, 1],
+         "prob_0": [0.5, 0.5], "prob_1": [0.5, 0.5]}
+    ).to_csv(os.path.join(fdir, "predictions_test.csv"), index=False)
+
+    # per-fold 経路は class F1 欠如で脱落する
+    assert collect_ablation_rows([root], GROUP_F1_METRIC, "test", group_classes=[0, 1]) == []
+    # プール経路（予測ベース）は拾う
+    rows = collect_pooled_rows([root], "test")
+    assert len(rows) == 1

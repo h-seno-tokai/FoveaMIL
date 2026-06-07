@@ -6,23 +6,30 @@
 多倍率ベースライン（成分すべて off）との差分 Δ・対応 fold 差からの NB 補正 t の p・
 多重比較補正後 p を付け，group-F1（指定クラス集合の非加重平均）も指標にできる
 複数の sweep 出力ルートをまたいで集計できる（成分群と MCTS を別ルートで回した場合に
-1 表へまとめる）素集計（:func:`collect_ablation`）は後方互換で残す
+1 表へまとめる）素集計（:func:`collect_ablation`）は後方互換で残すプール group-F1 比較
+（:func:`pooled_group_f1_compare`）は予測 CSV を出所キー（seed 由来）付きでプールし，
+``[slide_id, source]`` で対応付けて多 seed の直積化を防ぐ集める行は予測 CSV ベースの
+:func:`collect_pooled_rows`（per-fold class F1 欠如での無言脱落を避ける）
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
 from foveamil.evaluation.group_metrics import (
+    SOURCE_COL,
     Y_PRED_COL,
     Y_TRUE_COL,
     group_f1_summary,
     pool_combo_predictions,
     pooled_group_f1,
 )
+
+logger = logging.getLogger(__name__)
 from foveamil.evaluation.stats import (
     adjust_pvalues,
     nadeau_bengio_corrected_t,
@@ -51,6 +58,8 @@ ZOOM_DRIVER_KEY = "zoom_driver"
 DECORRELATION_WEIGHT_KEY = "decorrelation_weight"
 AUX_NORM_KEY = "aux_norm"
 SELECTOR_KEY = "selector"
+# 出所キーの素にする seed 設定キー（多 seed プールで run を識別する）
+SEED_KEY = "seed"
 # B(スパース) を表す aux_norm 値
 SPARSE_AUX_NORM = "entmax"
 # D(多様性) を表す selector 値
@@ -342,6 +351,47 @@ def _paired_diffs(a: Sequence[float], b: Sequence[float]) -> List[float]:
 SLIDE_ID_COL = "slide_id"
 
 
+def collect_pooled_rows(
+    out_roots: List[str], split: str = "test"
+) -> List[Dict[str, Any]]:
+    """プール group-F1 比較用に予測 CSV ベースで combo 行を集める
+
+    プール経路は per-fold の per-class F1（``cv_summary`` 依存）ではなく，保存済み
+    予測 CSV から症例を集める``cv_summary`` に per-class F1 が無くても予測さえ
+    あれば対象に含める（per-fold 経路の :func:`collect_ablation_rows` で無言脱落
+    していた combo を拾う）``config.yaml`` を持つが当該 split の予測 CSV が読めない
+    combo は警告して飛ばす（無言 skip はしない）
+
+    Args:
+        out_roots: sweep の ``--out`` ルートの列
+        split: 読む予測 split（``test`` / ``val``）
+
+    Returns:
+        行辞書の列（``regime`` / ``label`` / ``combo`` / ``root``）
+    """
+    rows: List[Dict[str, Any]] = []
+    for root in out_roots:
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            combo_dir = os.path.join(root, name)
+            config = _read_yaml(os.path.join(combo_dir, COMBO_CONFIG_NAME))
+            if config is None:
+                continue
+            preds = pool_combo_predictions([combo_dir], split)
+            if preds is None or not len(preds):
+                logger.warning(
+                    "pooled: combo %s に split=%s の予測 CSV が無く脱落",
+                    combo_dir, split,
+                )
+                continue
+            regime, label = tag_combo(config)
+            rows.append(
+                {"regime": regime, "label": label, "combo": name, "root": root}
+            )
+    return rows
+
+
 def _combo_dirs_for_label(
     rows: List[Dict[str, Any]], regime: str, label: str
 ) -> List[str]:
@@ -356,6 +406,36 @@ def _combo_dirs_for_label(
     ]
 
 
+def _combo_seed(combo_dir: str) -> Optional[Any]:
+    """combo の ``config.yaml`` から seed を読む無ければ ``None``"""
+    config = _read_yaml(os.path.join(combo_dir, COMBO_CONFIG_NAME))
+    if config is not None and SEED_KEY in config and config[SEED_KEY] is not None:
+        return config[SEED_KEY]
+    return None
+
+
+def _combo_sources(combo_dirs: Sequence[str]) -> List[Any]:
+    """combo ディレクトリ群の出所キー列を作る
+
+    出所キーは method と baseline で **同一 run（同一 seed）同士**が一致する値で
+    なければ ``[slide_id, source]`` の対応付けが成立しない各 combo の seed を読み，
+    全 combo で seed が読めるならそれを使う（多 seed プールで run を一意に識別）
+    seed を読めない combo があるときは label の combo 列の **位置 index** に揃える
+    （単一 CV や seed 未記録の出力で method/baseline を同位置同士で対応付ける）
+
+    Args:
+        combo_dirs: combo ディレクトリのパス列（label ごとの combo 群）
+
+    Returns:
+        各 combo の出所キー列（``combo_dirs`` と同長）
+    """
+    seeds = [_combo_seed(d) for d in combo_dirs]
+    if seeds and all(s is not None for s in seeds):
+        return seeds
+    # seed 未記録の出力では位置 index で揃える（method/baseline を同位置同士で対応）
+    return list(range(len(combo_dirs)))
+
+
 def pooled_group_f1_compare(
     rows: List[Dict[str, Any]],
     group_classes: Sequence[int],
@@ -368,8 +448,12 @@ def pooled_group_f1_compare(
     """各レジーム内で baseline に対するプール group-F1 の Δ・並べ替え p・bootstrap CI を付与する
 
     fold（必要なら複数 out_root / seed）の予測をプールし，baseline と各手法を
-    ``slide_id`` で対応付けて同一テスト症例集合に揃える単一 CV では各 slide が
-    test に 1 度だけ現れるため対応は 1 対 1 になる対応した予測に対し，プール
+    対応付けて同一テスト症例集合に揃える各 combo 行に出所キー（seed 由来の
+    ``source`` 列）を付け，対応付けは ``[slide_id, source]`` を単位に行う単一 CV では
+    各 slide が test に 1 度だけ現れ対応は 1 対 1多 seed プールでは同一 slide_id が
+    seed ごとに現れるため，``slide_id`` だけで merge すると直積化して N が水増しされ
+    method-seed と別 baseline-seed が誤対応する``source``（seed）を merge キーに
+    含めて同一 seed 同士で 1 対 1 に揃えることでこれを防ぐ対応した予測に対し，プール
     group-F1 の差 Δ・対応あり並べ替え検定の p・クラス層化 bootstrap の差の CI を求める
 
     baseline が無いレジーム・baseline 自身・対応症例が無い縮退では Δ/p/CI を
@@ -401,7 +485,9 @@ def pooled_group_f1_compare(
         group = by_regime[regime]
         base_dirs = _combo_dirs_for_label(group, regime, baseline_label)
         base_df = (
-            pool_combo_predictions(base_dirs, split) if base_dirs else None
+            pool_combo_predictions(base_dirs, split, _combo_sources(base_dirs))
+            if base_dirs
+            else None
         )
 
         seen_labels: set = set()
@@ -421,7 +507,9 @@ def pooled_group_f1_compare(
             seen_labels.add(label)
 
             method_dirs = _combo_dirs_for_label(group, regime, label)
-            method_df = pool_combo_predictions(method_dirs, split)
+            method_df = pool_combo_predictions(
+                method_dirs, split, _combo_sources(method_dirs)
+            )
             if method_df is not None and len(method_df):
                 new_row["pooled_gf1"] = pooled_group_f1(
                     method_df[Y_TRUE_COL].to_numpy(),
@@ -438,8 +526,9 @@ def pooled_group_f1_compare(
                 enriched.append(new_row)
                 continue
 
+            # [slide_id, source] を単位に 1 対 1 対応させる（多 seed の直積を防ぐ）
             merged = method_df.merge(
-                base_df, on=SLIDE_ID_COL, suffixes=("_m", "_b")
+                base_df, on=[SLIDE_ID_COL, SOURCE_COL], suffixes=("_m", "_b")
             )
             if not len(merged):
                 enriched.append(new_row)
