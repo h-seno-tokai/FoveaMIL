@@ -11,6 +11,7 @@ from foveamil.evaluation.stats import (
     mean_ci_bootstrap,
     mean_ci_t,
     nadeau_bengio_corrected_t,
+    repeated_cv_corrected_t,
     wilcoxon_signed_rank,
 )
 
@@ -110,3 +111,44 @@ def test_nadeau_bengio_zero_variance():
 def test_nadeau_bengio_too_few_samples():
     out = nadeau_bengio_corrected_t([0.02], 900, 100)
     assert math.isnan(out["t"])
+
+
+def test_repeated_cv_matches_corrected_formula():
+    # 反復 CV: 全リサンプル差を平坦化して 1 標本扱い
+    diffs = [0.02, 0.01, 0.03, 0.0, 0.02, 0.015, 0.025, 0.005, 0.02, 0.01]
+    n_train, n_test = 900, 100
+    out = repeated_cv_corrected_t(diffs, n_train, n_test)
+    arr = np.asarray(diffs)
+    m = len(diffs)
+    corrected = arr.var(ddof=1) * (1.0 / m + n_test / n_train)
+    assert out["m"] == m
+    assert out["df"] == m - 1
+    assert out["t"] == pytest.approx(arr.mean() / math.sqrt(corrected))
+    # 補正なしの平坦な対応 t より |t| が小さい（重なりで分散を増やすため保守的）
+    plain_t = arr.mean() / (arr.std(ddof=1) / math.sqrt(m))
+    assert abs(out["t"]) < abs(plain_t)
+
+
+def test_repeated_cv_correction_uses_m_not_k():
+    # 同一の per-fold 差を seed で複製しても t は単一 CV の Nadeau-Bengio と一致しない
+    # （単一 CV は 1/k，反復は 1/m を使うため分母項が変わる）
+    base = [0.02, 0.01, 0.03, 0.0, 0.02]
+    n_train, n_test = 900, 100
+    repeated = base * 2
+    single = nadeau_bengio_corrected_t(base, n_train, n_test)
+    rep = repeated_cv_corrected_t(repeated, n_train, n_test)
+    assert rep["m"] == 10
+    assert rep["t"] != pytest.approx(single["t"])
+
+
+def test_repeated_cv_zero_variance_is_nan():
+    out = repeated_cv_corrected_t([0.0, 0.0, 0.0, 0.0], 900, 100)
+    assert math.isnan(out["t"])
+    assert math.isnan(out["pvalue"])
+    assert out["mean_diff"] == 0.0
+
+
+def test_repeated_cv_too_few_samples_is_nan():
+    out = repeated_cv_corrected_t([0.02], 900, 100)
+    assert math.isnan(out["t"])
+    assert math.isnan(out["pvalue"])
