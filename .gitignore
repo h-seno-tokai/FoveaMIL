@@ -38,6 +38,7 @@ pretrained/*
 logs/
 runs/
 wandb/
+report/
 *.log
 events.out.tfevents.*
 
