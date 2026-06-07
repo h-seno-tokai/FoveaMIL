@@ -7,9 +7,15 @@ sweep が保存した ``predictions_{split}.csv`` の logit/prob を二次利用
 提供する較正は 2 段:
   1. temperature scaling: val のロジットを温度 T で割って NLL（多クラス交差エントロピー）を
      最小化する 1 次元最適化 確率の鋭さだけを直す（argmax は不変なので分類指標は変えない）
+     よって T の効用は分類指標でなく確率較正にある＝段階表では test の NLL・ECE で観測する
+     （F1 が T で不変なのは仕様）
   2. クラス別ロジット補正 δ_c: T 適用後のロジットへクラスごとの加算項 δ_c を入れ，pooled-val の
      macro-F1（または指定クラス集合の group-F1）を最大化する 座標降下＋δ_c への L2 正則で
      過適合を抑える argmax を動かすので少数クラスの recall を引き上げ得る
+
+F1 の規約: macro-F1・group-F1 とも present-only 平均（y_true 不在クラスを除外）で出す
+per_class_recall の nan 規約・per-fold 側 group_f1_from_fold の『キー不在クラスを除外』と一致し
+不在クラスを F1=0 算入する誤減点（δ_c 目的の希釈含む）を避ける
 
 過適合回避: 較正は必ず全 fold の val をプールした 1 標本で当てる（fold ごとに当てると
 標本が薄く過適合する）δ_c は L2 で 0 方向へ縮め，T 単独 → δ_c 追加 の段階で指標の限界効用を
@@ -49,6 +55,8 @@ DELTA_GRID_POINTS = 25
 PROB_FLOOR = 1e-12
 # 主要流出先混同の既定報告本数
 DEFAULT_TOP_CONFUSIONS = 3
+# ECE の既定 bin 数（report.py の DEFAULT_N_BINS と一致）
+DEFAULT_ECE_BINS = 10
 
 _NAN = float("nan")
 
@@ -101,10 +109,43 @@ def _softmax(logits: np.ndarray) -> np.ndarray:
 
 def _nll(logits: np.ndarray, y_true: np.ndarray) -> float:
     """ロジットと正解から平均負対数尤度を返す"""
-    prob = _softmax(logits)
+    return _nll_from_prob(_softmax(logits), y_true)
+
+
+def _nll_from_prob(prob: np.ndarray, y_true: np.ndarray) -> float:
+    """較正後確率と正解から平均負対数尤度（NLL）を返す標本無しで nan"""
+    y_true = np.asarray(y_true)
     n = len(y_true)
+    if n == 0:
+        return _NAN
     picked = prob[np.arange(n), y_true]
     return float(-np.mean(np.log(np.clip(picked, PROB_FLOOR, None))))
+
+
+def _ece_from_prob(
+    prob: np.ndarray, y_true: np.ndarray, n_bins: int = DEFAULT_ECE_BINS
+) -> float:
+    """較正後確率と正解から期待較正誤差（ECE）を返す
+
+    各 bin で最大確率（信頼度）の平均と正解率の差の絶対値を標本数で重み付けて足す
+    report.py の compute_ece と同じ定義（あちらは DataFrame 入力 こちらは確率配列入力）
+    標本無しで nan
+    """
+    y_true = np.asarray(y_true)
+    n = len(y_true)
+    if n == 0:
+        return _NAN
+    conf = prob.max(axis=1)
+    pred = prob.argmax(axis=1)
+    correct = (pred == y_true).astype(float)
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        mask = (conf > bins[i]) & (conf <= bins[i + 1])
+        count = int(mask.sum())
+        if count:
+            ece += count / n * abs(correct[mask].mean() - conf[mask].mean())
+    return float(ece)
 
 
 def fit_temperature(
@@ -141,27 +182,44 @@ def fit_temperature(
     return float(np.exp(result.x))
 
 
+def _present_classes(y_true: np.ndarray, n_classes: int) -> List[int]:
+    """y_true に支持標本が 1 つ以上あるクラスの index 列（昇順）"""
+    return [c for c in range(n_classes) if int(np.sum(y_true == c)) > 0]
+
+
 def _macro_f1(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int) -> float:
-    """全クラスを母集合とした macro-F1（欠損クラスも 0 で数える）"""
-    if len(y_true) == 0:
+    """present-only macro-F1（y_true に不在のクラスは平均から除外する）
+
+    不在クラスを F1=0 で算入せず除外する規約は per_class_recall の nan 規約と一致させる
+    （不在クラスを 0 減点すると T/δ_c の効用が希釈され誤誘導するため）present クラスが
+    1 つも無ければ nan
+    """
+    present = _present_classes(y_true, n_classes)
+    if len(y_true) == 0 or not present:
         return _NAN
-    return float(
-        f1_score(
-            y_true, y_pred, labels=list(range(n_classes)), average="macro",
-            zero_division=0,
-        )
+    per_class = f1_score(
+        y_true, y_pred, labels=present, average=None, zero_division=0
     )
+    return float(np.mean(per_class))
 
 
 def _group_f1(
     y_true: np.ndarray, y_pred: np.ndarray, class_indices: Sequence[int]
 ) -> float:
-    """指定クラス集合の非加重平均 F1（per-class F1 を当該集合で平均）"""
+    """指定クラス集合の present-only 非加重平均 F1
+
+    集合のうち y_true に支持標本があるクラスのみで平均する（不在クラスは除外）
+    per-fold 側 group_f1_from_fold の『キー不在クラスを除外』と定義を一致させる
+    present な対象クラスが無ければ nan
+    """
     indices = list(class_indices)
     if len(y_true) == 0 or not indices:
         return _NAN
+    present = [c for c in indices if int(np.sum(y_true == c)) > 0]
+    if not present:
+        return _NAN
     per_class = f1_score(
-        y_true, y_pred, labels=indices, average=None, zero_division=0
+        y_true, y_pred, labels=present, average=None, zero_division=0
     )
     return float(np.mean(per_class))
 
@@ -332,8 +390,14 @@ def evaluate_predictions(
     n_classes: int,
     group_classes: Optional[Sequence[int]] = None,
     top_confusions: int = DEFAULT_TOP_CONFUSIONS,
+    prob: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
-    """予測の指標一式（macro-F1・group-F1・per-class recall・主要流出先）を返す
+    """予測の指標一式（macro-F1・group-F1・per-class recall・主要流出先・NLL/ECE）を返す
+
+    macro-F1/group-F1 は present-only 平均（y_true 不在クラスを除外＝per-class recall の
+    nan 規約と一致）temperature scaling は argmax 不変なので分類指標（F1/recall）は
+    構造的に変えない T の効用は確率較正にあり ``prob`` を渡すと NLL・ECE を算出して返す
+    （F1 が T で不変なのは仕様であり T の価値は NLL↓/ECE↓ で観測する）
 
     Args:
         y_true: 正解ラベル ``[N]``
@@ -341,20 +405,26 @@ def evaluate_predictions(
         n_classes: クラス数 C
         group_classes: group-F1 の対象クラス集合（None で算出しない）
         top_confusions: 少数クラスごとに報告する流出先の本数
+        prob: 較正後確率 ``[N, C]``渡すと NLL/ECE を算出（None で両者 nan）
 
     Returns:
-        ``{"macro_f1", "group_f1", "minority_recall", "top_confusions"}``
+        ``{"macro_f1", "group_f1", "minority_recall", "top_confusions",
+           "nll", "ece"}``
     """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
     minority = _minority_classes(y_true, n_classes)
     recalls = _per_class_recall(y_true, y_pred, n_classes)
+    nll = _nll_from_prob(prob, y_true) if prob is not None else _NAN
+    ece = _ece_from_prob(prob, y_true) if prob is not None else _NAN
     return {
         "macro_f1": _macro_f1(y_true, y_pred, n_classes),
         "group_f1": (
             _group_f1(y_true, y_pred, group_classes)
             if group_classes else None
         ),
+        "nll": nll,
+        "ece": ece,
         "minority_classes": minority,
         "minority_recall": {c: recalls[c] for c in minority},
         "per_class_recall": recalls,
@@ -375,6 +445,9 @@ def calibrate_val_to_test(
 
     段階寄与分解: ``baseline``（較正なし）→ ``temperature``（T 単独）→ ``temperature_delta``
     （T+δ_c）の 3 段で test 指標を出し，各段の限界効用（前段との差）を併記する
+    各段は分類指標（present-only macro/group-F1・recall）に加え確率較正指標 NLL/ECE を出す
+    temperature scaling は argmax 不変なので F1/recall を構造的に変えない（T 段の F1 寄与が
+    0 なのは仕様）T の本来効用は NLL↓/ECE↓ で観測できるよう段間差を marginal に併記する
     val/test の logit が取れない・標本不足では恒等変換へ落とし指標は計算できる範囲で返す
     （例外を投げない）
 
@@ -430,20 +503,23 @@ def calibrate_val_to_test(
         val_scaled, val_y, n_classes, group_classes=group_classes, l2=l2
     )
 
-    # test に各段を適用
-    _, base_pred = apply_calibration(test_logits, IDENTITY_TEMPERATURE)
-    _, temp_pred = apply_calibration(test_logits, temperature)
-    _, full_pred = apply_calibration(test_logits, temperature, deltas)
+    # test に各段を適用確率も渡し NLL/ECE を段ごとに出す
+    base_prob, base_pred = apply_calibration(test_logits, IDENTITY_TEMPERATURE)
+    temp_prob, temp_pred = apply_calibration(test_logits, temperature)
+    full_prob, full_pred = apply_calibration(test_logits, temperature, deltas)
 
     stages = {
         "baseline": evaluate_predictions(
-            test_y, base_pred, n_classes, group_classes, top_confusions
+            test_y, base_pred, n_classes, group_classes, top_confusions,
+            prob=base_prob,
         ),
         "temperature": evaluate_predictions(
-            test_y, temp_pred, n_classes, group_classes, top_confusions
+            test_y, temp_pred, n_classes, group_classes, top_confusions,
+            prob=temp_prob,
         ),
         "temperature_delta": evaluate_predictions(
-            test_y, full_pred, n_classes, group_classes, top_confusions
+            test_y, full_pred, n_classes, group_classes, top_confusions,
+            prob=full_prob,
         ),
     }
     marginal = _marginal_utility(stages, group_classes)
@@ -480,7 +556,12 @@ def _diff(after: float, before: float) -> float:
 def _marginal_utility(
     stages: Dict[str, Dict[str, Any]], group_classes: Optional[Sequence[int]]
 ) -> Dict[str, Any]:
-    """段階寄与分解 baseline→T→T+δ の各段の macro/group-F1 限界効用を返す"""
+    """段階寄与分解 baseline→T→T+δ の各段の限界効用を返す
+
+    macro/group-F1 は分類指標で T 段では構造的に不変（argmax 不変）になる T 本来の
+    効用は確率較正なので NLL・ECE の段間差も併記する（負＝改善）これにより F1 が
+    T で 0 寄与に見えても T の価値（NLL↓/ECE↓）が観測できる
+    """
     base = stages["baseline"]
     temp = stages["temperature"]
     full = stages["temperature_delta"]
@@ -489,7 +570,17 @@ def _marginal_utility(
             "temperature": _diff(temp["macro_f1"], base["macro_f1"]),
             "delta": _diff(full["macro_f1"], temp["macro_f1"]),
             "total": _diff(full["macro_f1"], base["macro_f1"]),
-        }
+        },
+        "nll": {
+            "temperature": _diff(temp["nll"], base["nll"]),
+            "delta": _diff(full["nll"], temp["nll"]),
+            "total": _diff(full["nll"], base["nll"]),
+        },
+        "ece": {
+            "temperature": _diff(temp["ece"], base["ece"]),
+            "delta": _diff(full["ece"], temp["ece"]),
+            "total": _diff(full["ece"], base["ece"]),
+        },
     }
     if group_classes:
         out["group_f1"] = {

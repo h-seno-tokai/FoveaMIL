@@ -103,14 +103,21 @@ def _build_markdown(
             f"- temperature T: {r['temperature']:.4f}（logit 源: {r['logit_source']}）",
             f"- val/test 標本数: {r['n_val']} / {r['n_test']}",
             "",
-            "| 段階 | macro-F1 | group-F1 |",
-            "| --- | --- | --- |",
+            "temperature scaling は argmax 不変＝F1/recall を構造的に変えない（T 段の F1 寄与が"
+            "0 なのは仕様）T の効用は確率較正にあり NLL↓/ECE↓ で観測する F1 は present-only"
+            "平均（y_true 不在クラスを除外）",
+            "",
+            "| 段階 | macro-F1 | group-F1 | NLL | ECE |",
+            "| --- | --- | --- | --- | --- |",
             f"| baseline | {_format_metric(base.get('macro_f1'))} | "
-            f"{_format_metric(base.get('group_f1'))} |",
+            f"{_format_metric(base.get('group_f1'))} | "
+            f"{_format_metric(base.get('nll'))} | {_format_metric(base.get('ece'))} |",
             f"| +temperature | {_format_metric(temp.get('macro_f1'))} | "
-            f"{_format_metric(temp.get('group_f1'))} |",
+            f"{_format_metric(temp.get('group_f1'))} | "
+            f"{_format_metric(temp.get('nll'))} | {_format_metric(temp.get('ece'))} |",
             f"| +temperature+δ | {_format_metric(full.get('macro_f1'))} | "
-            f"{_format_metric(full.get('group_f1'))} |",
+            f"{_format_metric(full.get('group_f1'))} | "
+            f"{_format_metric(full.get('nll'))} | {_format_metric(full.get('ece'))} |",
             "",
         ]
         mm = marginal.get("macro_f1", {})
@@ -120,6 +127,24 @@ def _build_markdown(
                 f"T={_format_metric(mm.get('temperature'))} / "
                 f"δ={_format_metric(mm.get('delta'))} / "
                 f"合計={_format_metric(mm.get('total'))}",
+                "",
+            ]
+        mn = marginal.get("nll", {})
+        if mn:
+            lines += [
+                "段階寄与（NLL 限界効用 負＝改善）: "
+                f"T={_format_metric(mn.get('temperature'))} / "
+                f"δ={_format_metric(mn.get('delta'))} / "
+                f"合計={_format_metric(mn.get('total'))}",
+                "",
+            ]
+        me = marginal.get("ece", {})
+        if me:
+            lines += [
+                "段階寄与（ECE 限界効用 負＝改善）: "
+                f"T={_format_metric(me.get('temperature'))} / "
+                f"δ={_format_metric(me.get('delta'))} / "
+                f"合計={_format_metric(me.get('total'))}",
                 "",
             ]
         mg = marginal.get("group_f1", {})
