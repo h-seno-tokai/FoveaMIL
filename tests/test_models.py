@@ -3,6 +3,8 @@
 import pytest
 import torch
 
+import torch.nn as nn
+
 from foveamil.models import (
     FoveaMIL,
     GatedAttention,
@@ -11,6 +13,7 @@ from foveamil.models import (
     build_fusion,
     build_topk,
 )
+from foveamil.models.mil import _build_projection
 
 
 # --- top-k レジストリ ---
@@ -126,6 +129,91 @@ def test_build_fusion_unknown_raises():
 def test_linear_head_shape():
     head = LinearClassifierHead(in_dim=8, n_cls=4)
     assert head(torch.randn(2, 8)).shape == (2, 4)
+
+
+# --- 特徴射影（多段 MLP / LayerNorm）---
+
+
+def test_projection_default_is_linear_relu():
+    # 既定（1 段・LayerNorm なし）は Linear + ReLU の 2 部品のみ（従来構成）
+    proj = _build_projection(8, 12, dropout=None)
+    assert len(proj) == 2
+    assert isinstance(proj[0], nn.Linear)
+    assert isinstance(proj[1], nn.ReLU)
+    assert proj[0].in_features == 8 and proj[0].out_features == 12
+
+
+def test_projection_default_with_dropout_appends_dropout():
+    proj = _build_projection(8, 12, dropout=0.3)
+    assert [type(m) for m in proj] == [nn.Linear, nn.ReLU, nn.Dropout]
+
+
+def test_projection_default_bit_compatible_with_legacy():
+    # 既定構成は従来の Linear+ReLU(+Dropout) と部品の並び・初期化順まで一致し
+    # 同一シード下で重みが bit 一致する（RNG 消費が変わらないことの回帰ガード）
+    torch.manual_seed(0)
+    legacy = nn.Sequential(nn.Linear(8, 12), nn.ReLU())
+    torch.manual_seed(0)
+    proj = _build_projection(8, 12, dropout=None)
+    assert torch.equal(proj[0].weight, legacy[0].weight)
+    assert torch.equal(proj[0].bias, legacy[0].bias)
+
+
+def test_projection_multistage_shapes_and_layer_norm():
+    proj = _build_projection(8, 12, dropout=None, num_layers=3, layer_norm=True)
+    # 各段 Linear+LayerNorm+ReLU の 3 部品 × 3 段
+    assert [type(m) for m in proj] == [nn.Linear, nn.LayerNorm, nn.ReLU] * 3
+    linears = [m for m in proj if isinstance(m, nn.Linear)]
+    # 先頭段のみ in_feat_dim 入力，以降は out_feat_dim 入出力
+    assert linears[0].in_features == 8 and linears[0].out_features == 12
+    assert all(lin.in_features == 12 and lin.out_features == 12 for lin in linears[1:])
+    out = proj(torch.randn(2, 5, 8))
+    assert out.shape == (2, 5, 12)
+
+
+def test_projection_multistage_without_layer_norm():
+    proj = _build_projection(8, 12, dropout=None, num_layers=2, layer_norm=False)
+    assert [type(m) for m in proj] == [nn.Linear, nn.ReLU, nn.Linear, nn.ReLU]
+
+
+def test_projection_rejects_zero_layers():
+    with pytest.raises(ValueError, match="num_layers"):
+        _build_projection(8, 12, dropout=None, num_layers=0)
+
+
+def test_model_default_projection_bit_compatible():
+    # FoveaMIL 既定の射影は従来構成と数値一致（モデル全体の bit 互換ガード）
+    torch.manual_seed(0)
+    legacy = FoveaMIL(in_feat_dim=8, hidden_feat_dim=16, out_feat_dim=12, n_cls=3, num_layers=1)
+    torch.manual_seed(0)
+    explicit = FoveaMIL(
+        in_feat_dim=8, hidden_feat_dim=16, out_feat_dim=12, n_cls=3, num_layers=1,
+        proj_num_layers=1, proj_layer_norm=False,
+    )
+    legacy.eval()
+    explicit.eval()
+    x = torch.randn(1, 10, 8)
+    M_a, _, _, _ = legacy.forward_layer(x, 0)
+    M_b, _, _, _ = explicit.forward_layer(x, 0)
+    assert torch.equal(M_a, M_b)
+
+
+def test_model_multistage_projection_forward_and_gradient():
+    torch.manual_seed(0)
+    model = FoveaMIL(
+        in_feat_dim=8, hidden_feat_dim=16, out_feat_dim=12, n_cls=3, num_layers=2,
+        k_sample=4, proj_num_layers=3, proj_layer_norm=True,
+    )
+    model.train()
+    M0, _, _, _ = model.forward_layer(torch.randn(1, 10, 8, requires_grad=False), 0)
+    M1, _, _, _ = model.forward_layer(torch.randn(1, 7, 8), 1)
+    logits, _, _ = model.forward_final([M0, M1])
+    assert logits.shape == (1, 3)
+    logits.sum().backward()
+    # 多段射影の各 Linear へ勾配が流れる
+    linears = [m for m in model.projections[0] if isinstance(m, nn.Linear)]
+    assert len(linears) == 3
+    assert all(lin.weight.grad is not None and torch.isfinite(lin.weight.grad).all() for lin in linears)
 
 
 # --- FoveaMIL 組立 ---
