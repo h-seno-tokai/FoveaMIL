@@ -66,6 +66,14 @@ DEFAULT_BAG_WEIGHT = 0.7
 DEFAULT_INST_K = 8
 # 既定のインスタンス補助損失の out-of-class 枝の有無
 DEFAULT_INST_SUBTYPING = True
+# 既定の不均衡対応損失種別（plain は素 cross-entropy で従来挙動と一致）
+DEFAULT_LOSS_TYPE = "plain"
+# 既定の logit-adjusted CE の補正強度 τ（loss_type="logit_adjusted" のときのみ有効）
+DEFAULT_LOSS_TAU = 1.0
+# 既定の class-balanced の有効標本数 β（loss_type="class_balanced" のときのみ有効）
+DEFAULT_LOSS_CB_BETA = 0.999
+# 既定の LDAM の最大マージン（loss_type="ldam" のときのみ有効）
+DEFAULT_LOSS_LDAM_MAX_MARGIN = 0.5
 # 既定のクラス数
 DEFAULT_N_CLS = 3
 # 既定の倍率間冗長性罰則の重み（0 で無効）
@@ -133,6 +141,10 @@ class TrainConfig:
         inst_k: インスタンス補助損失の pos/neg パッチ数
         inst_subtyping: インスタンス補助損失に out-of-class 枝を加えるか
         n_cls: クラス数
+        loss_type: 分類損失種別（``"plain"`` で素 CE，``"logit_adjusted"`` / ``"ldam"`` / ``"class_balanced"`` で不均衡対応クラス頻度は train split から自動算出する）
+        loss_tau: logit-adjusted CE の補正強度 τ（``loss_type="logit_adjusted"`` のときのみ有効）
+        loss_cb_beta: class-balanced の有効標本数 β（``loss_type="class_balanced"`` のときのみ有効）
+        loss_ldam_max_margin: LDAM の最大マージン（``loss_type="ldam"`` のときのみ有効）
         decorrelation_weight: 倍率間冗長性罰則の重み（0 で無効，多倍率のみ有効）
         decorrelation_method: 倍率間冗長性罰則の手法（``"cosine"`` / ``"covariance"``）
         is_weighted_sampler: train で WeightedRandomSampler を使うか
@@ -188,6 +200,10 @@ class TrainConfig:
     inst_k: int = DEFAULT_INST_K
     inst_subtyping: bool = DEFAULT_INST_SUBTYPING
     n_cls: int = DEFAULT_N_CLS
+    loss_type: str = DEFAULT_LOSS_TYPE
+    loss_tau: float = DEFAULT_LOSS_TAU
+    loss_cb_beta: float = DEFAULT_LOSS_CB_BETA
+    loss_ldam_max_margin: float = DEFAULT_LOSS_LDAM_MAX_MARGIN
     decorrelation_weight: float = DEFAULT_DECORRELATION_WEIGHT
     decorrelation_method: str = DEFAULT_DECORRELATION_METHOD
 

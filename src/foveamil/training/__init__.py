@@ -11,6 +11,12 @@ from foveamil.training.hierarchy import (
     compute_child_indices,
     validate_magnification_hierarchy,
 )
+from foveamil.training.losses import (
+    ClassBalancedLoss,
+    LDAMLoss,
+    LogitAdjustedLoss,
+    build_loss,
+)
 from foveamil.training.metrics import MetricLogger
 from foveamil.training.resolve import (
     ResolvedPaths,
@@ -33,6 +39,10 @@ __all__ = [
     "compute_child_indices",
     "children_per_parent",
     "validate_magnification_hierarchy",
+    "build_loss",
+    "LogitAdjustedLoss",
+    "LDAMLoss",
+    "ClassBalancedLoss",
     "FeatureStager",
     "STAGE_DIR_ENV",
     "TrainConfig",

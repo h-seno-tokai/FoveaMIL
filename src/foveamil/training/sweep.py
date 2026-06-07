@@ -85,6 +85,17 @@ MCTS_PARAM_KEYS = (
 )
 # instance_loss 有効時のみ意味を持つキー（無効時は無関係）
 INSTANCE_PARAM_KEYS = ("bag_weight", "inst_k", "inst_subtyping")
+# 分類損失種別キー
+LOSS_TYPE_KEY = "loss_type"
+# loss_type の値ごとにのみ意味を持つキー（他の値では無関係）
+LOSS_LOGIT_ADJUSTED = "logit_adjusted"
+LOSS_CLASS_BALANCED = "class_balanced"
+LOSS_LDAM = "ldam"
+LOSS_TYPE_PARAM_KEYS = {
+    "loss_tau": LOSS_LOGIT_ADJUSTED,
+    "loss_cb_beta": LOSS_CLASS_BALANCED,
+    "loss_ldam_max_margin": LOSS_LDAM,
+}
 # 倍率間冗長性罰則の重みキー（多倍率のみ有効）
 DECORRELATION_WEIGHT_KEY = "decorrelation_weight"
 # decorrelation_weight 有効時のみ意味を持つキー（無効時は無関係）
@@ -278,6 +289,8 @@ def _canonicalize_conditional(
     instance 系（``bag_weight`` / ``inst_k`` / ``inst_subtyping``）は ``instance_loss`` 有効時の
     み意味を持つ（無効時は畳む）``decorrelation_weight`` は多倍率のみ有効（単一倍率では畳む）
     ``decorrelation_method`` は ``decorrelation_weight`` が正のときのみ意味を持つ（0 では畳む）
+    損失ハイパラ（``loss_tau`` / ``loss_cb_beta`` / ``loss_ldam_max_margin``）は対応する
+    ``loss_type`` 値のときのみ意味を持つ（他では畳む）
     畳んだキーは ``axis_values`` から落とし集計・表に載せない明示値を捨てたキー集合を返す（警告用）
     """
     discarded: set = set()
@@ -320,6 +333,11 @@ def _canonicalize_conditional(
                 discarded.add(key)
     if not instance_on:
         for key in INSTANCE_PARAM_KEYS:
+            if _disable_param(config, axis_values, defaults, key):
+                discarded.add(key)
+    loss_type = config.get(LOSS_TYPE_KEY, defaults[LOSS_TYPE_KEY])
+    for key, required_loss_type in LOSS_TYPE_PARAM_KEYS.items():
+        if loss_type != required_loss_type:
             if _disable_param(config, axis_values, defaults, key):
                 discarded.add(key)
     decorrelation_on = (

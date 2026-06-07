@@ -298,6 +298,58 @@ def test_decorrelation_method_kept_when_weight_positive():
     }
 
 
+def test_loss_hyperparams_collapse_for_plain():
+    # 既定 loss_type=plain では損失ハイパラは無関係なので畳んで統合する
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        loss_tau=[0.5, 1.0],
+        loss_cb_beta=[0.99, 0.999],
+        loss_ldam_max_margin=[0.3, 0.5],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 損失ハイパラは畳まれて 10 pairs のみ
+    keys = varying_axis_keys(combos)
+    assert "loss_tau" not in keys
+    assert "loss_cb_beta" not in keys
+    assert "loss_ldam_max_margin" not in keys
+
+
+def test_loss_tau_kept_for_logit_adjusted():
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        loss_type=["logit_adjusted"],
+        loss_tau=[0.5, 1.0],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 20  # 10 pairs * 2 tau
+    assert {c.config["loss_tau"] for c in combos} == {0.5, 1.0}
+    assert "loss_tau" in varying_axis_keys(combos)
+
+
+def test_loss_cb_beta_collapses_for_non_class_balanced():
+    # loss_type=ldam では loss_cb_beta は無関係なので畳む
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        loss_type=["ldam"],
+        loss_cb_beta=[0.99, 0.999],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10
+    assert "loss_cb_beta" not in varying_axis_keys(combos)
+
+
+def test_loss_type_axis_kept():
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        loss_type=["plain", "logit_adjusted", "class_balanced"],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 30  # 10 pairs * 3 loss_type
+    assert {c.config["loss_type"] for c in combos} == {
+        "plain", "logit_adjusted", "class_balanced"
+    }
+
+
 def test_single_mag_collapses_aux_norm_params():
     # 単一倍率では補助アテンションを持たないため aux_norm 系は無関係で畳む
     sweep = _base_sweep(

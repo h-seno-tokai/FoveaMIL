@@ -20,7 +20,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch import Tensor
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -37,6 +36,7 @@ from foveamil.training.accessor import FeatureAccessor
 from foveamil.training.config import TrainConfig
 from foveamil.training.dataset import feature_bag_collate
 from foveamil.training.hierarchy import validate_magnification_hierarchy
+from foveamil.training.losses import build_loss
 from foveamil.training.metrics import MetricLogger
 from foveamil.training.saver import ModelSaver
 from foveamil.training.zoom_driver import build_zoom_driver
@@ -209,6 +209,13 @@ def _class_weights(dataset, n_cls: int) -> torch.Tensor:
     return torch.DoubleTensor(weights)
 
 
+def _class_frequencies(dataset, n_cls: int) -> List[int]:
+    """データセットからクラスごとのサンプル件数を返す（不均衡対応損失の入力）"""
+    labels = [dataset.get_label(idx) for idx in range(len(dataset))]
+    counts = np.bincount(labels, minlength=n_cls)
+    return [int(c) for c in counts]
+
+
 class Trainer:
     """FoveaMIL の学習・検証・評価を司る
 
@@ -266,7 +273,13 @@ class Trainer:
         self.val_loader = self._build_eval_loader(val_ds)
         self.test_loader = self._build_eval_loader(test_ds)
 
-        self.ce_loss = nn.CrossEntropyLoss()
+        self.criterion = build_loss(
+            config.loss_type,
+            _class_frequencies(train_ds, self.n_cls),
+            tau=config.loss_tau,
+            beta=config.loss_cb_beta,
+            ldam_max_margin=config.loss_ldam_max_margin,
+        ).to(self.device)
         self.optimizer = optim.Adam(
             self.model.parameters(),
             lr=config.lr,
@@ -371,9 +384,10 @@ class Trainer:
     def _train_one_epoch(self) -> float:
         """1 エポック学習し平均損失を返す
 
-        ``instance_enabled`` なら最低倍率の全バッグ主アテンションでインスタンス補助
-        損失を計算し ``bag·bag_weight + inst·(1-bag_weight)`` を最小化する補助損失が
-        有効なら ``CE + Σ w_i·reg_i + Σ extra_losses`` を最小化する
+        分類損失は ``config.loss_type`` で選ぶ損失（既定は素 CE）``instance_enabled`` なら
+        最低倍率の全バッグ主アテンションでインスタンス補助損失を計算し
+        ``bag·bag_weight + inst·(1-bag_weight)`` を最小化する補助損失が有効なら
+        ``分類損失 + Σ w_i·reg_i + Σ extra_losses`` を最小化する
         """
         self.model.train()
         self.optimizer.zero_grad()
@@ -386,12 +400,12 @@ class Trainer:
                     base_feats.to(self.device), label
                 )
                 loss = (
-                    self.bag_weight * self.ce_loss(logits, label)
+                    self.bag_weight * self.criterion(logits, label)
                     + (1.0 - self.bag_weight) * inst_loss
                 )
             else:
                 logits, _, _, context = self._forward(base_feats, slide_id, label)
-                loss = self.ce_loss(logits, label) + self._regularizer_loss(
+                loss = self.criterion(logits, label) + self._regularizer_loss(
                     context, label
                 )
             total_loss += loss.item()
@@ -417,7 +431,7 @@ class Trainer:
                 logits, Y_hat, Y_prob, _ = self._forward(base_feats, slide_id)
                 metric_logger.log(Y_hat, label, Y_prob, Y_logit=logits)
                 slide_ids.append(slide_id)
-                total_loss += self.ce_loss(logits, label).item()
+                total_loss += self.criterion(logits, label).item()
                 n += 1
         avg_loss = total_loss / n if n else float("nan")
         return avg_loss, metric_logger.get_summary(), metric_logger, slide_ids
