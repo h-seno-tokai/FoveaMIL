@@ -38,6 +38,11 @@ from foveamil.training.dataset import feature_bag_collate
 from foveamil.training.hierarchy import validate_magnification_hierarchy
 from foveamil.training.losses import build_loss
 from foveamil.training.metrics import MetricLogger
+from foveamil.training.minority import (
+    BagMixup,
+    OrdinalAuxLoss,
+    temper_sampler_weights,
+)
 from foveamil.training.saver import ModelSaver
 from foveamil.training.zoom_driver import build_zoom_driver
 
@@ -92,6 +97,8 @@ CONFUSION_MATRIX_NORM_PNG_TEMPLATE = "confusion_matrix_{split}_normalized.png"
 # 予測 CSV の確率/​logit 列名テンプレート
 PROB_COL_TEMPLATE = "prob_{i}"
 LOGIT_COL_TEMPLATE = "logit_{i}"
+# mixup の λ サンプリングに使う乱数生成器の seed オフセット（学習 seed と分離する）
+MIXUP_GENERATOR_SEED_OFFSET = 7919
 
 
 def _topk_kwargs(config: TrainConfig) -> dict:
@@ -320,10 +327,24 @@ class Trainer:
         )
         self.tb_writer = self._build_tb_writer()
 
+        # 少数クラス学習信号の強化機構（いずれも既定 off で従来挙動と一致）
+        mixup_generator = torch.Generator()
+        mixup_generator.manual_seed(config.seed + MIXUP_GENERATOR_SEED_OFFSET)
+        self.bag_mixup = BagMixup(
+            config.mixup_alpha, self.n_cls, generator=mixup_generator
+        )
+        self.ordinal_aux_weight = config.ordinal_aux_weight
+        self.ordinal_aux = (
+            OrdinalAuxLoss(self.n_cls).to(self.device)
+            if config.ordinal_aux_weight > 0
+            else None
+        )
+
     def _build_train_loader(self, train_ds) -> DataLoader:
         """学習用 DataLoader を作る（重み付き or ランダムサンプラ）"""
         if self.config.is_weighted_sampler:
             weights = _class_weights(train_ds, self.n_cls)
+            weights = temper_sampler_weights(weights, self.config.sampler_temp)
             sampler = WeightedRandomSampler(weights, len(weights))
         else:
             sampler = RandomSampler(train_ds)
@@ -403,13 +424,40 @@ class Trainer:
         """有効な正則化項と寄与損失を合算する（``regularizer_loss`` へ委譲する）"""
         return regularizer_loss(self.regularizers, context, label)
 
+    def _bag_classification_loss(self, fused: Tensor, label: Tensor) -> Tensor:
+        """bag 表現を分類し（任意で mixup・ordinal を加え）分類損失を返す
+
+        ``bag_mixup`` が有効なら融合後 bag 表現を直前サンプルと補間し補間ラベルで損失を
+        取る（無効/初回は素のラベルで素の分類損失）``ordinal_aux`` が有効なら mixup を
+        通さない素の logit で ordinal 補助損失を加える 既定（``mixup_alpha=0`` かつ
+        ``ordinal_aux_weight=0``）では補間も追加項も無く ``criterion(logits, label)`` と一致する
+
+        Args:
+            fused: 融合後 bag 表現 ``[B, out_dim]``
+            label: 正解クラス ``[B]``
+
+        Returns:
+            分類損失スカラ（mixup・ordinal 込み）
+        """
+        repr_mixed, _, loss_fn = self.bag_mixup.mix(fused, label)
+        logits, _, _ = self.model.classify(repr_mixed)
+        loss = loss_fn(self.criterion, logits)
+        if self.ordinal_aux is not None:
+            # ordinal は素の bag 表現の logit で測る（mixup の補間に依らない順序信号）
+            plain_logits, _, _ = self.model.classify(fused)
+            loss = loss + self.ordinal_aux_weight * self.ordinal_aux(
+                plain_logits, label
+            )
+        return loss
+
     def _train_one_epoch(self) -> float:
         """1 エポック学習し平均損失を返す
 
         分類損失は ``config.loss_type`` で選ぶ損失（既定は素 CE）``instance_enabled`` なら
         最低倍率の全バッグ主アテンションでインスタンス補助損失を計算し
         ``bag·bag_weight + inst·(1-bag_weight)`` を最小化する補助損失が有効なら
-        ``分類損失 + Σ w_i·reg_i + Σ extra_losses`` を最小化する
+        ``分類損失 + Σ w_i·reg_i + Σ extra_losses`` を最小化する mixup / ordinal が有効なら
+        bag 表現レベルの補間・順序補助損失を分類損失へ織り込む（既定 off で従来と一致）
         """
         self.model.train()
         self.optimizer.zero_grad()
@@ -417,19 +465,20 @@ class Trainer:
         for base_feats, slide_id, label in self.train_loader:
             label = label.to(self.device)
             if self.instance_enabled:
-                # 単一倍率の bag forward と補助損失を同一の射影・主アテンションから得る
-                logits, _, _, inst_loss = self.model.forward_with_instance_loss(
+                # 単一倍率の bag 表現と補助損失を同一の射影・主アテンションから得る
+                fused, inst_loss = self.model.forward_with_instance_repr(
                     base_feats.to(self.device), label
                 )
                 loss = (
-                    self.bag_weight * self.criterion(logits, label)
+                    self.bag_weight * self._bag_classification_loss(fused, label)
                     + (1.0 - self.bag_weight) * inst_loss
                 )
             else:
-                logits, _, _, context = self._forward(base_feats, slide_id, label)
-                loss = self.criterion(logits, label) + self._regularizer_loss(
-                    context, label
-                )
+                _, _, _, context = self._forward(base_feats, slide_id, label)
+                fused = self.model.fuse_repr(context.m_list)
+                loss = self._bag_classification_loss(
+                    fused, label
+                ) + self._regularizer_loss(context, label)
             total_loss += loss.item()
             loss.backward()
             self.optimizer.step()
