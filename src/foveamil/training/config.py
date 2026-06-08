@@ -141,7 +141,7 @@ class TrainConfig:
         dpp_rbf_gamma: DPP RBF 帯域（``selector=="dpp"`` かつ ``dpp_similarity=="rbf"`` 時のみ）
         dpp_use_gumbel: DPP 学習時に Gumbel 雑音で確率的に選ぶか（``selector=="dpp"`` 時のみ）
         dpp_diversity_weight: DPP 多様性正則化の重み（0 で無効，``selector=="dpp"`` 多倍率時のみ）
-        fusion: 融合名
+        fusion: 融合名（``"sum"`` で従来挙動，``"gated"`` でスライド依存ゲート加重和，``"scale_attention"`` でスケール間自己アテンション集約）
         aggregator: 集約器名（``"abmil"`` で従来のゲート付きアテンションプーリングと bit 互換，``"self_attn"`` でパッチ間コンテキストを取り込む自己アテンション）
         aggregator_num_heads: 自己アテンション集約器の注意ヘッド数（``aggregator="self_attn"`` のときのみ有効）
         aggregator_num_landmarks: 自己アテンション集約器の Nyström landmark 数（``aggregator="self_attn"`` のときのみ有効パッチ数が landmark 以下なら厳密注意へ縮退）
