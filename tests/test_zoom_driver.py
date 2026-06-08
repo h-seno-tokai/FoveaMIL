@@ -664,15 +664,16 @@ def test_mcts_eval_non_stochastic_memoizes_same_value():
 
 
 def test_mcts_stochastic_improved_policy_differs_from_deterministic():
-    """確率評価で改良方策が変わる＝simulation が実ノブとして探索に効く
+    """確率評価の simulation 分散が選択へ波及する
 
-    決定的評価では simulation を重ねても同値で改良方策が固まるが，確率評価では
-    simulation 間の分散で改良方策（Q 由来）が決定版と異なる
+    評価値が simulation 間で変動することは別テストが担保する 本テストはその分散が
+    改良方策を介し選択へ波及することを確認する 単一シードでは argmax が偶然一致
+    しうるため複数シードで集め少なくとも1つが決定版と異なることを要求する
     """
     base = torch.randn(1, 12, IN_DIM)
     label = torch.tensor([1])
 
-    def improved_first_layer(stochastic):
+    def first_layer_selection(stochastic, run_seed):
         torch.manual_seed(0)
         model = _model(num_layers=3)
         driver = build_zoom_driver(
@@ -685,24 +686,20 @@ def test_mcts_stochastic_improved_policy_differs_from_deterministic():
             model,
         )
         model.train()
+        torch.manual_seed(run_seed)
         _, _, _, ctx = driver.run(
             base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
         )
-        return ctx
+        return tuple(
+            None
+            if s is None
+            else tuple(s["select_indices"].cpu().numpy().ravel().tolist())
+            for s in ctx.selections
+        )
 
-    ctx_det = improved_first_layer(False)
-    ctx_sto = improved_first_layer(True)
-    # 選択（改良方策上位）が確率評価で決定版と異なりうる少なくとも選択集合が
-    # 一致しないことで simulation の分散が探索へ波及したと確認する
-    sel_det = [
-        None if s is None else s["select_indices"].cpu().numpy().tolist()
-        for s in ctx_det.selections
-    ]
-    sel_sto = [
-        None if s is None else s["select_indices"].cpu().numpy().tolist()
-        for s in ctx_sto.selections
-    ]
-    assert sel_det != sel_sto
+    sel_det = first_layer_selection(False, 0)
+    sto_variants = {first_layer_selection(True, seed) for seed in range(6)}
+    assert any(variant != sel_det for variant in sto_variants)
 
 
 # --- 深い rollout でも policy/value へ勾配が流れる（lazy選択未学習バグの再来防止）---
