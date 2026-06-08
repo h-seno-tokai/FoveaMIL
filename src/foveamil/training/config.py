@@ -30,6 +30,10 @@ DEFAULT_IN_FEAT_DIM = 1024
 DEFAULT_HIDDEN_FEAT_DIM = 256
 # 既定の特徴射影後の次元
 DEFAULT_OUT_FEAT_DIM = 512
+# 既定の特徴射影の段数（1 で従来の浅い 1 段）
+DEFAULT_PROJ_NUM_LAYERS = 1
+# 既定の特徴射影の LayerNorm 有無（False で従来の正規化なし）
+DEFAULT_PROJ_LAYER_NORM = False
 # 既定のズーム選択数 k
 DEFAULT_K_SAMPLE = 12
 # 既定の top-k 平滑化パラメータ（perturbed の sigma / fast_sparse の epsilon）
@@ -129,6 +133,8 @@ class TrainConfig:
         in_feat_dim: 入力特徴次元
         hidden_feat_dim: アテンション中間次元
         out_feat_dim: 特徴射影後の次元
+        proj_num_layers: 特徴射影の段数（1 で従来の浅い 1 段）
+        proj_layer_norm: 特徴射影の各 Linear 直後に LayerNorm を挟むか
         drop_out: Dropout 率（``None`` なら Dropout なし）
         k_sample: ズーム選択数 k（単一倍率では無効）
         k_sigma: top-k 平滑化パラメータ（単一倍率では無効）
@@ -193,6 +199,8 @@ class TrainConfig:
     in_feat_dim: int = DEFAULT_IN_FEAT_DIM
     hidden_feat_dim: int = DEFAULT_HIDDEN_FEAT_DIM
     out_feat_dim: int = DEFAULT_OUT_FEAT_DIM
+    proj_num_layers: int = DEFAULT_PROJ_NUM_LAYERS
+    proj_layer_norm: bool = DEFAULT_PROJ_LAYER_NORM
     drop_out: Optional[float] = None
     k_sample: int = DEFAULT_K_SAMPLE
     k_sigma: float = DEFAULT_K_SIGMA

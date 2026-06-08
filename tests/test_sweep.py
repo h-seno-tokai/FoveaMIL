@@ -96,6 +96,15 @@ def test_product_with_other_axes():
     assert {c.config["lr"] for c in combos} == {1e-4, 1e-3}
 
 
+def test_projection_axes_flow_through_as_product():
+    # 射影の段数・LayerNorm は TrainConfig フィールドとして直積軸で展開される
+    sweep = _base_sweep(proj_num_layers=[1, 2], proj_layer_norm=[False, True])
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 40  # 10 pairs * 2 * 2
+    assert {c.config["proj_num_layers"] for c in combos} == {1, 2}
+    assert {c.config["proj_layer_norm"] for c in combos} == {False, True}
+
+
 def test_magnification_sets_are_an_axis():
     sweep = _base_sweep(magnifications=[[1.25, 2.5], [1.25, 2.5, 5.0]])
     combos = expand_combos(sweep, {}, _resolved())

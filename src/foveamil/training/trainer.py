@@ -189,6 +189,8 @@ def build_foveamil_from_config(config: TrainConfig, num_layers: int) -> FoveaMIL
         hidden_feat_dim=config.hidden_feat_dim,
         out_feat_dim=config.out_feat_dim,
         dropout=config.drop_out,
+        proj_num_layers=config.proj_num_layers,
+        proj_layer_norm=config.proj_layer_norm,
         k_sample=config.k_sample,
         n_cls=config.n_cls,
         num_layers=num_layers,

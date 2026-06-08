@@ -31,6 +31,10 @@ from foveamil.models.selection import build_selection_controller
 DEFAULT_HIDDEN_DIM = 256
 # 既定の出力特徴次元（特徴射影後の次元）
 DEFAULT_OUT_DIM = 512
+# 既定の射影段数（1 で従来の浅い 1 段）
+DEFAULT_PROJ_NUM_LAYERS = 1
+# 既定の射影 LayerNorm 有無（False で従来の正規化なし）
+DEFAULT_PROJ_LAYER_NORM = False
 # 既定のズーム選択数 k
 DEFAULT_K_SAMPLE = 12
 # 既定のクラス数
@@ -53,6 +57,8 @@ DEFAULT_HEAD_TYPE = "linear"
 DEFAULT_INST_K = 8
 # インスタンス補助損失を許す倍率数（単一倍率のみ）
 _SINGLE_LAYER = 1
+# 射影 MLP の最小段数
+_MIN_PROJ_LAYERS = 1
 # 主・補助アテンションのクラス数（1 スコア/要素）
 _ATTENTION_N_CLS = 1
 # アテンションスコアの次元（n_cls=1 の squeeze 対象軸）
@@ -67,12 +73,43 @@ _AGGREGATOR_ATTENTION_FMT = "aggregators.{idx}.attention.{rest}"
 
 
 def _build_projection(
-    in_feat_dim: int, out_feat_dim: int, dropout: Optional[float]
+    in_feat_dim: int,
+    out_feat_dim: int,
+    dropout: Optional[float],
+    num_layers: int = DEFAULT_PROJ_NUM_LAYERS,
+    layer_norm: bool = DEFAULT_PROJ_LAYER_NORM,
 ) -> nn.Sequential:
-    """特徴射影 ``Linear(in, out) + ReLU (+ Dropout)`` を構築する"""
-    layers = [nn.Linear(in_feat_dim, out_feat_dim), nn.ReLU()]
-    if dropout is not None:
-        layers.append(nn.Dropout(dropout))
+    """特徴射影 MLP を構築する
+
+    ``num_layers`` 段の ``Linear (+ LayerNorm) + ReLU (+ Dropout)`` を積む先頭段が
+    ``in_feat_dim -> out_feat_dim``，以降は ``out_feat_dim -> out_feat_dim``
+    ``layer_norm`` が真なら各 ``Linear`` の直後に ``LayerNorm(out_feat_dim)`` を挟む
+    既定（``num_layers=1`` / ``layer_norm=False``）は従来の ``Linear + ReLU (+ Dropout)``
+    と部品の並びまで一致し数値も bit 互換になる
+
+    Args:
+        in_feat_dim: 入力特徴次元
+        out_feat_dim: 出力特徴次元（2 段目以降の入出力次元でもある）
+        dropout: Dropout 率``None`` なら Dropout なし
+        num_layers: 射影段数（1 以上）
+        layer_norm: 各 Linear 直後に LayerNorm を挟むか
+
+    Raises:
+        ValueError: ``num_layers`` が 1 未満の場合
+    """
+    if num_layers < _MIN_PROJ_LAYERS:
+        raise ValueError(
+            f"proj num_layers must be >= {_MIN_PROJ_LAYERS}; got {num_layers}"
+        )
+    layers: list = []
+    for stage in range(num_layers):
+        stage_in = in_feat_dim if stage == 0 else out_feat_dim
+        layers.append(nn.Linear(stage_in, out_feat_dim))
+        if layer_norm:
+            layers.append(nn.LayerNorm(out_feat_dim))
+        layers.append(nn.ReLU())
+        if dropout is not None:
+            layers.append(nn.Dropout(dropout))
     return nn.Sequential(*layers)
 
 
@@ -123,6 +160,8 @@ class FoveaMIL(nn.Module):
         hidden_feat_dim: アテンション中間次元
         out_feat_dim: 特徴射影後の次元
         dropout: Dropout 率``None`` なら Dropout なし
+        proj_num_layers: 特徴射影の段数（1 で従来の浅い 1 段）
+        proj_layer_norm: 特徴射影の各 Linear 直後に LayerNorm を挟むか
         k_sample: 次倍率へズームする選択数 k
         n_cls: 出力クラス数
         num_layers: 倍率数
@@ -152,6 +191,8 @@ class FoveaMIL(nn.Module):
         hidden_feat_dim: int = DEFAULT_HIDDEN_DIM,
         out_feat_dim: int = DEFAULT_OUT_DIM,
         dropout: Optional[float] = None,
+        proj_num_layers: int = DEFAULT_PROJ_NUM_LAYERS,
+        proj_layer_norm: bool = DEFAULT_PROJ_LAYER_NORM,
         k_sample: int = DEFAULT_K_SAMPLE,
         n_cls: int = DEFAULT_N_CLS,
         num_layers: int = DEFAULT_NUM_LAYERS,
@@ -181,7 +222,9 @@ class FoveaMIL(nn.Module):
         self.n_cls = n_cls
 
         self.projections = nn.ModuleList(
-            _build_projection(in_feat_dim, out_feat_dim, dropout)
+            _build_projection(
+                in_feat_dim, out_feat_dim, dropout, proj_num_layers, proj_layer_norm
+            )
             for _ in range(num_layers)
         )
         self.aggregators = nn.ModuleList(
