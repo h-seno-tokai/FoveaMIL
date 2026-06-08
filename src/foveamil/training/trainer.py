@@ -70,6 +70,8 @@ AUX_NORM_TEMPERATURE_KEY = "temperature"
 AUX_NORM_ALPHA_KEY = "alpha"
 # DPP 選択コントローラ名
 SELECTOR_DPP = "dpp"
+# 自己アテンション集約器名
+AGGREGATOR_SELF_ATTN = "self_attn"
 # last モデルの接尾辞
 LAST_SUFFIX = "last"
 # 評価する split 名
@@ -158,6 +160,20 @@ def _selector_kwargs(config: TrainConfig) -> dict:
     return {}
 
 
+def _aggregator_kwargs(config: TrainConfig) -> dict:
+    """``aggregator`` に応じて集約器固有の追加引数を組み立てる
+
+    ``aggregator=="self_attn"`` なら ``num_heads`` / ``num_landmarks`` を返す
+    それ以外（既定 ``abmil``）は空辞書を返し，bit 互換の従来挙動を保つ
+    """
+    if config.aggregator == AGGREGATOR_SELF_ATTN:
+        return {
+            "num_heads": config.aggregator_num_heads,
+            "num_landmarks": config.aggregator_num_landmarks,
+        }
+    return {}
+
+
 def build_foveamil_from_config(config: TrainConfig, num_layers: int) -> FoveaMIL:
     """設定と倍率数から FoveaMIL を構築する（学習・再構築で同一の組立を共有する）
 
@@ -183,6 +199,8 @@ def build_foveamil_from_config(config: TrainConfig, num_layers: int) -> FoveaMIL
         selector=config.selector,
         selector_kwargs=_selector_kwargs(config),
         fusion=config.fusion,
+        aggregator=config.aggregator,
+        aggregator_kwargs=_aggregator_kwargs(config),
         instance_loss=config.instance_loss,
         inst_k=config.inst_k,
         inst_subtyping=config.inst_subtyping,

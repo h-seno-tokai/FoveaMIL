@@ -70,6 +70,31 @@ def test_load_fold_rebuilds_and_loads_weights(tmp_path):
     assert not loaded.model.training
 
 
+def _legacy_keys(state):
+    """新 state_dict を集約器導入前の旧キーへ巻き戻す（``attentions.<i>.<rest>``）"""
+    legacy = {}
+    for key, value in state.items():
+        if key.startswith("aggregators."):
+            idx = key.split(".")[1]
+            rest = key.split(".", 3)[3]
+            legacy[f"attentions.{idx}.{rest}"] = value.clone()
+        else:
+            legacy[key] = value.clone()
+    return legacy
+
+
+def test_load_fold_loads_legacy_checkpoint(tmp_path):
+    # 集約器導入前（旧キー）の checkpoint も可視化 loader が strict ロードできる
+    _, _, fold_dir = _make_sweep(tmp_path)
+    legacy_state = _legacy_keys(build_model(CONFIG).state_dict())
+    assert any(k.startswith("attentions.") for k in legacy_state)
+    weights_path = os.path.join(fold_dir, "model_best_loss.pt")
+    torch.save(legacy_state, weights_path)
+    loaded = load_fold(fold_dir, device="cpu")  # 例外なし＝旧キー remap が効く
+    assert loaded.n_cls == 3
+    assert not loaded.model.training
+
+
 def test_build_model_topk_kwargs_roundtrip():
     # 同 config で 2 回構築し state_dict を相互ロード（topk 構築の一致を担保）
     a = build_model(CONFIG)

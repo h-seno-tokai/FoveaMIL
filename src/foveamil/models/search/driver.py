@@ -234,11 +234,13 @@ class MCTSZoomDriver(ZoomDriver):
         )
 
     def _project_and_pool(self, x: Tensor, layer_idx: int) -> Tuple[Tensor, Tensor]:
-        """射影と主アテンションでプーリング表現を作り ``(M, x_fc)`` を返す"""
+        """射影と集約器でプーリング表現を作り ``(M, x_fc)`` を返す
+
+        プーリングは基線と同じ集約器に委ね，集約器軸の差し替えへ追随する射影特徴
+        ``x_fc`` は方策・価値ネットへ渡すため別途返す
+        """
         x_fc = self.model.projections[layer_idx](x)
-        scores, _ = self.model.attentions[layer_idx](x_fc)
-        weights = F.softmax(scores.permute(0, 2, 1), dim=-1)
-        M = weights @ x_fc
+        M, _ = self.model.aggregators[layer_idx](x_fc)
         return M, x_fc
 
     def run(
