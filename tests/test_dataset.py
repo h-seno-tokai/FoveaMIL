@@ -1,6 +1,7 @@
-"""FeatureBagDataset の空バッグ除外のユニット"""
+"""FeatureBagDataset の空バッグ除外・h5 open リトライのユニット"""
 
 import os
+from unittest.mock import patch, MagicMock
 
 import h5py
 import numpy as np
@@ -87,3 +88,51 @@ def test_missing_feature_file_treated_as_empty(tmp_path):
         feature_type="cls",
     )
     assert [s for s, _ in ds.samples] == ["s_ok"]
+
+
+# -- _open_retry tests ------------------------------------------------
+
+
+def test_open_retry_succeeds_after_transient_errors(tmp_path):
+    """Transient OSError is retried; after 2 failures the 3rd attempt succeeds."""
+    from foveamil.training.accessor import _open_retry
+
+    mock_handle = MagicMock()
+    side = [OSError("busy"), OSError("busy"), mock_handle]
+    with patch("foveamil.training.accessor.h5py.File", side_effect=side) as mock_file, \
+         patch("foveamil.training.accessor.time.sleep") as mock_sleep:
+        result = _open_retry("dummy.h5", retries=3, wait=0.0)
+    assert result is mock_handle
+    assert mock_file.call_count == 3
+    # sleep called twice (after attempt 1 and 2, not after success)
+    assert mock_sleep.call_count == 2
+
+
+def test_open_retry_raises_filenotfounderror_immediately():
+    """FileNotFoundError is never retried — raised on the first attempt."""
+    from foveamil.training.accessor import _open_retry
+
+    with patch("foveamil.training.accessor.h5py.File",
+               side_effect=FileNotFoundError("no such file")) as mock_file, \
+         patch("foveamil.training.accessor.time.sleep") as mock_sleep:
+        try:
+            _open_retry("missing.h5", retries=5, wait=0.0)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("FileNotFoundError was not raised")
+    assert mock_file.call_count == 1
+    mock_sleep.assert_not_called()
+
+
+def test_open_retry_exhausts_retries():
+    """If every attempt raises OSError, _open_retry re-raises after all retries."""
+    import pytest
+    from foveamil.training.accessor import _open_retry
+
+    with patch("foveamil.training.accessor.h5py.File",
+               side_effect=OSError("fail")), \
+         patch("foveamil.training.accessor.time.sleep"):
+        with pytest.raises(OSError, match="fail"):
+            _open_retry("broken.h5", retries=3, wait=0.0)
+

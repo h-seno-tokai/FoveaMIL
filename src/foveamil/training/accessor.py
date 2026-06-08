@@ -11,7 +11,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 from typing import Dict
 
 import h5py
@@ -40,10 +42,58 @@ FEATURE_DTYPE = np.float32
 # concat 時の特徴次元連結軸
 CONCAT_AXIS = 1
 
+# h5 open retry settings for transient I/O errors (e.g. NAS under load)
+H5_OPEN_RETRIES = 5
+H5_OPEN_WAIT_SEC = 1.0
+
+logger = logging.getLogger(__name__)
+
 
 def _format_mag(magnification: float) -> str:
     """倍率を正準レイアウトのディレクトリ名（例 ``1.25`` → ``"1.25x"``）にする"""
     return f"{magnification}x"
+
+
+def _open_retry(
+    path: str,
+    retries: int = H5_OPEN_RETRIES,
+    wait: float = H5_OPEN_WAIT_SEC,
+) -> h5py.File:
+    """Open an h5 file with linear-backoff retry on transient ``OSError``.
+
+    ``FileNotFoundError`` is raised immediately without retry so that callers
+    can distinguish a genuinely missing file from a transient I/O failure.
+
+    Args:
+        path: h5 file path
+        retries: maximum number of attempts (≥1)
+        wait: base wait in seconds; actual sleep is ``wait * attempt``
+
+    Returns:
+        An open ``h5py.File`` handle in read mode.
+
+    Raises:
+        FileNotFoundError: if the file does not exist (no retry)
+        OSError: if all retry attempts are exhausted
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            return h5py.File(path, "r")
+        except FileNotFoundError:
+            raise
+        except OSError:
+            if attempt == retries:
+                raise
+            logger.warning(
+                "h5 open failed (attempt %d/%d), retrying in %.1fs: %s",
+                attempt,
+                retries,
+                wait * attempt,
+                path,
+            )
+            time.sleep(wait * attempt)
+    # unreachable – kept for type-checker satisfaction
+    raise OSError(f"failed to open {path} after {retries} attempts")
 
 
 class FeatureAccessor:
@@ -86,7 +136,7 @@ class FeatureAccessor:
         """倍率のファイルハンドルを返す（キャッシュし無ければ開く）"""
         handle = self._handles.get(magnification)
         if handle is None:
-            handle = h5py.File(self._path(magnification), "r")
+            handle = _open_retry(self._path(magnification))
             self._handles[magnification] = handle
         return handle
 
