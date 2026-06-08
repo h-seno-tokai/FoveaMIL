@@ -148,7 +148,7 @@ def test_mixup_lam_variance_decreases_monotonically_in_alpha():
 
 
 def test_mixup_lam_variance_close_to_beta_theory():
-    # generator 経路の var が Beta(α,α) 理論値に近接（旧バグでは α 非依存の一様だった）
+    # generator 経路の var が Beta(α,α) の理論分散に近接する
     n = 12000
     for alpha in (0.5, 1.0, 3.0):
         var = _lam_samples(alpha, n).var().item()
@@ -159,8 +159,7 @@ def test_mixup_lam_variance_close_to_beta_theory():
 
 
 def test_mixup_lam_not_uniform_for_concentrated_alpha():
-    # α 大は λ が 0.5 付近に集中（旧バグの一様 var=1/12 とは明確に異なる）
-    # 旧バグでは α に依らず var≈1/12 だったため この差が回帰を捕える
+    # α 大は λ が 0.5 付近に集中し 一様分布の分散 1/12 より小さい
     var = _lam_samples(5.0, 12000).var().item()
     assert var < 1.0 / 12.0 - 0.03
 

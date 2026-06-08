@@ -559,7 +559,7 @@ def test_instance_loss_requires_single_magnification():
         FoveaMIL(in_feat_dim=8, out_feat_dim=12, n_cls=3, num_layers=2, instance_loss=True)
 
 
-# --- 旧 checkpoint キーの remap（集約器導入による後方互換破壊の修正）---
+# --- 旧 checkpoint キーの remap ---
 
 
 def _legacy_state_dict(model):
