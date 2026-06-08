@@ -14,6 +14,13 @@
 融合を共有ヘッドへ通した状態依存 leaf 報酬（detach）を目標にし，選択確率には advantage
 （leaf 報酬 − 価値推定）由来の actor-critic 項を加えることで，どの親を選ぶかが分類の良し
 悪しを弁別する leaf 報酬は detach され共有ヘッド・融合へは勾配を流さない
+
+葉評価は ``mcts_rollout_depth`` と ``mcts_eval_stochastic`` でノブ化する``rollout_depth=1``
+は選んだ親の子を 1 段だけ次倍率へ射影して価値ネットで評価する（従来挙動）``>1`` では
+その子を更に次倍率へ再帰展開し（各段でプランナが 1 子を選ぶ）最深状態の価値を葉評価に
+する子ロードは木全体で ``child_cache`` を共有し重複 h5 読みを抑える``eval_stochastic``
+は葉評価を MC dropout で確率化し報酬 memoize を撤廃して simulation 間に分散を出す
+（既定 ``False`` は eval モード葉評価＋memoize で従来挙動）
 """
 
 from __future__ import annotations
@@ -55,12 +62,110 @@ _PROB_FLOOR = 1e-12
 _LAYER_SEED_STRIDE = 1009
 
 
+class _RolloutContext:
+    """rollout 木全体で共有する状態（子キャッシュ・葉評価カウンタ・倍率列）
+
+    ``child_cache`` は ``(layer_idx, global_parent)`` を鍵に子特徴を保持し，深さ×分岐で
+    増える h5 読みの重複を抑える木の全 :class:`_ZoomSearchProblem` がこの 1 個を共有する
+    ``leaf_evals`` は価値ネットを葉として評価した回数（テストで深さ依存を確認する）
+
+    Args:
+        model: 段階 forward を持つ :class:`FoveaMIL`
+        value_net: 価値ネット
+        child_loader: 子特徴ローダ
+        magnifications: 倍率列（再帰で次倍率比を引く）
+        num_layers: 倍率数（これ以上展開できない最深層の判定に使う）
+        planner_name: 子選択に用いるプランナ名
+        rollout_simulations: 各 rollout 段のプランナ模擬予算
+        rollout_considered: 各 rollout 段のプランナ検討候補数 m
+        stochastic: 葉評価を MC dropout で確率化するか
+        device: 計算デバイス
+    """
+
+    def __init__(
+        self,
+        model,
+        value_net: ValueNetwork,
+        child_loader: ChildLoader,
+        magnifications: List[float],
+        num_layers: int,
+        planner_name: str,
+        rollout_simulations: int,
+        rollout_considered: int,
+        stochastic: bool,
+        device: torch.device,
+    ) -> None:
+        self.model = model
+        self.value_net = value_net
+        self.child_loader = child_loader
+        self.magnifications = magnifications
+        self.num_layers = num_layers
+        self.planner_name = planner_name
+        self.rollout_simulations = rollout_simulations
+        self.rollout_considered = rollout_considered
+        self.stochastic = stochastic
+        self.device = device
+        self.child_cache: Dict[Tuple[int, int], Tensor] = {}
+        self.leaf_evals = 0
+
+    def load_child(
+        self, layer_idx: int, global_parent: int, next_mag: float, cpp: int
+    ) -> Tensor:
+        """親の global index ``global_parent`` の子特徴 ``[1, cpp, D_in]`` を返す
+
+        木全体で鍵 ``(layer_idx, global_parent)`` のキャッシュを共有し重複読みを避ける
+        """
+        key = (layer_idx, int(global_parent))
+        cached = self.child_cache.get(key)
+        if cached is not None:
+            return cached
+        child = compute_child_indices(
+            np.asarray([global_parent], dtype=np.int64), None, children=cpp
+        )
+        feats = self.child_loader(next_mag, child).to(self.device)
+        self.child_cache[key] = feats
+        return feats
+
+    def value_leaf(self, x_next: Tensor) -> float:
+        """射影済み状態 ``x_next`` を価値ネットで葉評価する（カウンタを進める）
+
+        確率的でない（既定）ときは eval モードへ切り替え dropout 等の確率性を除く前向き
+        の間だけモードを変え終了後に元へ戻す確率的なときは train モードのまま MC dropout
+        で評価し simulation 間に分散を出す
+        """
+        self.leaf_evals += 1
+        was_training = self.value_net.training
+        self.value_net.train(self.stochastic)
+        try:
+            with torch.no_grad():
+                return float(self.value_net(x_next).item())
+        finally:
+            self.value_net.train(was_training)
+
+    def policy_prior(self, x_next: Tensor) -> Tensor:
+        """rollout 中段の方策事前 ``π(a|state)`` を勾配なしで返す（探索シグナル）
+
+        確率的でない（既定）ときは eval モードで dropout を除き決定的にする確率的な
+        ときは train モードのまま MC dropout で標本化する前向きの間だけモードを変える
+        """
+        policy_net = self.model.search_policy
+        was_training = policy_net.training
+        policy_net.train(self.stochastic)
+        try:
+            with torch.no_grad():
+                return policy_net(x_next)
+        finally:
+            policy_net.train(was_training)
+
+
 class _ZoomSearchProblem(SearchProblem):
     """1 倍率のズーム決定を解く探索問題
 
     候補は現倍率の親パッチ事前は方策ネット出力各候補の評価は，その親の子を
-    ``child_loader`` で materialise し次倍率へ射影・プーリングした状態の価値ネット推定
-    （look-ahead）同一候補の子ロードと評価をキャッシュし h5 読みの重複を避ける
+    ``child_loader`` で materialise し次倍率へ射影した状態の rollout 評価``rollout_depth``
+    が 1 ならその状態を直接価値ネットで評価する（look-ahead）``>1`` なら子を更に次倍率へ
+    再帰展開し（各段でプランナが 1 子を選ぶ）最深状態を価値ネットで評価する子ロードと
+    （非確率時の）評価をキャッシュし h5 読みの重複を避ける
 
     Args:
         prior_np: 事前方策 ``(N,)``（numpy detached）
@@ -69,10 +174,9 @@ class _ZoomSearchProblem(SearchProblem):
         next_mag: 次倍率
         cpp: 1 親あたりの子数（倍率比^2）
         global_idx: 現倍率パッチの global index（``None`` なら local=global）
-        model: 段階 forward を持つ :class:`FoveaMIL`
-        value_net: 価値ネット
-        child_loader: 子特徴ローダ
-        device: 計算デバイス
+        rollout_depth: 展開する rollout 深さ（1 で 1 段評価し更に展開しない）
+        seed: 子選択プランナのシード（決定性のため）
+        ctx: 木全体で共有する :class:`_RolloutContext`
     """
 
     def __init__(
@@ -83,10 +187,9 @@ class _ZoomSearchProblem(SearchProblem):
         next_mag: float,
         cpp: int,
         global_idx: Optional[np.ndarray],
-        model,
-        value_net: ValueNetwork,
-        child_loader: ChildLoader,
-        device: torch.device,
+        rollout_depth: int,
+        seed: int,
+        ctx: _RolloutContext,
     ) -> None:
         self._prior = prior_np
         self.x_fc = x_fc
@@ -94,12 +197,10 @@ class _ZoomSearchProblem(SearchProblem):
         self.next_mag = next_mag
         self.cpp = cpp
         self.global_idx = global_idx
-        self.model = model
-        self.value_net = value_net
-        self.child_loader = child_loader
-        self.device = device
+        self.rollout_depth = int(rollout_depth)
+        self.seed = int(seed)
+        self.ctx = ctx
         self._reward_cache: Dict[int, float] = {}
-        self._child_cache: Dict[int, Tensor] = {}
 
     def num_actions(self) -> int:
         return self._prior.shape[0]
@@ -107,37 +208,79 @@ class _ZoomSearchProblem(SearchProblem):
     def prior(self) -> np.ndarray:
         return self._prior
 
+    def _global_parent(self, action: int) -> int:
+        """候補 local index ``action`` を現倍率の global index へ写す"""
+        if self.global_idx is None:
+            return int(action)
+        return int(self.global_idx[action])
+
     def _load_child(self, action: int) -> Tensor:
-        """候補親 ``action`` の子特徴 ``[1, cpp, D_in]`` をロードしてキャッシュする"""
-        cached = self._child_cache.get(action)
-        if cached is not None:
-            return cached
-        child = compute_child_indices(
-            np.asarray([action], dtype=np.int64), self.global_idx, children=self.cpp
+        """候補親 ``action`` の子特徴 ``[1, cpp, D_in]`` を共有キャッシュ経由でロードする"""
+        return self.ctx.load_child(
+            self.layer_idx, self._global_parent(action), self.next_mag, self.cpp
         )
-        feats = self.child_loader(self.next_mag, child).to(self.device)
-        self._child_cache[action] = feats
-        return feats
+
+    def _can_expand(self) -> bool:
+        """次倍率の子を更に展開できるか（最深層手前まで）を返す"""
+        return self.layer_idx + 1 < self.ctx.num_layers - 1
+
+    def _rollout(self, x_next: Tensor, global_child: np.ndarray) -> float:
+        """子状態 ``x_next`` を 1 段深く展開し最深状態の価値を返す（再帰）
+
+        子状態の方策事前でプランナを 1 回回し，最良の孫を選んでさらに展開する残り深さが
+        尽きるか最深層に達したら価値ネットで葉評価する子ロードは ``ctx`` の共有キャッシュ
+        を使い，乱数は ``seed`` で固定して決定的に動く
+        """
+        next_layer = self.layer_idx + 1
+        sub_mag = self.ctx.magnifications[next_layer]
+        sub_next_mag = self.ctx.magnifications[next_layer + 1]
+        sub_cpp = children_per_parent(sub_mag, sub_next_mag)
+        sub_prior = self.ctx.policy_prior(x_next).squeeze(0)
+        sub_problem = _ZoomSearchProblem(
+            prior_np=sub_prior.detach().cpu().numpy(),
+            x_fc=x_next,
+            layer_idx=next_layer,
+            next_mag=sub_next_mag,
+            cpp=sub_cpp,
+            global_idx=global_child,
+            rollout_depth=self.rollout_depth - 1,
+            seed=self.seed,
+            ctx=self.ctx,
+        )
+        planner = build_planner(
+            self.ctx.planner_name,
+            simulations=self.ctx.rollout_simulations,
+            max_considered=self.ctx.rollout_considered,
+            seed=self.seed,
+        )
+        result: PlannerResult = planner.run(sub_problem, num_select=1)
+        return sub_problem.evaluate(int(result.chosen_actions[0]))
 
     def evaluate(self, action: int) -> float:
-        """候補 ``action`` の子を次倍率へ射影・プーリングした状態の価値推定を返す
+        """候補 ``action`` の rollout 評価（最深状態の価値推定）を返す
 
-        価値ネットは探索シグナルなので eval モードで前向きし dropout 等の確率性を
-        除く前向きの間だけ eval へ切り替え終了後に元のモード（train/eval）へ戻す
+        ``rollout_depth<=1`` または最深層手前なら子を次倍率へ射影した状態を価値ネットで
+        直接評価する``>1`` なら子を更に再帰展開し最深状態を葉評価にする確率的でないとき
+        は同一候補の評価を memoize し，確率的なときは memoize せず simulation 毎に再評価する
         """
-        cached = self._reward_cache.get(action)
-        if cached is not None:
-            return cached
-        was_training = self.value_net.training
-        self.value_net.eval()
-        try:
-            with torch.no_grad():
-                feats = self._load_child(action)
-                x_next = self.model.projections[self.layer_idx + 1](feats)
-                reward = float(self.value_net(x_next).item())
-        finally:
-            self.value_net.train(was_training)
-        self._reward_cache[action] = reward
+        if not self.ctx.stochastic:
+            cached = self._reward_cache.get(action)
+            if cached is not None:
+                return cached
+        feats = self._load_child(action)
+        with torch.no_grad():
+            x_next = self.ctx.model.projections[self.layer_idx + 1](feats)
+        if self.rollout_depth > 1 and self._can_expand():
+            global_child = compute_child_indices(
+                np.asarray([self._global_parent(action)], dtype=np.int64),
+                None,
+                children=self.cpp,
+            )
+            reward = self._rollout(x_next, global_child)
+        else:
+            reward = self.ctx.value_leaf(x_next)
+        if not self.ctx.stochastic:
+            self._reward_cache[action] = reward
         return reward
 
 
@@ -172,6 +315,8 @@ class MCTSZoomDriver(ZoomDriver):
         value_weight: 価値回帰損失の重み λ_v
         entropy_weight: 方策エントロピー損失の重み
         value_target: 価値回帰目標の作り方（``"realised"`` で従来挙動，``"leaf_ce"`` で状態依存 leaf 報酬）
+        rollout_depth: 葉評価の rollout 深さ（1 で従来＝1 段評価，>1 で再帰展開）
+        eval_stochastic: 葉評価を MC dropout で確率化するか（False で従来＝eval＋memoize）
         seed: 乱数シード
     """
 
@@ -190,6 +335,8 @@ class MCTSZoomDriver(ZoomDriver):
         value_weight: float,
         entropy_weight: float,
         value_target: str = VALUE_TARGET_REALISED,
+        rollout_depth: int = 1,
+        eval_stochastic: bool = False,
         seed: int = 0,
     ) -> None:
         super().__init__(model, num_layers)
@@ -201,6 +348,8 @@ class MCTSZoomDriver(ZoomDriver):
         self.value_weight = value_weight
         self.entropy_weight = entropy_weight
         self.value_target = value_target
+        self.rollout_depth = int(rollout_depth)
+        self.eval_stochastic = bool(eval_stochastic)
         self.seed = seed
 
         device = next(model.parameters()).device
@@ -243,6 +392,8 @@ class MCTSZoomDriver(ZoomDriver):
             value_weight=config.value_loss_weight,
             entropy_weight=config.policy_entropy_weight,
             value_target=config.mcts_value_target,
+            rollout_depth=config.mcts_rollout_depth,
+            eval_stochastic=config.mcts_eval_stochastic,
             seed=config.seed,
         )
 
@@ -270,6 +421,20 @@ class MCTSZoomDriver(ZoomDriver):
         improved: List[Tensor] = []
         value_preds: List[Tensor] = []
 
+        # rollout 木全体で子キャッシュ・葉カウンタ・確率設定を共有する
+        rollout_ctx = _RolloutContext(
+            model=self.model,
+            value_net=self.value,
+            child_loader=child_loader,
+            magnifications=magnifications,
+            num_layers=self.num_layers,
+            planner_name=self.planner_name,
+            rollout_simulations=self.simulations,
+            rollout_considered=self.max_considered,
+            stochastic=self.eval_stochastic,
+            device=device,
+        )
+
         x = base_feats.to(device)
         global_idx: Optional[np.ndarray] = None
         for layer_idx in range(self.num_layers):
@@ -287,6 +452,7 @@ class MCTSZoomDriver(ZoomDriver):
             value_preds.append(self.value(x_fc).squeeze(0))
             priors.append(prior)
 
+            layer_seed = self.seed + layer_idx * _LAYER_SEED_STRIDE
             problem = _ZoomSearchProblem(
                 prior_np=prior.detach().cpu().numpy(),
                 x_fc=x_fc,
@@ -294,16 +460,15 @@ class MCTSZoomDriver(ZoomDriver):
                 next_mag=next_mag,
                 cpp=cpp,
                 global_idx=global_idx,
-                model=self.model,
-                value_net=self.value,
-                child_loader=child_loader,
-                device=device,
+                rollout_depth=self.rollout_depth,
+                seed=layer_seed,
+                ctx=rollout_ctx,
             )
             planner = build_planner(
                 self.planner_name,
                 simulations=self.simulations,
                 max_considered=self.max_considered,
-                seed=self.seed + layer_idx * _LAYER_SEED_STRIDE,
+                seed=layer_seed,
             )
             result: PlannerResult = planner.run(problem, num_select=self.k_sample)
             improved.append(

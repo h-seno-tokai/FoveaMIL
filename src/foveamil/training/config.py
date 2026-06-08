@@ -112,6 +112,10 @@ DEFAULT_VALUE_LOSS_WEIGHT = 1.0
 DEFAULT_POLICY_ENTROPY_WEIGHT = 0.0
 # 既定の価値ターゲット種別（``"realised"`` で従来挙動＝最終 CE を全状態へ broadcast）
 DEFAULT_MCTS_VALUE_TARGET = "realised"
+# 既定の rollout 深さ（1 で従来挙動＝選んだ親の子を 1 段だけ評価し更に展開しない）
+DEFAULT_MCTS_ROLLOUT_DEPTH = 1
+# 既定の確率的葉評価フラグ（False で従来挙動＝eval モード葉評価＋報酬 memoize）
+DEFAULT_MCTS_EVAL_STOCHASTIC = False
 # 既定の bag 表現 mixup の Beta 形状 α（0 で無効＝従来挙動）
 DEFAULT_MIXUP_ALPHA = 0.0
 # 既定のバランスサンプラ温度（1.0 で現行＝重み不変）
@@ -190,6 +194,8 @@ class TrainConfig:
         policy_entropy_weight: 方策エントロピー損失の重み（``mcts`` のみ有効）
         mcts_hidden_dim: 方策・価値ネットの中間次元（``None`` なら ``hidden_feat_dim``）
         mcts_value_target: 価値回帰目標の作り方（``"realised"`` で従来＝最終 CE を全状態へ broadcast，``"leaf_ce"`` で選択 j の結果状態を含む融合の負分類損失を状態依存リターンにする，``mcts`` のみ有効）
+        mcts_rollout_depth: 葉評価で展開する rollout 深さ（``1`` で従来＝選んだ親の子を 1 段射影して評価し更に展開しない，``>1`` で子を更に次倍率へ再帰展開し最深状態を葉評価にする，``mcts`` のみ有効）
+        mcts_eval_stochastic: 葉評価を確率的にするか（``False`` で従来＝eval モード葉評価＋報酬 memoize で simulation 間同値，``True`` で MC dropout＋memoize 撤廃で simulation 間に分散を出す，``mcts`` のみ有効）
     """
 
     seed: int = DEFAULT_SEED
@@ -262,3 +268,5 @@ class TrainConfig:
     policy_entropy_weight: float = DEFAULT_POLICY_ENTROPY_WEIGHT
     mcts_hidden_dim: Optional[int] = None
     mcts_value_target: str = DEFAULT_MCTS_VALUE_TARGET
+    mcts_rollout_depth: int = DEFAULT_MCTS_ROLLOUT_DEPTH
+    mcts_eval_stochastic: bool = DEFAULT_MCTS_EVAL_STOCHASTIC

@@ -263,15 +263,28 @@ def test_mcts_driver_deterministic_under_seed():
     assert a_sel == b_sel
 
 
-def _zoom_search_problem(model, value_net):
+def _zoom_search_problem(model, value_net, rollout_depth=1, stochastic=False):
     """``_ZoomSearchProblem`` の最小インスタンスを作る（``evaluate`` の単体検証用）
 
-    同一の ``model`` ``value_net`` を共有し，値の差は評価モードのみに由来させる
+    同一の ``model`` ``value_net`` を共有し，木全体で共有する ``_RolloutContext`` を
+    1 個張る単一倍率比の最小木で ``rollout_depth=1`` 既定では値の差は評価モードのみに由来する
     """
     import numpy as np
 
-    from foveamil.models.search.driver import _ZoomSearchProblem
+    from foveamil.models.search.driver import _RolloutContext, _ZoomSearchProblem
 
+    ctx = _RolloutContext(
+        model=model,
+        value_net=value_net,
+        child_loader=_seeded_child_loader(),
+        magnifications=MAGS_2,
+        num_layers=2,
+        planner_name="gumbel",
+        rollout_simulations=4,
+        rollout_considered=4,
+        stochastic=stochastic,
+        device=torch.device("cpu"),
+    )
     return _ZoomSearchProblem(
         prior_np=np.full(3, 1.0 / 3),
         x_fc=torch.zeros(1, 3, OUT_DIM),
@@ -279,10 +292,9 @@ def _zoom_search_problem(model, value_net):
         next_mag=MAGS_2[1],
         cpp=children_per_parent(MAGS_2[0], MAGS_2[1]),
         global_idx=None,
-        model=model,
-        value_net=value_net,
-        child_loader=_seeded_child_loader(),
-        device=torch.device("cpu"),
+        rollout_depth=rollout_depth,
+        seed=0,
+        ctx=ctx,
     )
 
 
@@ -504,3 +516,224 @@ def test_mcts_value_target_leaf_ce_loss_is_finite():
     )
     assert torch.isfinite(ctx.extra_losses["mcts_value"])
     assert torch.isfinite(ctx.extra_losses["mcts_policy"])
+
+
+# --- 多段 rollout 軸 mcts_rollout_depth ---
+
+
+def test_mcts_rollout_depth_default_is_one():
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(_mcts_config(), model)
+    # 既定は 1 段評価（従来挙動）で確率評価は無効
+    assert driver.rollout_depth == 1
+    assert driver.eval_stochastic is False
+
+
+def test_mcts_rollout_depth_one_bit_compat_with_default():
+    """``mcts_rollout_depth=1`` を明示しても既定（未指定）と数値が完全一致する
+
+    既定が 1 なので明示は no-op であるべきで logits・全 extra_losses が一致する
+    """
+    base = torch.randn(1, 10, IN_DIM)
+    label = torch.tensor([2])
+
+    def run_once(**overrides):
+        torch.manual_seed(3)
+        model = _model(num_layers=3)
+        driver = build_zoom_driver(_mcts_config(**overrides), model)
+        model.train()
+        logits, _, _, ctx = driver.run(
+            base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+        )
+        return (
+            float(logits.detach().sum()),
+            {k: float(v.detach()) for k, v in ctx.extra_losses.items()},
+        )
+
+    assert run_once() == run_once(mcts_rollout_depth=1)
+
+
+def _evaluate_with_depth(rollout_depth, action=0):
+    """3 層モデルで深さ ``rollout_depth`` の最上層 evaluate を回し ``(ctx, reward)`` を返す
+
+    共有 ``_RolloutContext`` を観測し，葉評価回数・子キャッシュの到達層を確認する
+    """
+    import numpy as np
+
+    from foveamil.models.search.driver import _RolloutContext, _ZoomSearchProblem
+
+    torch.manual_seed(0)
+    model = _model(num_layers=3)
+    build_zoom_driver(_mcts_config(), model)  # search_policy/value を登録する
+    model.eval()
+    x_fc = torch.randn(1, 6, OUT_DIM)
+    ctx = _RolloutContext(
+        model=model,
+        value_net=model.search_value,
+        child_loader=_seeded_child_loader(),
+        magnifications=MAGS_3,
+        num_layers=3,
+        planner_name="gumbel",
+        rollout_simulations=4,
+        rollout_considered=4,
+        stochastic=False,
+        device=torch.device("cpu"),
+    )
+    problem = _ZoomSearchProblem(
+        prior_np=np.full(6, 1.0 / 6),
+        x_fc=x_fc,
+        layer_idx=0,
+        next_mag=MAGS_3[1],
+        cpp=children_per_parent(MAGS_3[0], MAGS_3[1]),
+        global_idx=None,
+        rollout_depth=rollout_depth,
+        seed=0,
+        ctx=ctx,
+    )
+    reward = problem.evaluate(action)
+    return ctx, reward
+
+
+def test_mcts_rollout_depth_two_evaluates_deeper_state():
+    """``rollout_depth=2`` は子を更に次倍率へ展開し最深層 (layer 1 の子) を葉評価する
+
+    depth=1 では子キャッシュは layer 0 の鍵のみ（最深評価は projections[1] の状態）
+    depth=2 では rollout が layer 1 へ降り layer 1 の子キャッシュ鍵が増える
+    """
+    ctx1, _ = _evaluate_with_depth(rollout_depth=1)
+    ctx2, _ = _evaluate_with_depth(rollout_depth=2)
+
+    layers1 = {layer for (layer, _) in ctx1.child_cache}
+    layers2 = {layer for (layer, _) in ctx2.child_cache}
+    # depth=1 は layer 0 の子ロードのみ depth=2 は layer 1 へ降り子ロードが増える
+    assert layers1 == {0}
+    assert 1 in layers2
+    # depth=1 は 1 候補 1 葉 depth=2 は層 1 の sub-planner が複数葉を評価し増える
+    assert ctx1.leaf_evals == 1
+    assert ctx2.leaf_evals > ctx1.leaf_evals
+
+
+def test_mcts_rollout_depth_two_runs_end_to_end():
+    """``rollout_depth=2`` の driver.run が有限な合成損失を作り深い rollout が回る"""
+    torch.manual_seed(0)
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(_mcts_config(mcts_rollout_depth=2), model)
+    model.train()
+    device = torch.device("cpu")
+    base = torch.randn(1, 12, IN_DIM)
+    label = torch.tensor([1])
+    logits, _, _, ctx = driver.run(
+        base, MAGS_3, _seeded_child_loader(), device, label=label
+    )
+    composite = F.cross_entropy(logits, label) + sum(ctx.extra_losses.values())
+    assert torch.isfinite(composite)
+
+
+# --- 確率的葉評価 mcts_eval_stochastic ---
+
+
+def test_mcts_eval_stochastic_varies_across_simulations():
+    """確率評価では同一候補を 2 回評価しても MC dropout で値が異なる（memoize 撤廃）"""
+    from foveamil.models.search.value import ValueNetwork
+
+    torch.manual_seed(0)
+    model = _model(num_layers=2)
+    value_net = ValueNetwork(OUT_DIM, HIDDEN, dropout=0.5)
+
+    problem = _zoom_search_problem(
+        model, value_net, rollout_depth=1, stochastic=True
+    )
+    torch.manual_seed(7)
+    first = problem.evaluate(0)
+    second = problem.evaluate(0)
+    # memoize されないため同一候補でも MC dropout で評価が異なる
+    assert first != second
+
+
+def test_mcts_eval_non_stochastic_memoizes_same_value():
+    """非確率（既定）では同一候補の評価は memoize され同値（従来挙動）"""
+    from foveamil.models.search.value import ValueNetwork
+
+    torch.manual_seed(0)
+    model = _model(num_layers=2)
+    value_net = ValueNetwork(OUT_DIM, HIDDEN, dropout=0.5)
+    problem = _zoom_search_problem(
+        model, value_net, rollout_depth=1, stochastic=False
+    )
+    assert problem.evaluate(0) == problem.evaluate(0)
+
+
+def test_mcts_stochastic_improved_policy_differs_from_deterministic():
+    """確率評価で改良方策が変わる＝simulation が実ノブとして探索に効く
+
+    決定的評価では simulation を重ねても同値で改良方策が固まるが，確率評価では
+    simulation 間の分散で改良方策（Q 由来）が決定版と異なる
+    """
+    base = torch.randn(1, 12, IN_DIM)
+    label = torch.tensor([1])
+
+    def improved_first_layer(stochastic):
+        torch.manual_seed(0)
+        model = _model(num_layers=3)
+        driver = build_zoom_driver(
+            _mcts_config(
+                mcts_eval_stochastic=stochastic,
+                drop_out=0.5,
+                mcts_simulations=24,
+                mcts_max_considered=8,
+            ),
+            model,
+        )
+        model.train()
+        _, _, _, ctx = driver.run(
+            base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+        )
+        return ctx
+
+    ctx_det = improved_first_layer(False)
+    ctx_sto = improved_first_layer(True)
+    # 選択（改良方策上位）が確率評価で決定版と異なりうる少なくとも選択集合が
+    # 一致しないことで simulation の分散が探索へ波及したと確認する
+    sel_det = [
+        None if s is None else s["select_indices"].cpu().numpy().tolist()
+        for s in ctx_det.selections
+    ]
+    sel_sto = [
+        None if s is None else s["select_indices"].cpu().numpy().tolist()
+        for s in ctx_sto.selections
+    ]
+    assert sel_det != sel_sto
+
+
+# --- 深い rollout でも policy/value へ勾配が流れる（lazy選択未学習バグの再来防止）---
+
+
+def test_mcts_rollout_depth_two_propagates_policy_value_gradient():
+    """``rollout_depth=2`` でも extra_losses が policy/value ネットへ勾配を流す
+
+    主 CE を除き extra_losses のみで backward し，深い木でも方策・価値ネットへ
+    勾配が流れる（>0）ことを確認する（探索が学習されないバグの再来防止）
+    """
+    torch.manual_seed(0)
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(
+        _mcts_config(mcts_rollout_depth=2, mcts_value_target="leaf_ce"), model
+    )
+    model.train()
+    base = torch.randn(1, 12, IN_DIM)
+    label = torch.tensor([2])
+    _, _, _, ctx = driver.run(
+        base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+    )
+    model.zero_grad()
+    sum(ctx.extra_losses.values()).backward()
+
+    def grad_sum(module):
+        return sum(
+            p.grad.abs().sum().item()
+            for p in module.parameters()
+            if p.grad is not None
+        )
+
+    assert grad_sum(model.search_policy) > 0
+    assert grad_sum(model.search_value) > 0

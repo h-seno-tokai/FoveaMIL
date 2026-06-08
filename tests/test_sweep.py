@@ -590,6 +590,73 @@ def test_mcts_value_target_kept_when_driver_mcts():
     assert "mcts_value_target" in varying_axis_keys(combos)
 
 
+def test_mcts_rollout_depth_collapses_when_driver_not_mcts():
+    # 既定 zoom_driver=differentiable では mcts_rollout_depth は無関係なので畳む
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        mcts_rollout_depth=[1, 2],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs のみ rollout 深さは畳まれる
+    keys = varying_axis_keys(combos)
+    assert "mcts_rollout_depth" not in keys
+    for c in combos:
+        assert c.config["mcts_rollout_depth"] == 1  # DEFAULT_MCTS_ROLLOUT_DEPTH
+
+
+def test_mcts_rollout_depth_collapses_for_single_mag():
+    # 単一倍率では探索自体が無いため mcts_rollout_depth も無関係 -> 畳む
+    sweep = _base_sweep(
+        magnifications=[[40]],
+        zoom_driver=["mcts"],
+        mcts_rollout_depth=[1, 2],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs のみ
+    keys = varying_axis_keys(combos)
+    assert "mcts_rollout_depth" not in keys
+    for c in combos:
+        assert c.config["mcts_rollout_depth"] == 1
+
+
+def test_mcts_rollout_depth_kept_when_driver_mcts():
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5, 5.0]],
+        zoom_driver=["mcts"],
+        mcts_rollout_depth=[1, 2],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 20  # 10 pairs * 2 rollout depths
+    assert {c.config["mcts_rollout_depth"] for c in combos} == {1, 2}
+    assert "mcts_rollout_depth" in varying_axis_keys(combos)
+
+
+def test_mcts_eval_stochastic_collapses_when_driver_not_mcts():
+    # 既定 zoom_driver=differentiable では mcts_eval_stochastic は無関係なので畳む
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        mcts_eval_stochastic=[False, True],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs のみ 確率評価フラグは畳まれる
+    keys = varying_axis_keys(combos)
+    assert "mcts_eval_stochastic" not in keys
+    for c in combos:
+        assert c.config["mcts_eval_stochastic"] is False  # DEFAULT
+
+
+def test_mcts_eval_stochastic_kept_when_driver_mcts():
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        zoom_driver=["mcts"],
+        mcts_eval_stochastic=[False, True],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 20  # 10 pairs * 2 flags
+    assert {c.config["mcts_eval_stochastic"] for c in combos} == {False, True}
+    assert "mcts_eval_stochastic" in varying_axis_keys(combos)
+
+
 def _write_fold(combo_dir, fold, val_auc, test_auc):
     fold_dir = os.path.join(combo_dir, f"fold{fold}")
     os.makedirs(fold_dir, exist_ok=True)
