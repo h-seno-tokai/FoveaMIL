@@ -6,9 +6,13 @@
 
 学習損失は :class:`ForwardContext` の ``extra_losses`` に名前付きで積む分類損失（CE）
 は学習ループが従来どおり加える本駆動は ``λ_π · 方策蒸留``（π から改良方策への交差
-エントロピー）と ``λ_v · 価値回帰``（探索表現の実現報酬＝負分類損失への回帰，目標は
-detach）を加える（任意でエントロピー項）識別器ヘッド・射影は基線と共有し，並列分類器
-は持たない推論時はラベル無しで同じ探索を回しズーム先を選ぶ
+エントロピー）と ``λ_v · 価値回帰``を加える（任意でエントロピー項）識別器ヘッド・射影は
+基線と共有し，並列分類器は持たない推論時はラベル無しで同じ探索を回しズーム先を選ぶ
+
+価値回帰の目標は ``mcts_value_target`` で選ぶ``"realised"`` は探索表現の負分類損失
+（最終 CE）を全状態へ broadcast する（detach）``"leaf_ce"`` は各部分選択状態の前置融合を
+共有ヘッドへ通した状態依存 leaf 報酬を目標にし，選択確率には advantage（leaf 報酬 − 価値
+推定）由来の actor-critic 項を加えることで，どの親を選ぶかが分類の良し悪しを弁別する
 """
 
 from __future__ import annotations
@@ -36,6 +40,10 @@ LOSS_POLICY = "mcts_policy"
 LOSS_VALUE = "mcts_value"
 # 方策エントロピー損失のキー
 LOSS_ENTROPY = "mcts_entropy"
+# 価値ターゲット種別：最終 CE を全状態へ broadcast（従来挙動）
+VALUE_TARGET_REALISED = "realised"
+# 価値ターゲット種別：各部分選択状態の暫定融合を共有ヘッドへ通した状態依存 leaf 報酬
+VALUE_TARGET_LEAF_CE = "leaf_ce"
 # モデルへ登録する方策ネットの属性名
 POLICY_ATTR = "search_policy"
 # モデルへ登録する価値ネットの属性名
@@ -162,6 +170,7 @@ class MCTSZoomDriver(ZoomDriver):
         policy_weight: 方策蒸留損失の重み λ_π
         value_weight: 価値回帰損失の重み λ_v
         entropy_weight: 方策エントロピー損失の重み
+        value_target: 価値回帰目標の作り方（``"realised"`` で従来挙動，``"leaf_ce"`` で状態依存 leaf 報酬）
         seed: 乱数シード
     """
 
@@ -179,6 +188,7 @@ class MCTSZoomDriver(ZoomDriver):
         policy_weight: float,
         value_weight: float,
         entropy_weight: float,
+        value_target: str = VALUE_TARGET_REALISED,
         seed: int = 0,
     ) -> None:
         super().__init__(model, num_layers)
@@ -189,6 +199,7 @@ class MCTSZoomDriver(ZoomDriver):
         self.policy_weight = policy_weight
         self.value_weight = value_weight
         self.entropy_weight = entropy_weight
+        self.value_target = value_target
         self.seed = seed
 
         device = next(model.parameters()).device
@@ -230,6 +241,7 @@ class MCTSZoomDriver(ZoomDriver):
             policy_weight=config.policy_loss_weight,
             value_weight=config.value_loss_weight,
             entropy_weight=config.policy_entropy_weight,
+            value_target=config.mcts_value_target,
             seed=config.seed,
         )
 
@@ -319,8 +331,29 @@ class MCTSZoomDriver(ZoomDriver):
 
         logits, Y_hat, Y_prob = self.model.forward_final(M_list)
         context = ForwardContext(m_list=M_list, selections=selections)
-        self._attach_losses(context, logits, label, priors, improved, value_preds)
+        self._attach_losses(
+            context, logits, label, priors, improved, value_preds, M_list, selections
+        )
         return logits, Y_hat, Y_prob, context
+
+    def _leaf_rewards(
+        self,
+        m_list: List[Tensor],
+        label: Tensor,
+        num_states: int,
+    ) -> Tensor:
+        """各部分選択状態の leaf 報酬 ``[num_states]`` を返す
+
+        状態 ``j`` の暫定融合は前置 ``m_list[:j+1]`` を共有融合・識別ヘッドへ通したもので，
+        その負分類損失を報酬とする前置が状態で異なるため報酬は状態を弁別する勾配は
+        共有融合・ヘッド・各倍率の表現へ流れる
+        """
+        rewards: List[Tensor] = []
+        for j in range(num_states):
+            prefix = m_list[: j + 1]
+            prefix_logits = self.model.classify(self.model.fuse_repr(prefix))[0]
+            rewards.append(-F.cross_entropy(prefix_logits, label))
+        return torch.stack(rewards, dim=0)
 
     def _attach_losses(
         self,
@@ -330,11 +363,16 @@ class MCTSZoomDriver(ZoomDriver):
         priors: List[Tensor],
         improved: List[Tensor],
         value_preds: List[Tensor],
+        m_list: List[Tensor],
+        selections: List[Optional[dict]],
     ) -> None:
         """方策蒸留・価値回帰（・エントロピー）損失を ``extra_losses`` に積む
 
-        ラベルが無い（推論）または探索層が無い場合は何も積まない実現報酬は探索表現の
-        負分類損失で，価値回帰の目標として detach する
+        ラベルが無い（推論）または探索層が無い場合は何も積まない
+        ``value_target="realised"`` では実現報酬（探索表現の負分類損失）を全状態へ
+        broadcast して価値回帰の目標にする（detach）``value_target="leaf_ce"`` では各部分
+        選択状態の暫定融合を共有ヘッドへ通した状態依存 leaf 報酬を目標にし，選択確率には
+        advantage（leaf 報酬 − 価値推定）由来の actor-critic 項を加える
         """
         if label is None or not priors:
             return
@@ -347,12 +385,27 @@ class MCTSZoomDriver(ZoomDriver):
             policy_terms.append(-(target.detach() * log_prior).sum())
             if self.entropy_weight != 0.0:
                 entropy_terms.append(-(prior * log_prior).sum())
+
+        value_stack = torch.stack(value_preds, dim=0)
+        if self.value_target == VALUE_TARGET_LEAF_CE:
+            leaf = self._leaf_rewards(m_list, label, value_stack.shape[0])
+            value_loss = F.mse_loss(value_stack, leaf.detach())
+            # advantage は状態の良し悪しで選択を弁別する（価値推定はベースライン）
+            advantage = leaf.detach() - value_stack.detach()
+            for state_idx, selection in enumerate(
+                s for s in selections if s is not None
+            ):
+                select_weight = selection["select_weight"]
+                log_select = torch.log(select_weight.clamp_min(_PROB_FLOOR)).sum()
+                policy_terms[state_idx] = (
+                    policy_terms[state_idx] - advantage[state_idx] * log_select
+                )
+        else:
+            realised = (-F.cross_entropy(logits, label)).detach()
+            value_loss = F.mse_loss(value_stack, realised.expand_as(value_stack))
+
         policy_loss = torch.stack(policy_terms).mean()
         context.extra_losses[LOSS_POLICY] = self.policy_weight * policy_loss
-
-        realised = (-F.cross_entropy(logits, label)).detach()
-        value_stack = torch.stack(value_preds, dim=0)
-        value_loss = F.mse_loss(value_stack, realised.expand_as(value_stack))
         context.extra_losses[LOSS_VALUE] = self.value_weight * value_loss
 
         if entropy_terms:

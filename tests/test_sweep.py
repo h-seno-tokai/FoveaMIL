@@ -549,6 +549,47 @@ def test_zoom_driver_collapses_for_single_mag():
         assert c.config["zoom_driver"] == "differentiable"  # DEFAULT_ZOOM_DRIVER
 
 
+def test_mcts_value_target_collapses_when_driver_not_mcts():
+    # 既定 zoom_driver=differentiable では mcts_value_target は無関係なので畳む
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        mcts_value_target=["realised", "leaf_ce"],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs のみ 価値ターゲットは畳まれる
+    keys = varying_axis_keys(combos)
+    assert "mcts_value_target" not in keys
+    for c in combos:
+        assert c.config["mcts_value_target"] == "realised"  # DEFAULT
+
+
+def test_mcts_value_target_collapses_for_single_mag():
+    # 単一倍率では探索自体が無いため mcts_value_target も無関係 -> 畳む
+    sweep = _base_sweep(
+        magnifications=[[40]],
+        zoom_driver=["mcts"],
+        mcts_value_target=["realised", "leaf_ce"],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs のみ
+    keys = varying_axis_keys(combos)
+    assert "mcts_value_target" not in keys
+    for c in combos:
+        assert c.config["mcts_value_target"] == "realised"
+
+
+def test_mcts_value_target_kept_when_driver_mcts():
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        zoom_driver=["mcts"],
+        mcts_value_target=["realised", "leaf_ce"],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 20  # 10 pairs * 2 value targets
+    assert {c.config["mcts_value_target"] for c in combos} == {"realised", "leaf_ce"}
+    assert "mcts_value_target" in varying_axis_keys(combos)
+
+
 def _write_fold(combo_dir, fold, val_auc, test_auc):
     fold_dir = os.path.join(combo_dir, f"fold{fold}")
     os.makedirs(fold_dir, exist_ok=True)

@@ -110,6 +110,8 @@ DEFAULT_POLICY_LOSS_WEIGHT = 1.0
 DEFAULT_VALUE_LOSS_WEIGHT = 1.0
 # 既定の方策エントロピー損失重み（探索の早期収束を抑える既定は無効）
 DEFAULT_POLICY_ENTROPY_WEIGHT = 0.0
+# 既定の価値ターゲット種別（``"realised"`` で従来挙動＝最終 CE を全状態へ broadcast）
+DEFAULT_MCTS_VALUE_TARGET = "realised"
 # 既定の bag 表現 mixup の Beta 形状 α（0 で無効＝従来挙動）
 DEFAULT_MIXUP_ALPHA = 0.0
 # 既定のバランスサンプラ温度（1.0 で現行＝重み不変）
@@ -187,6 +189,7 @@ class TrainConfig:
         value_loss_weight: 価値回帰損失の重み λ_v（``mcts`` のみ有効）
         policy_entropy_weight: 方策エントロピー損失の重み（``mcts`` のみ有効）
         mcts_hidden_dim: 方策・価値ネットの中間次元（``None`` なら ``hidden_feat_dim``）
+        mcts_value_target: 価値回帰目標の作り方（``"realised"`` で従来挙動＝最終 CE を全状態へ broadcast，``"leaf_ce"`` で各部分選択状態の暫定融合を共有ヘッドへ通した状態依存 leaf 報酬を目標にし方策は完了 Q 由来の advantage で更新，``mcts`` のみ有効）
     """
 
     seed: int = DEFAULT_SEED
@@ -258,3 +261,4 @@ class TrainConfig:
     value_loss_weight: float = DEFAULT_VALUE_LOSS_WEIGHT
     policy_entropy_weight: float = DEFAULT_POLICY_ENTROPY_WEIGHT
     mcts_hidden_dim: Optional[int] = None
+    mcts_value_target: str = DEFAULT_MCTS_VALUE_TARGET

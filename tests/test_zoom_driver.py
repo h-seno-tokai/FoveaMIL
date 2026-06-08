@@ -328,3 +328,128 @@ def test_mcts_driver_entropy_term_when_enabled():
     )
     assert "mcts_entropy" in ctx.extra_losses
     assert torch.isfinite(ctx.extra_losses["mcts_entropy"])
+
+
+# --- 価値ターゲット軸 mcts_value_target ---
+
+
+def test_mcts_value_target_default_is_realised():
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(_mcts_config(), model)
+    # 既定は従来挙動（最終 CE を全状態へ broadcast）
+    assert driver.value_target == "realised"
+
+
+def test_mcts_value_target_realised_uses_single_broadcast_target():
+    """realised の価値回帰は最終 CE の単一スカラを全状態へ broadcast した目標を使う
+
+    leaf_ce が状態依存目標を使うのと対照に，realised は同一スカラを全状態へ広げる
+    両モードで価値損失が一致しないことで broadcast 経路が leaf 経路と別物だと確認する
+    """
+    base = torch.randn(1, 10, IN_DIM)
+    label = torch.tensor([1])
+
+    def value_loss(value_target):
+        torch.manual_seed(0)
+        model = _model(num_layers=3)
+        driver = build_zoom_driver(
+            _mcts_config(mcts_value_target=value_target), model
+        )
+        model.train()
+        _, _, _, ctx = driver.run(
+            base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+        )
+        return float(ctx.extra_losses["mcts_value"].detach())
+
+    realised_loss = value_loss("realised")
+    leaf_loss = value_loss("leaf_ce")
+    assert realised_loss >= 0.0
+    # 状態依存目標とスカラ broadcast 目標で価値損失が異なる
+    assert realised_loss != leaf_loss
+
+
+def test_mcts_value_target_default_bit_compat_is_deterministic():
+    """既定 realised は state_dict 固定で再現可能（数値が run 間で一致）"""
+    base = torch.randn(1, 10, IN_DIM)
+    label = torch.tensor([2])
+
+    def run_once():
+        torch.manual_seed(3)
+        model = _model(num_layers=3)
+        driver = build_zoom_driver(_mcts_config(), model)
+        model.train()
+        logits, _, _, ctx = driver.run(
+            base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+        )
+        return (
+            float(logits.detach().sum()),
+            {k: float(v.detach()) for k, v in ctx.extra_losses.items()},
+        )
+
+    a = run_once()
+    b = run_once()
+    assert a == b
+
+
+def test_mcts_value_target_leaf_ce_is_state_dependent():
+    """leaf_ce では部分選択状態ごとに価値ターゲット（leaf 報酬）が異なる"""
+    torch.manual_seed(0)
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(_mcts_config(mcts_value_target="leaf_ce"), model)
+    model.train()
+    device = torch.device("cpu")
+    base = torch.randn(1, 10, IN_DIM)
+    label = torch.tensor([1])
+
+    _, _, _, ctx = driver.run(
+        base, MAGS_3, _seeded_child_loader(), device, label=label
+    )
+    # 各探索層（num_layers-1 個）の状態で leaf 報酬を再計算する
+    rewards = driver._leaf_rewards(
+        [m.detach() for m in ctx.m_list], label, num_states=len(MAGS_3) - 1
+    )
+    assert rewards.shape[0] == len(MAGS_3) - 1
+    # 前置融合が状態で異なるため目標は状態を弁別する
+    assert not torch.allclose(rewards[0], rewards[1])
+
+
+def test_mcts_value_target_leaf_ce_propagates_gradient():
+    """leaf_ce で policy/value（と共有ヘッド）へ勾配が流れる（grad>0）"""
+    torch.manual_seed(0)
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(_mcts_config(mcts_value_target="leaf_ce"), model)
+    model.train()
+    device = torch.device("cpu")
+    base = torch.randn(1, 10, IN_DIM)
+    label = torch.tensor([2])
+
+    logits, _, _, ctx = driver.run(
+        base, MAGS_3, _seeded_child_loader(), device, label=label
+    )
+    composite = F.cross_entropy(logits, label) + sum(ctx.extra_losses.values())
+    composite.backward()
+
+    def grad_sum(module):
+        return sum(
+            p.grad.abs().sum().item()
+            for p in module.parameters()
+            if p.grad is not None
+        )
+
+    assert grad_sum(model.search_policy) > 0
+    assert grad_sum(model.search_value) > 0
+    assert grad_sum(model.head) > 0
+
+
+def test_mcts_value_target_leaf_ce_loss_is_finite():
+    torch.manual_seed(0)
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(_mcts_config(mcts_value_target="leaf_ce"), model)
+    model.train()
+    device = torch.device("cpu")
+    base = torch.randn(1, 9, IN_DIM)
+    _, _, _, ctx = driver.run(
+        base, MAGS_3, _seeded_child_loader(), device, label=torch.tensor([0])
+    )
+    assert torch.isfinite(ctx.extra_losses["mcts_value"])
+    assert torch.isfinite(ctx.extra_losses["mcts_policy"])
