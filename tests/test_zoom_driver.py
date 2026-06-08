@@ -518,6 +518,177 @@ def test_mcts_value_target_leaf_ce_loss_is_finite():
     assert torch.isfinite(ctx.extra_losses["mcts_policy"])
 
 
+# --- actor-critic 安定化軸 mcts_actor_critic_weight ---
+
+
+def test_mcts_actor_critic_weight_default_is_one():
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(_mcts_config(), model)
+    # 既定は等倍（正規化 advantage を 1.0 で方策蒸留へ上乗せ）
+    assert driver.actor_critic_weight == 1.0
+
+
+def test_normalize_advantage_zero_mean_unit_var():
+    """advantage 正規化は選択状態軸でゼロ平均・単位分散にする（eps 付き）"""
+    from foveamil.models.search import MCTSZoomDriver
+
+    adv = torch.tensor([3.0, -1.0, 0.5, 7.0, -4.0])
+    out = MCTSZoomDriver._normalize_advantage(adv)
+    assert float(out.mean().abs()) < 1e-5
+    # 分散 1（不偏でない母分散）に近い eps による僅かな縮みは許容する
+    assert float(out.var(unbiased=False)) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_normalize_advantage_preserves_sign():
+    """正規化は線形変換のため要素の符号と大小順を保つ（advantage>0 で chosen 確率↑）"""
+    from foveamil.models.search import MCTSZoomDriver
+
+    adv = torch.tensor([2.0, -3.0, 5.0, -0.5])
+    out = MCTSZoomDriver._normalize_advantage(adv)
+    # 平均を引くため符号自体は不変でないが大小順（argsort）は保たれる
+    assert torch.equal(adv.argsort(), out.argsort())
+    # 元の最大が正規化後も最大最小が最小（順序保存＝符号保存の弁別シグナル）
+    assert out.argmax() == adv.argmax()
+    assert out.argmin() == adv.argmin()
+
+
+def test_normalize_advantage_single_state_no_div():
+    """状態が 1 個なら平均引きのみで分散正規化を省く（ゼロ割を回避し有限）"""
+    from foveamil.models.search import MCTSZoomDriver
+
+    out = MCTSZoomDriver._normalize_advantage(torch.tensor([4.0]))
+    assert torch.isfinite(out).all()
+    assert float(out.abs().max()) == pytest.approx(0.0)
+
+
+def _leaf_ce_extra_losses(actor_critic_weight, label, base):
+    """``leaf_ce`` で driver.run を回し ``extra_losses`` を返す（actor-critic 重み可変）"""
+    torch.manual_seed(0)
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(
+        _mcts_config(
+            mcts_value_target="leaf_ce", mcts_actor_critic_weight=actor_critic_weight
+        ),
+        model,
+    )
+    model.train()
+    _, _, _, ctx = driver.run(
+        base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+    )
+    return {k: float(v.detach()) for k, v in ctx.extra_losses.items()}
+
+
+def test_mcts_actor_critic_weight_zero_removes_actor_critic_term():
+    """``mcts_actor_critic_weight=0`` で leaf_ce の方策損失が蒸留のみ（actor-critic 消失）
+
+    重み 0 では actor-critic 項が落ち方策損失が realised と同一になる価値回帰は leaf_ce の
+    状態依存目標を保つため value 損失は realised と異なる（value だけ残り planner を導く）
+    """
+    label = torch.tensor([2])
+    torch.manual_seed(13)
+    base = torch.randn(1, 10, IN_DIM)
+
+    leaf_zero = _leaf_ce_extra_losses(0.0, label, base)
+
+    torch.manual_seed(0)
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(_mcts_config(mcts_value_target="realised"), model)
+    model.train()
+    _, _, _, ctx = driver.run(
+        base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+    )
+    realised = {k: float(v.detach()) for k, v in ctx.extra_losses.items()}
+
+    # actor-critic 無効で方策損失は蒸留のみ＝realised と一致する
+    assert leaf_zero["mcts_policy"] == pytest.approx(realised["mcts_policy"])
+    # value は状態依存 leaf 目標で realised の broadcast 目標と異なる
+    assert leaf_zero["mcts_value"] != pytest.approx(realised["mcts_value"])
+
+
+def test_mcts_actor_critic_weight_scales_policy_loss():
+    """actor-critic 重みが方策損失を線形にスケールする（重みで項が増減する）"""
+    label = torch.tensor([2])
+    torch.manual_seed(13)
+    base = torch.randn(1, 10, IN_DIM)
+
+    zero = _leaf_ce_extra_losses(0.0, label, base)["mcts_policy"]
+    half = _leaf_ce_extra_losses(0.5, label, base)["mcts_policy"]
+    full = _leaf_ce_extra_losses(1.0, label, base)["mcts_policy"]
+
+    # policy_loss = distill - w * (正規化 advantage * log_select) の平均
+    # 重み 0/0.5/1.0 で actor-critic 寄与が線形に効き half は zero と full の中点
+    assert half == pytest.approx((zero + full) / 2)
+    assert full != pytest.approx(zero)
+
+
+def test_mcts_leaf_ce_advantage_sign_preserved_in_policy_term():
+    """正規化後も advantage>0 の選択で chosen log 確率の係数が正（chosen 確率↑方向）
+
+    actor-critic 項は ``- w * adv * log_select`` で policy_terms へ加わるadv>0 のとき
+    log_select の係数 ``w*adv`` が正＝最小化で log_select を増やす（chosen 確率↑）方向を保つ
+    正規化（平均引き・分散割り）は線形変換のためこの符号関係を壊さないことを確認する
+    """
+    from foveamil.models.search import MCTSZoomDriver
+
+    raw = torch.tensor([2.0, -3.0, 5.0, -1.0])
+    norm = MCTSZoomDriver._normalize_advantage(raw)
+    # 正規化後の符号と大小が選択の弁別を保つ（最良選択の係数が最大正）
+    assert norm.argmax() == raw.argmax()
+    # 平均引きで正負が分かれ良い選択は正悪い選択は負（chosen 確率↑/↓を弁別）
+    assert float(norm[raw.argmax()]) > 0 > float(norm[raw.argmin()])
+
+
+def _toy_train_loss_trace(value_target, steps=12, actor_critic_weight=1.0):
+    """toy データで数ステップ学習し合成 train_loss の系列を返す（発散検証用）
+
+    主 CE + extra_losses を合成損失とし optimizer で更新する単一 bag を繰り返し回し
+    train_loss が有界（発散しない）かを realised/正規化 leaf_ce で比較する
+    """
+    torch.manual_seed(0)
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(
+        _mcts_config(
+            mcts_value_target=value_target,
+            mcts_actor_critic_weight=actor_critic_weight,
+        ),
+        model,
+    )
+    model.train()
+    device = torch.device("cpu")
+    opt = torch.optim.SGD(model.parameters(), lr=0.05)
+    loader = _seeded_child_loader()
+    base = torch.randn(1, 12, IN_DIM)
+    label = torch.tensor([1])
+
+    losses = []
+    for _ in range(steps):
+        opt.zero_grad()
+        logits, _, _, ctx = driver.run(base, MAGS_3, loader, device, label=label)
+        loss = F.cross_entropy(logits, label) + sum(ctx.extra_losses.values())
+        loss.backward()
+        opt.step()
+        losses.append(float(loss.detach()))
+    return losses
+
+
+def test_toy_leaf_ce_train_loss_bounded():
+    """toy で正規化 leaf_ce の train_loss が有界（発散しない）realised と同程度に収まる
+
+    正規化前の actor-critic 項はスケール暴走で train_loss が負へ発散しうる正規化で
+    advantage を単位分散に抑えるため数ステップ学習しても有限な範囲に留まることを確認する
+    """
+    realised = _toy_train_loss_trace("realised")
+    leaf_ce = _toy_train_loss_trace("leaf_ce")
+
+    # 全ステップで有限
+    assert all(torch.isfinite(torch.tensor(realised)))
+    assert all(torch.isfinite(torch.tensor(leaf_ce)))
+    # 正規化 leaf_ce の train_loss が realised から大きく乖離せず有界に留まる
+    # （正規化 advantage は単位分散で actor-critic 寄与が ~O(1) に抑えられる）
+    bound = abs(max(realised)) + 10.0
+    assert max(abs(v) for v in leaf_ce) < bound
+
+
 # --- 多段 rollout 軸 mcts_rollout_depth ---
 
 

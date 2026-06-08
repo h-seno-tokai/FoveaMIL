@@ -657,6 +657,47 @@ def test_mcts_eval_stochastic_kept_when_driver_mcts():
     assert "mcts_eval_stochastic" in varying_axis_keys(combos)
 
 
+def test_mcts_actor_critic_weight_collapses_when_driver_not_mcts():
+    # 既定 zoom_driver=differentiable では mcts_actor_critic_weight は無関係なので畳む
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5]],
+        mcts_actor_critic_weight=[0.0, 1.0],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs のみ actor-critic 重みは畳まれる
+    keys = varying_axis_keys(combos)
+    assert "mcts_actor_critic_weight" not in keys
+    for c in combos:
+        assert c.config["mcts_actor_critic_weight"] == 1.0  # DEFAULT
+
+
+def test_mcts_actor_critic_weight_collapses_for_single_mag():
+    # 単一倍率では探索自体が無いため mcts_actor_critic_weight も無関係 -> 畳む
+    sweep = _base_sweep(
+        magnifications=[[40]],
+        zoom_driver=["mcts"],
+        mcts_actor_critic_weight=[0.0, 1.0],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 10  # 10 pairs のみ
+    keys = varying_axis_keys(combos)
+    assert "mcts_actor_critic_weight" not in keys
+    for c in combos:
+        assert c.config["mcts_actor_critic_weight"] == 1.0
+
+
+def test_mcts_actor_critic_weight_kept_when_driver_mcts():
+    sweep = _base_sweep(
+        magnifications=[[1.25, 2.5, 5.0]],
+        zoom_driver=["mcts"],
+        mcts_actor_critic_weight=[0.0, 1.0],
+    )
+    combos = expand_combos(sweep, {}, _resolved())
+    assert len(combos) == 20  # 10 pairs * 2 weights
+    assert {c.config["mcts_actor_critic_weight"] for c in combos} == {0.0, 1.0}
+    assert "mcts_actor_critic_weight" in varying_axis_keys(combos)
+
+
 def _write_fold(combo_dir, fold, val_auc, test_auc):
     fold_dir = os.path.join(combo_dir, f"fold{fold}")
     os.makedirs(fold_dir, exist_ok=True)

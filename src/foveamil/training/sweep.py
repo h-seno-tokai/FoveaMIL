@@ -85,6 +85,7 @@ MCTS_PARAM_KEYS = (
     "mcts_value_target",
     "mcts_rollout_depth",
     "mcts_eval_stochastic",
+    "mcts_actor_critic_weight",
 )
 # instance_loss 有効時のみ意味を持つキー（無効時は無関係）
 INSTANCE_PARAM_KEYS = ("bag_weight", "inst_k", "inst_subtyping")

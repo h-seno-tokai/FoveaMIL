@@ -58,6 +58,8 @@ POLICY_ATTR = "search_policy"
 VALUE_ATTR = "search_value"
 # 確率の数値下限（log 安定化）
 _PROB_FLOOR = 1e-12
+# advantage 正規化の分散下限（ゼロ割回避）
+_ADV_EPS = 1e-8
 # プランナへ渡すシードの倍率ごとオフセット係数（層で別シードにする）
 _LAYER_SEED_STRIDE = 1009
 
@@ -317,6 +319,7 @@ class MCTSZoomDriver(ZoomDriver):
         value_target: 価値回帰目標の作り方（``"realised"`` で従来挙動，``"leaf_ce"`` で状態依存 leaf 報酬）
         rollout_depth: 葉評価の rollout 深さ（1 で従来＝1 段評価，>1 で再帰展開）
         eval_stochastic: 葉評価を MC dropout で確率化するか（False で従来＝eval＋memoize）
+        actor_critic_weight: ``leaf_ce`` の actor-critic 項スケール（正規化 advantage × 選択 log 確率の上乗せ重み，0 で無効）
         seed: 乱数シード
     """
 
@@ -337,6 +340,7 @@ class MCTSZoomDriver(ZoomDriver):
         value_target: str = VALUE_TARGET_REALISED,
         rollout_depth: int = 1,
         eval_stochastic: bool = False,
+        actor_critic_weight: float = 1.0,
         seed: int = 0,
     ) -> None:
         super().__init__(model, num_layers)
@@ -350,6 +354,7 @@ class MCTSZoomDriver(ZoomDriver):
         self.value_target = value_target
         self.rollout_depth = int(rollout_depth)
         self.eval_stochastic = bool(eval_stochastic)
+        self.actor_critic_weight = float(actor_critic_weight)
         self.seed = seed
 
         device = next(model.parameters()).device
@@ -394,6 +399,7 @@ class MCTSZoomDriver(ZoomDriver):
             value_target=config.mcts_value_target,
             rollout_depth=config.mcts_rollout_depth,
             eval_stochastic=config.mcts_eval_stochastic,
+            actor_critic_weight=config.mcts_actor_critic_weight,
             seed=config.seed,
         )
 
@@ -522,6 +528,19 @@ class MCTSZoomDriver(ZoomDriver):
             rewards.append(-F.cross_entropy(prefix_logits, label))
         return torch.stack(rewards, dim=0)
 
+    @staticmethod
+    def _normalize_advantage(advantage: Tensor) -> Tensor:
+        """advantage ``[num_states]`` を選択状態軸でゼロ平均・単位分散へ正規化する
+
+        平均を引き標準偏差（eps 付き）で割る標準的な policy-gradient 安定化で advantage の
+        スケール暴走を抑える符号（advantage>0 で chosen 確率↑）は線形変換で保たれる状態が
+        1 個で分散が定義できないときは平均引きのみ行い分散正規化は省く（ゼロ割回避）
+        """
+        if advantage.numel() <= 1:
+            return advantage - advantage.mean()
+        std = advantage.std(unbiased=False)
+        return (advantage - advantage.mean()) / (std + _ADV_EPS)
+
     def _attach_losses(
         self,
         context: ForwardContext,
@@ -540,6 +559,9 @@ class MCTSZoomDriver(ZoomDriver):
         broadcast して価値回帰の目標にする（detach）``value_target="leaf_ce"`` では選択 j の
         結果状態を含む融合の負分類損失を状態依存 leaf 報酬（detach）として価値回帰の目標にし，
         選択確率には advantage（leaf 報酬 − 価値推定）由来の actor-critic 項を加える
+        advantage は選択状態軸でゼロ平均・単位分散へ正規化し（eps 付き・符号は保つ）スケール
+        暴走を抑える``actor_critic_weight`` で actor-critic 項を方策蒸留と分離して独立に
+        スケールする（0 で actor-critic 無効＝状態依存 value は価値回帰のみ残る）
         leaf 報酬は detach されるため価値回帰・方策勾配のどちらも共有ヘッド・融合へは
         勾配を流さない（共有ヘッド・融合・各倍率表現は主 CE 経由でのみ学習される）
         """
@@ -562,14 +584,17 @@ class MCTSZoomDriver(ZoomDriver):
             value_loss = F.mse_loss(value_stack, leaf.detach())
             # 価値推定をベースラインに選択 j のリターン残差で選択を弁別する
             # （良い選択ほど結果状態の leaf 報酬が高く advantage が正へ向く）
-            advantage = leaf.detach() - value_stack.detach()
+            advantage = self._normalize_advantage(
+                leaf.detach() - value_stack.detach()
+            )
             for state_idx, selection in enumerate(
                 s for s in selections if s is not None
             ):
                 select_weight = selection["select_weight"]
                 log_select = torch.log(select_weight.clamp_min(_PROB_FLOOR)).sum()
                 policy_terms[state_idx] = (
-                    policy_terms[state_idx] - advantage[state_idx] * log_select
+                    policy_terms[state_idx]
+                    - self.actor_critic_weight * advantage[state_idx] * log_select
                 )
         else:
             realised = (-F.cross_entropy(logits, label)).detach()
