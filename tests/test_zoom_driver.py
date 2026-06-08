@@ -413,32 +413,83 @@ def test_mcts_value_target_leaf_ce_is_state_dependent():
     assert not torch.allclose(rewards[0], rewards[1])
 
 
-def test_mcts_value_target_leaf_ce_propagates_gradient():
-    """leaf_ce で policy/value（と共有ヘッド）へ勾配が流れる（grad>0）"""
+def _policy_grad_from_extra_losses(value_target, label, base):
+    """``extra_losses`` のみで backward し方策ネット勾配の絶対値和を返す
+
+    主 CE を加えないため方策ネットへ流れる勾配は方策蒸留・actor-critic 項のみに由来する
+    （共有ヘッドの自明な主 CE 勾配を検証から排除する）
+    """
+    torch.manual_seed(0)
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(_mcts_config(mcts_value_target=value_target), model)
+    model.train()
+    _, _, _, ctx = driver.run(
+        base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+    )
+    model.zero_grad()
+    sum(ctx.extra_losses.values()).backward()
+    return sum(
+        p.grad.abs().sum().item()
+        for p in model.search_policy.parameters()
+        if p.grad is not None
+    )
+
+
+def test_mcts_value_target_leaf_ce_actor_critic_drives_policy_gradient():
+    """leaf_ce の actor-critic 項が方策勾配へ寄与し realised と方策勾配が異なる
+
+    主 CE を除いた extra_losses のみで backward し方策ネット勾配を測るleaf_ce は方策
+    蒸留に actor-critic 項を上乗せするため，蒸留のみの realised と勾配の大きさが異なる
+    （head 勾配は主 CE から自明に来るので検証には使わない）
+    """
+    label = torch.tensor([2])
+    torch.manual_seed(13)
+    base = torch.randn(1, 10, IN_DIM)
+    leaf_grad = _policy_grad_from_extra_losses("leaf_ce", label, base)
+    realised_grad = _policy_grad_from_extra_losses("realised", label, base)
+    assert leaf_grad > 0
+    assert realised_grad > 0
+    # actor-critic 項の上乗せにより方策勾配が realised と一致しない
+    assert leaf_grad != pytest.approx(realised_grad)
+
+
+def test_mcts_value_target_leaf_ce_advantage_reflects_selection_effect():
+    """選択 j の advantage が選択 j の結果状態 M_{j+1} の良し悪しを反映する
+
+    M_0 を固定し選択 0 の結果状態 M_1 を「良い（負 CE が高い）」「悪い」で差し替え，
+    共通の価値ベースラインの下で advantage（leaf 報酬 − 価値推定）が良い選択で大きくなる
+    ことを確認する選択 j のリターンが M_{j+1} に依存する（off-by-one でない）ことの検証
+    """
     torch.manual_seed(0)
     model = _model(num_layers=3)
     driver = build_zoom_driver(_mcts_config(mcts_value_target="leaf_ce"), model)
-    model.train()
-    device = torch.device("cpu")
-    base = torch.randn(1, 10, IN_DIM)
-    label = torch.tensor([2])
+    model.eval()
+    label = torch.tensor([1])
 
-    logits, _, _, ctx = driver.run(
-        base, MAGS_3, _seeded_child_loader(), device, label=label
-    )
-    composite = F.cross_entropy(logits, label) + sum(ctx.extra_losses.values())
-    composite.backward()
+    torch.manual_seed(1)
+    cands = [torch.randn(1, 1, OUT_DIM) for _ in range(60)]
 
-    def grad_sum(module):
-        return sum(
-            p.grad.abs().sum().item()
-            for p in module.parameters()
-            if p.grad is not None
-        )
+    def ce(prefix):
+        return float(F.cross_entropy(model.classify(model.fuse_repr(prefix))[0], label))
 
-    assert grad_sum(model.search_policy) > 0
-    assert grad_sum(model.search_value) > 0
-    assert grad_sum(model.head) > 0
+    m0, m2 = cands[0], cands[1]
+    good_m1 = min(cands, key=lambda c: ce([m0, c]))
+    bad_m1 = max(cands, key=lambda c: ce([m0, c]))
+
+    # 選択 0 の報酬は m_list[:2]＝fuse(M_0, M_1) の負 CE（M_1 が選択 0 の結果状態）
+    reward_good = driver._leaf_rewards(
+        [m0, good_m1, m2], label, num_states=len(MAGS_3) - 1
+    )[0]
+    reward_bad = driver._leaf_rewards(
+        [m0, bad_m1, m2], label, num_states=len(MAGS_3) - 1
+    )[0]
+
+    # 共通の価値ベースライン v の下で advantage = reward - v良い選択で advantage が大きい
+    baseline = (reward_good.detach() + reward_bad.detach()) / 2
+    adv_good = reward_good.detach() - baseline
+    adv_bad = reward_bad.detach() - baseline
+    assert float(reward_good) > float(reward_bad)
+    assert float(adv_good) > 0 > float(adv_bad)
 
 
 def test_mcts_value_target_leaf_ce_loss_is_finite():

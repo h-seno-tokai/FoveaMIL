@@ -10,9 +10,10 @@
 基線と共有し，並列分類器は持たない推論時はラベル無しで同じ探索を回しズーム先を選ぶ
 
 価値回帰の目標は ``mcts_value_target`` で選ぶ``"realised"`` は探索表現の負分類損失
-（最終 CE）を全状態へ broadcast する（detach）``"leaf_ce"`` は各部分選択状態の前置融合を
-共有ヘッドへ通した状態依存 leaf 報酬を目標にし，選択確率には advantage（leaf 報酬 − 価値
-推定）由来の actor-critic 項を加えることで，どの親を選ぶかが分類の良し悪しを弁別する
+（最終 CE）を全状態へ broadcast する（detach）``"leaf_ce"`` は選択 j の結果状態を含む
+融合を共有ヘッドへ通した状態依存 leaf 報酬（detach）を目標にし，選択確率には advantage
+（leaf 報酬 − 価値推定）由来の actor-critic 項を加えることで，どの親を選ぶかが分類の良し
+悪しを弁別する leaf 報酬は detach され共有ヘッド・融合へは勾配を流さない
 """
 
 from __future__ import annotations
@@ -342,15 +343,16 @@ class MCTSZoomDriver(ZoomDriver):
         label: Tensor,
         num_states: int,
     ) -> Tensor:
-        """各部分選択状態の leaf 報酬 ``[num_states]`` を返す
+        """選択 ``j`` の結果状態の leaf 報酬 ``[num_states]`` を返す
 
-        状態 ``j`` の暫定融合は前置 ``m_list[:j+1]`` を共有融合・識別ヘッドへ通したもので，
-        その負分類損失を報酬とする前置が状態で異なるため報酬は状態を弁別する勾配は
-        共有融合・ヘッド・各倍率の表現へ流れる
+        run() の構造上選択 ``j`` の効果は次倍率のプーリング表現 ``M_{j+1}`` に現れる
+        よって選択 ``j`` の報酬は ``m_list[:j+2]``（``M_0..M_{j+1}``）を共有融合・識別
+        ヘッドへ通した負分類損失とする最深選択は ``m_list`` 全長の融合を含み報酬に現れる
+        報酬は消費側で detach され勾配源にはしない（共有ヘッド・融合は主 CE で学習される）
         """
         rewards: List[Tensor] = []
         for j in range(num_states):
-            prefix = m_list[: j + 1]
+            prefix = m_list[: j + 2]
             prefix_logits = self.model.classify(self.model.fuse_repr(prefix))[0]
             rewards.append(-F.cross_entropy(prefix_logits, label))
         return torch.stack(rewards, dim=0)
@@ -370,9 +372,11 @@ class MCTSZoomDriver(ZoomDriver):
 
         ラベルが無い（推論）または探索層が無い場合は何も積まない
         ``value_target="realised"`` では実現報酬（探索表現の負分類損失）を全状態へ
-        broadcast して価値回帰の目標にする（detach）``value_target="leaf_ce"`` では各部分
-        選択状態の暫定融合を共有ヘッドへ通した状態依存 leaf 報酬を目標にし，選択確率には
-        advantage（leaf 報酬 − 価値推定）由来の actor-critic 項を加える
+        broadcast して価値回帰の目標にする（detach）``value_target="leaf_ce"`` では選択 j の
+        結果状態を含む融合の負分類損失を状態依存 leaf 報酬（detach）として価値回帰の目標にし，
+        選択確率には advantage（leaf 報酬 − 価値推定）由来の actor-critic 項を加える
+        leaf 報酬は detach されるため価値回帰・方策勾配のどちらも共有ヘッド・融合へは
+        勾配を流さない（共有ヘッド・融合・各倍率表現は主 CE 経由でのみ学習される）
         """
         if label is None or not priors:
             return
@@ -388,9 +392,11 @@ class MCTSZoomDriver(ZoomDriver):
 
         value_stack = torch.stack(value_preds, dim=0)
         if self.value_target == VALUE_TARGET_LEAF_CE:
+            # leaf[j] は選択 j の結果状態 M_{j+1} を含む融合の負分類損失で選択 j に依存する
             leaf = self._leaf_rewards(m_list, label, value_stack.shape[0])
             value_loss = F.mse_loss(value_stack, leaf.detach())
-            # advantage は状態の良し悪しで選択を弁別する（価値推定はベースライン）
+            # 価値推定をベースラインに選択 j のリターン残差で選択を弁別する
+            # （良い選択ほど結果状態の leaf 報酬が高く advantage が正へ向く）
             advantage = leaf.detach() - value_stack.detach()
             for state_idx, selection in enumerate(
                 s for s in selections if s is not None

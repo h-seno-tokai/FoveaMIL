@@ -189,7 +189,7 @@ class TrainConfig:
         value_loss_weight: 価値回帰損失の重み λ_v（``mcts`` のみ有効）
         policy_entropy_weight: 方策エントロピー損失の重み（``mcts`` のみ有効）
         mcts_hidden_dim: 方策・価値ネットの中間次元（``None`` なら ``hidden_feat_dim``）
-        mcts_value_target: 価値回帰目標の作り方（``"realised"`` で従来挙動＝最終 CE を全状態へ broadcast，``"leaf_ce"`` で各部分選択状態の暫定融合を共有ヘッドへ通した状態依存 leaf 報酬を目標にし方策は完了 Q 由来の advantage で更新，``mcts`` のみ有効）
+        mcts_value_target: 価値回帰目標の作り方（``"realised"`` で従来＝最終 CE を全状態へ broadcast，``"leaf_ce"`` で選択 j の結果状態を含む融合の負分類損失を状態依存リターンにする，``mcts`` のみ有効）
     """
 
     seed: int = DEFAULT_SEED
