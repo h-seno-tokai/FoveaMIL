@@ -64,6 +64,8 @@ DEFAULT_AGGREGATOR = "abmil"
 DEFAULT_AGGREGATOR_NUM_HEADS = 4
 # 既定の自己アテンション集約器の landmark 数（aggregator="self_attn" のときのみ有効）
 DEFAULT_AGGREGATOR_NUM_LANDMARKS = 64
+# 既定の識別器ヘッド名（線形で従来挙動と一致）
+DEFAULT_HEAD_TYPE = "linear"
 # 既定のインスタンス補助損失の有効化
 DEFAULT_INSTANCE_LOSS = False
 # 既定の bag 損失とインスタンス補助損失の重み（bag 側）
@@ -145,6 +147,8 @@ class TrainConfig:
         aggregator: 集約器名（``"abmil"`` で従来のゲート付きアテンションプーリングと bit 互換，``"self_attn"`` でパッチ間コンテキストを取り込む自己アテンション）
         aggregator_num_heads: 自己アテンション集約器の注意ヘッド数（``aggregator="self_attn"`` のときのみ有効）
         aggregator_num_landmarks: 自己アテンション集約器の Nyström landmark 数（``aggregator="self_attn"`` のときのみ有効パッチ数が landmark 以下なら厳密注意へ縮退）
+        head_type: 識別器ヘッド名（``"linear"`` 既定で従来挙動，``"mlp"`` で容量増の小 MLP）
+        head_hidden_dim: 小 MLP ヘッドの中間次元（``head_type="mlp"`` のときのみ有効，``None`` で既定値）
         instance_loss: インスタンス補助損失を加えるか（単一倍率のみ）
         bag_weight: bag 損失とインスタンス補助損失の重み（``bag·bag_weight + inst·(1-bag_weight)``）
         inst_k: インスタンス補助損失の pos/neg パッチ数
@@ -207,6 +211,8 @@ class TrainConfig:
     aggregator: str = DEFAULT_AGGREGATOR
     aggregator_num_heads: int = DEFAULT_AGGREGATOR_NUM_HEADS
     aggregator_num_landmarks: int = DEFAULT_AGGREGATOR_NUM_LANDMARKS
+    head_type: str = DEFAULT_HEAD_TYPE
+    head_hidden_dim: Optional[int] = None
     instance_loss: bool = DEFAULT_INSTANCE_LOSS
     bag_weight: float = DEFAULT_BAG_WEIGHT
     inst_k: int = DEFAULT_INST_K

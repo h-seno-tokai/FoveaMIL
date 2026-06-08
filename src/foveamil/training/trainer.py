@@ -201,6 +201,8 @@ def build_foveamil_from_config(config: TrainConfig, num_layers: int) -> FoveaMIL
         fusion=config.fusion,
         aggregator=config.aggregator,
         aggregator_kwargs=_aggregator_kwargs(config),
+        head_type=config.head_type,
+        head_hidden_dim=config.head_hidden_dim,
         instance_loss=config.instance_loss,
         inst_k=config.inst_k,
         inst_subtyping=config.inst_subtyping,

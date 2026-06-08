@@ -14,7 +14,11 @@ from foveamil.models.fusion import (
     SumFusion,
     build_fusion,
 )
-from foveamil.models.heads import LinearClassifierHead
+from foveamil.models.heads import (
+    LinearClassifierHead,
+    MLPClassifierHead,
+    build_head,
+)
 from foveamil.models.instance import InstanceClusteringLoss
 from foveamil.models.mil import FoveaMIL
 from foveamil.models.regularizers import (
@@ -47,6 +51,8 @@ __all__ = [
     "ScaleSelfAttentionFusion",
     "build_fusion",
     "LinearClassifierHead",
+    "MLPClassifierHead",
+    "build_head",
     "InstanceClusteringLoss",
     "FoveaMIL",
     "ForwardContext",

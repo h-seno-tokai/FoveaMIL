@@ -23,7 +23,7 @@ from foveamil.models.aggregator import build_aggregator
 from foveamil.models.attention import GatedAttention
 from foveamil.models.attention_norm import build_attention_norm
 from foveamil.models.fusion import build_fusion
-from foveamil.models.heads import LinearClassifierHead
+from foveamil.models.heads import build_head
 from foveamil.models.instance import InstanceClusteringLoss
 from foveamil.models.selection import build_selection_controller
 
@@ -47,6 +47,8 @@ DEFAULT_SELECTOR = "topk"
 DEFAULT_FUSION = "sum"
 # 既定の集約器名（既定は従来のゲート付きアテンションプーリングと bit 互換）
 DEFAULT_AGGREGATOR = "abmil"
+# 既定の識別器ヘッド名（線形で従来挙動と一致）
+DEFAULT_HEAD_TYPE = "linear"
 # 既定のインスタンス補助損失の pos/neg パッチ数
 DEFAULT_INST_K = 8
 # インスタンス補助損失を許す倍率数（単一倍率のみ）
@@ -134,6 +136,8 @@ class FoveaMIL(nn.Module):
         aggregator: 集約器名（``build_aggregator`` のレジストリ）既定 ``abmil`` は
             従来のゲート付きアテンションプーリングと bit 互換
         aggregator_kwargs: 集約器へ渡す追加引数
+        head_type: 識別器ヘッド名（``build_head`` のレジストリ既定 ``"linear"`` で従来挙動と一致）
+        head_hidden_dim: 小 MLP ヘッドの中間次元（``head_type="mlp"`` のときのみ有効）
         instance_loss: インスタンス補助損失を持たせるか（単一倍率のみ）
         inst_k: インスタンス補助損失の pos/neg パッチ数
         inst_subtyping: インスタンス補助損失に out-of-class 枝を加えるか
@@ -160,6 +164,8 @@ class FoveaMIL(nn.Module):
         fusion: str = DEFAULT_FUSION,
         aggregator: str = DEFAULT_AGGREGATOR,
         aggregator_kwargs: Optional[dict] = None,
+        head_type: str = DEFAULT_HEAD_TYPE,
+        head_hidden_dim: Optional[int] = None,
         instance_loss: bool = False,
         inst_k: int = DEFAULT_INST_K,
         inst_subtyping: bool = True,
@@ -203,7 +209,13 @@ class FoveaMIL(nn.Module):
             **(selector_kwargs or {}),
         )
         self.fusion = build_fusion(fusion, out_feat_dim, num_layers)
-        self.head = LinearClassifierHead(self.fusion.out_dim, n_cls)
+        self.head = build_head(
+            head_type,
+            self.fusion.out_dim,
+            n_cls,
+            hidden_dim=head_hidden_dim,
+            dropout=dropout,
+        )
         self.instance_module = (
             InstanceClusteringLoss(out_feat_dim, n_cls, inst_k, inst_subtyping)
             if instance_loss

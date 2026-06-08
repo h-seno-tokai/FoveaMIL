@@ -8,7 +8,9 @@ from foveamil.models import (
     GatedAttention,
     InstanceClusteringLoss,
     LinearClassifierHead,
+    MLPClassifierHead,
     build_fusion,
+    build_head,
     build_topk,
 )
 
@@ -199,6 +201,63 @@ def test_linear_head_shape():
     assert head(torch.randn(2, 8)).shape == (2, 4)
 
 
+def test_build_head_registry_types():
+    assert isinstance(build_head("linear", in_dim=8, n_cls=4), LinearClassifierHead)
+    assert isinstance(build_head("mlp", in_dim=8, n_cls=4), MLPClassifierHead)
+
+
+def test_build_head_unknown_raises():
+    with pytest.raises(KeyError):
+        build_head("does_not_exist", in_dim=8, n_cls=4)
+
+
+def test_build_head_linear_bit_identical_to_direct():
+    # build_head("linear") は LinearClassifierHead と RNG 描画順を保ち数値一致する
+    torch.manual_seed(0)
+    direct = LinearClassifierHead(in_dim=8, n_cls=4)
+    torch.manual_seed(0)
+    built = build_head("linear", in_dim=8, n_cls=4)
+    assert torch.equal(direct.fc.weight, built.fc.weight)
+    assert torch.equal(direct.fc.bias, built.fc.bias)
+
+
+def test_mlp_head_shape():
+    head = build_head("mlp", in_dim=8, n_cls=4, hidden_dim=16)
+    assert head(torch.randn(2, 8)).shape == (2, 4)
+
+
+def test_mlp_head_layernorm_placement():
+    # 構成は Linear→LayerNorm→ReLU→(Dropout)→Linear の順
+    head = MLPClassifierHead(in_dim=8, n_cls=4, hidden_dim=16, dropout=0.5)
+    types = [type(m) for m in head.mlp]
+    assert types == [
+        torch.nn.Linear,
+        torch.nn.LayerNorm,
+        torch.nn.ReLU,
+        torch.nn.Dropout,
+        torch.nn.Linear,
+    ]
+    # dropout=None なら Dropout を挟まない
+    no_drop = MLPClassifierHead(in_dim=8, n_cls=4, hidden_dim=16, dropout=None)
+    assert [type(m) for m in no_drop.mlp] == [
+        torch.nn.Linear,
+        torch.nn.LayerNorm,
+        torch.nn.ReLU,
+        torch.nn.Linear,
+    ]
+
+
+def test_mlp_head_propagates_gradient():
+    head = build_head("mlp", in_dim=8, n_cls=4, hidden_dim=16)
+    x = torch.randn(3, 8, requires_grad=True)
+    logits = head(x)
+    logits.sum().backward()
+    assert x.grad is not None and x.grad.abs().sum().item() > 0
+    # 全パラメタへ勾配が流れる
+    for p in head.parameters():
+        assert p.grad is not None
+
+
 # --- FoveaMIL 組立 ---
 
 
@@ -273,6 +332,55 @@ def test_model_assembles_with_fusion(fusion):
     logits, _, Y_prob = model.forward_final([M0, M1])
     assert logits.shape == (2, 3)
     assert torch.allclose(Y_prob.sum(dim=-1), torch.ones(2), atol=1e-6)
+
+
+def test_default_head_is_linear_and_bit_identical():
+    # 既定 head_type は linear で，明示しない既定モデルと全パラメタが数値一致する
+    torch.manual_seed(0)
+    default_model = _build_model(num_layers=2, n_cls=3, out_feat_dim=12)
+    torch.manual_seed(0)
+    explicit_model = FoveaMIL(
+        in_feat_dim=8,
+        hidden_feat_dim=16,
+        out_feat_dim=12,
+        k_sample=4,
+        n_cls=3,
+        num_layers=2,
+        topk_method="perturbed",
+        fusion="sum",
+        head_type="linear",
+    )
+    assert isinstance(default_model.head, LinearClassifierHead)
+    for (n_a, p_a), (n_b, p_b) in zip(
+        default_model.named_parameters(), explicit_model.named_parameters()
+    ):
+        assert n_a == n_b
+        assert torch.equal(p_a, p_b)
+
+
+def test_mlp_head_model_forward_and_gradient():
+    # head_type="mlp" でも出力契約 [B, n_cls] を保ち head へ勾配が流れる
+    model = FoveaMIL(
+        in_feat_dim=8,
+        hidden_feat_dim=16,
+        out_feat_dim=12,
+        k_sample=4,
+        n_cls=3,
+        num_layers=2,
+        topk_method="perturbed",
+        fusion="sum",
+        head_type="mlp",
+        head_hidden_dim=16,
+    )
+    assert isinstance(model.head, MLPClassifierHead)
+    model.train()
+    M0, _, _, _ = model.forward_layer(torch.randn(2, 10, 8), layer_idx=0)
+    M1, _, _, _ = model.forward_layer(torch.randn(2, 7, 8), layer_idx=1)
+    logits, _, _ = model.forward_final([M0, M1])
+    assert logits.shape == (2, 3)
+    logits.sum().backward()
+    for p in model.head.parameters():
+        assert p.grad is not None and p.grad.abs().sum().item() > 0
 
 
 def test_single_magnification_is_final_only():
