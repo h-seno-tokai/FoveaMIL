@@ -256,6 +256,17 @@ class GumbelAlphaZeroPlanner(Planner):
         キャッシュヒットになり報酬列・訪問・スコア順序は per-leaf 評価と一致する
         （メモ化実装のみ有効・確率時は no-op）
         """
+        state = self._prepare_candidates(problem)
+        problem.prefetch_batch([int(a) for a in state.candidates])
+        return state
+
+    def _prepare_candidates(self, problem: SearchProblem) -> _GumbelRunState:
+        """葉充填を行わず候補集合・gumbel・スケジュールのみ確定して状態を返す
+
+        Gumbel top-m で初期候補集合を決め sequential halving の各ラウンド幅を確定する
+        葉評価の充填（prefetch）は呼ばず numpy 算術のみ行う（:meth:`_prepare` は本メソッド
+        の後に prefetch_batch を 1 回呼ぶ＝挙動は分離前と完全一致）
+        """
         n = problem.num_actions()
         prior = np.asarray(problem.prior(), dtype=np.float64).reshape(-1)
         if prior.shape[0] != n:
@@ -270,7 +281,6 @@ class GumbelAlphaZeroPlanner(Planner):
         considered = max(1, min(self.max_considered, n))
         # Gumbel top-m: logits + gumbel の上位 m を最初の候補集合にする
         candidates = np.argsort(-(logits + gumbel), kind="stable")[:considered]
-        problem.prefetch_batch([int(a) for a in candidates])
 
         schedule = _sequential_halving_schedule(considered, self.simulations)
         sims_per_round = max(1, self.simulations // max(1, len(schedule)))
