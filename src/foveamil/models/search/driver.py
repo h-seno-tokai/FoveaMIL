@@ -449,6 +449,8 @@ class MCTSZoomDriver(ZoomDriver):
         rollout_simulations: rollout 各段の入れ子プランナ模擬予算（``None`` で ``simulations`` に一致＝従来挙動）
         eval_stochastic: 葉評価を MC dropout で確率化するか（False で従来＝eval＋memoize）
         actor_critic_weight: ``leaf_ce`` の actor-critic 項スケール（正規化 advantage × 選択 log 確率の上乗せ重み，0 で無効）
+        curriculum_warmup_epochs: 機構L のカリキュラム warmup epoch 数（0 で無効＝重み定数）
+        curriculum_value_lead_frac: value_weight が full に達する warmup 内の割合（critic を actor に先行させる）
         seed: 乱数シード
     """
 
@@ -471,6 +473,8 @@ class MCTSZoomDriver(ZoomDriver):
         rollout_simulations: Optional[int] = None,
         eval_stochastic: bool = False,
         actor_critic_weight: float = 1.0,
+        curriculum_warmup_epochs: int = 0,
+        curriculum_value_lead_frac: float = 0.5,
         seed: int = 0,
     ) -> None:
         super().__init__(model, num_layers)
@@ -491,6 +495,14 @@ class MCTSZoomDriver(ZoomDriver):
         )
         self.eval_stochastic = bool(eval_stochastic)
         self.actor_critic_weight = float(actor_critic_weight)
+        # 機構L カリキュラム: 目標(base)重みを保持し set_curriculum(epoch) で effective を ramp する
+        # 報酬(共有ヘッドの -CE)が安定してから critic(value)→actor(policy/actor-critic)の順に
+        # 立ち上げ探索の学習が moving-target 不安定に陥るのを避ける
+        self.base_policy_weight = float(policy_weight)
+        self.base_value_weight = float(value_weight)
+        self.base_actor_critic_weight = float(actor_critic_weight)
+        self.curriculum_warmup_epochs = int(curriculum_warmup_epochs)
+        self.curriculum_value_lead_frac = float(curriculum_value_lead_frac)
         self.seed = seed
 
         device = next(model.parameters()).device
@@ -500,6 +512,29 @@ class MCTSZoomDriver(ZoomDriver):
         # （基線の識別器ヘッド・射影と同一 optimizer で最適化される）
         model.add_module(POLICY_ATTR, self.policy)
         model.add_module(VALUE_ATTR, self.value)
+
+    def set_curriculum(self, epoch: int) -> None:
+        """機構L: epoch に応じ RL 損失重みを base から ramp する
+
+        ``curriculum_warmup_epochs<=0`` なら base 据置（従来挙動）``>0`` なら value→policy→
+        actor-critic の順に 0→base へ立ち上げ value は warmup×lead_frac の vfull で full に先行する
+        報酬（共有ヘッドの -CE）が未熟な序盤に探索の学習が moving-target 不安定に陥るのを避ける
+        value/policy/actor-critic とも ``epoch==warmup`` で base に達する actor-critic は vfull まで 0
+        で [vfull, warmup] を ramp し vfull==warmup の縮退時は warmup で step 状に base へ立つ
+        """
+        w = self.curriculum_warmup_epochs
+        if w <= 0:
+            return
+        vfull = max(1, round(w * self.curriculum_value_lead_frac))
+        self.value_weight = self.base_value_weight * max(0.0, min(1.0, epoch / vfull))
+        self.policy_weight = self.base_policy_weight * max(0.0, min(1.0, epoch / w))
+        if epoch >= w:
+            ac_scale = 1.0
+        elif epoch <= vfull:
+            ac_scale = 0.0
+        else:
+            ac_scale = (epoch - vfull) / (w - vfull)
+        self.actor_critic_weight = self.base_actor_critic_weight * ac_scale
 
     @classmethod
     def from_config(cls, config, model, num_layers: int) -> "MCTSZoomDriver":
@@ -537,6 +572,8 @@ class MCTSZoomDriver(ZoomDriver):
             rollout_simulations=config.mcts_rollout_simulations,
             eval_stochastic=config.mcts_eval_stochastic,
             actor_critic_weight=config.mcts_actor_critic_weight,
+            curriculum_warmup_epochs=config.curriculum_warmup_epochs,
+            curriculum_value_lead_frac=config.curriculum_value_lead_frac,
             seed=config.seed,
         )
 
@@ -724,6 +761,8 @@ class MCTSZoomDriver(ZoomDriver):
             advantage = self._normalize_advantage(
                 leaf.detach() - value_stack.detach()
             )
+            # actor-critic 項は policy_terms へ畳まれ後段で policy_weight 倍されるため
+            # 実効 actor-critic 係数は policy_weight × actor_critic_weight（機構L は両者を ramp）
             for state_idx, selection in enumerate(
                 s for s in selections if s is not None
             ):

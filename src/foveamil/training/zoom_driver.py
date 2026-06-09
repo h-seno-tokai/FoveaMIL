@@ -45,6 +45,13 @@ class ZoomDriver(abc.ABC):
         self.model = model
         self.num_layers = num_layers
 
+    def set_curriculum(self, epoch: int) -> None:
+        """機構L カリキュラム hook（既定 no-op）
+
+        :class:`MCTSZoomDriver` のみ override し epoch 依存で RL 損失重みを ramp する
+        探索を持たない駆動では何もしない
+        """
+
     def _pop_log_det(self):
         """選択コントローラが log-det を保持していれば取り出す（無ければ ``None``）"""
         pop = getattr(self.model.selector, "pop_log_det", None)

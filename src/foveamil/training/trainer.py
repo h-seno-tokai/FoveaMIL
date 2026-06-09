@@ -310,7 +310,7 @@ class Trainer:
             ldam_max_margin=config.loss_ldam_max_margin,
         ).to(self.device)
         self.optimizer = optim.Adam(
-            self.model.parameters(),
+            self._optimizer_param_groups(config.lr, config.search_lr_scale),
             lr=config.lr,
             betas=ADAM_BETAS,
             eps=ADAM_EPS,
@@ -339,6 +339,36 @@ class Trainer:
             if config.ordinal_aux_weight > 0
             else None
         )
+
+    def _optimizer_param_groups(self, lr: float, search_lr_scale: float):
+        """機構L: ``search_lr_scale != 1`` のとき探索ネット(policy/value)を別 LR の param group へ分ける
+
+        ``1.0`` なら ``model.parameters()`` をそのまま返す（単一グループ＝従来挙動・ビット一致）
+        探索ネットは ``model.search_policy`` / ``model.search_value``（mcts 駆動時のみ存在）で識別し
+        見つからなければ単一グループに畳む
+        """
+        if search_lr_scale == 1.0:
+            return self.model.parameters()
+        # 遅延 import で driver ⇄ trainer の循環 import を避ける（探索ネット属性名の単一源）
+        from foveamil.models.search.driver import POLICY_ATTR, VALUE_ATTR
+
+        search_params = [
+            param
+            for attr in (POLICY_ATTR, VALUE_ATTR)
+            for module in [getattr(self.model, attr, None)]
+            if module is not None
+            for param in module.parameters()
+        ]
+        if not search_params:
+            return self.model.parameters()
+        search_ids = {id(param) for param in search_params}
+        other_params = [
+            param for param in self.model.parameters() if id(param) not in search_ids
+        ]
+        return [
+            {"params": other_params},
+            {"params": search_params, "lr": lr * search_lr_scale},
+        ]
 
     def _build_train_loader(self, train_ds) -> DataLoader:
         """学習用 DataLoader を作る（重み付き or ランダムサンプラ）"""
@@ -516,6 +546,8 @@ class Trainer:
             self.device,
         )
         for epoch in range(self.config.max_epochs):
+            # 機構L: epoch 依存で RL 損失重みを ramp する（mcts 以外は no-op）
+            self.zoom_driver.set_curriculum(epoch)
             train_loss = self._train_one_epoch()
             val_loss, val_metrics, _, _ = self._evaluate(self.val_loader)
 
@@ -534,6 +566,11 @@ class Trainer:
                 {f"val/{k}": v for k, v in val_metrics.items()}, epoch
             )
             self._log_scalars({"val/loss": val_loss, "lr": current_lr}, epoch)
+            # 機構L で param group を分けた場合は探索ネットの LR も可視化する
+            if len(self.optimizer.param_groups) > 1:
+                self._log_scalars(
+                    {"lr_search": self.optimizer.param_groups[1]["lr"]}, epoch
+                )
             self._record_history(epoch, current_lr, train_loss, val_loss, val_metrics)
 
             self.scheduler.step(val_loss)

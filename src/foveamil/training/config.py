@@ -120,6 +120,12 @@ DEFAULT_MCTS_ROLLOUT_SIMULATIONS = None
 DEFAULT_MCTS_EVAL_STOCHASTIC = False
 # 既定の actor-critic 項スケール（1.0 で正規化 advantage を等倍で方策蒸留へ上乗せ，0 で無効）
 DEFAULT_MCTS_ACTOR_CRITIC_WEIGHT = 1.0
+# 既定のカリキュラム warmup epoch 数（機構L・0 で無効＝RL損失重みを epoch0 から定数＝従来挙動）
+DEFAULT_CURRICULUM_WARMUP_EPOCHS = 0
+# 既定の value 先行割合（warmup の何割で value_weight が full に達するか＝critic を actor に先行させる）
+DEFAULT_CURRICULUM_VALUE_LEAD_FRAC = 0.5
+# 既定の探索ネット LR スケール（1.0 で無効＝policy/value も主 LR と同一の単一 param group＝従来挙動）
+DEFAULT_SEARCH_LR_SCALE = 1.0
 # 既定の bag 表現 mixup の Beta 形状 α（0 で無効＝従来挙動）
 DEFAULT_MIXUP_ALPHA = 0.0
 # 既定のバランスサンプラ温度（1.0 で現行＝重み不変）
@@ -202,6 +208,9 @@ class TrainConfig:
         mcts_rollout_simulations: rollout 各段の入れ子プランナ模擬予算（``None`` で ``mcts_simulations`` に一致＝従来挙動，``rollout_depth>1`` のときのみ意味を持ち入れ子探索の予算を最上層と分離して設定する，``mcts`` のみ有効）
         mcts_eval_stochastic: 葉評価を確率的にするか（``False`` で従来＝eval モード葉評価＋報酬 memoize で simulation 間同値，``True`` で MC dropout＋memoize 撤廃で simulation 間に分散を出す，``mcts`` のみ有効）
         mcts_actor_critic_weight: ``leaf_ce`` の actor-critic 項スケール（正規化 advantage × 選択 log 確率を方策蒸留へ上乗せする重み，``0`` で actor-critic 無効＝状態依存 value は価値回帰のみ残る，``mcts`` のみ有効）
+        curriculum_warmup_epochs: 機構 L のカリキュラム warmup epoch 数（``0`` で無効＝RL 損失重みを epoch0 から定数＝従来挙動，``>0`` で value→policy→actor-critic の順に重みを 0 から目標へ ramp し分類器の報酬が安定してから探索の学習を立ち上げる，``mcts`` のみ有効）
+        curriculum_value_lead_frac: value_weight が full に達する warmup 内の割合（``0.5`` で warmup の半分で value が full＝critic を actor に先行させ actor-critic 項はそこから ramp 開始，``curriculum_warmup_epochs>0`` のときのみ意味を持つ）
+        search_lr_scale: 探索ネット（policy/value）専用 param group の LR 倍率（``1.0`` で無効＝単一 param group で従来挙動，``<1`` で探索ネットだけ学習を遅くし共有ヘッド・融合の立ち上がりを先行させる）
     """
 
     seed: int = DEFAULT_SEED
@@ -278,3 +287,6 @@ class TrainConfig:
     mcts_rollout_simulations: Optional[int] = DEFAULT_MCTS_ROLLOUT_SIMULATIONS
     mcts_eval_stochastic: bool = DEFAULT_MCTS_EVAL_STOCHASTIC
     mcts_actor_critic_weight: float = DEFAULT_MCTS_ACTOR_CRITIC_WEIGHT
+    curriculum_warmup_epochs: int = DEFAULT_CURRICULUM_WARMUP_EPOCHS
+    curriculum_value_lead_frac: float = DEFAULT_CURRICULUM_VALUE_LEAD_FRAC
+    search_lr_scale: float = DEFAULT_SEARCH_LR_SCALE
