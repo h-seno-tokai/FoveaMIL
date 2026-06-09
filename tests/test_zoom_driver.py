@@ -4,6 +4,7 @@
 合成損失を作り，方策・価値・共有ヘッドへ勾配を流し，シードで決定的であることを確認する
 """
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -905,3 +906,190 @@ def test_mcts_rollout_depth_two_propagates_policy_value_gradient():
 
     assert grad_sum(model.search_policy) > 0
     assert grad_sum(model.search_value) > 0
+
+
+# --- 葉評価バッチ化の数値同値（per-leaf 参照経路との完全一致） ---
+
+
+def _run_driver_capture(driver, base, mags, label, force_per_leaf):
+    """``driver.run`` を回し選択・改良方策・logits・extra_losses を取り出す
+
+    バッチ化と per-leaf 参照経路の数値同値を比べるための観測点を集める
+    ``force_per_leaf=True`` で ``prefetch_batch`` を基底 no-op へ退化させ per-action
+    ``evaluate`` を単体葉評価へ強制する（＝改修前と同一の per-leaf 経路）最上層プランナの
+    ``improved_policy`` は ``GumbelAlphaZeroPlanner.run`` を一時 wrap して記録する
+    """
+    from unittest import mock
+
+    from foveamil.models.search import mcts as mcts_mod
+    from foveamil.models.search.driver import _ZoomSearchProblem
+    from foveamil.models.search.mcts import GumbelAlphaZeroPlanner
+
+    captured: list = []
+    original_run = GumbelAlphaZeroPlanner.run
+
+    def recording_run(self, problem, num_select):
+        result = original_run(self, problem, num_select)
+        captured.append(np.asarray(result.improved_policy).copy())
+        return result
+
+    patches = [mock.patch.object(GumbelAlphaZeroPlanner, "run", recording_run)]
+    if force_per_leaf:
+        patches.append(
+            mock.patch.object(
+                _ZoomSearchProblem,
+                "prefetch_batch",
+                mcts_mod.SearchProblem.prefetch_batch,
+            )
+        )
+    for patch in patches:
+        patch.start()
+    try:
+        logits, _, _, ctx = driver.run(
+            base, mags, _seeded_child_loader(), torch.device("cpu"), label=label
+        )
+    finally:
+        for patch in patches:
+            patch.stop()
+    chosen = [
+        None if s is None else s["select_indices"].cpu().numpy().tolist()
+        for s in ctx.selections
+    ]
+    extra = {k: float(v.detach()) for k, v in ctx.extra_losses.items()}
+    return chosen, captured, logits.detach().clone(), extra
+
+
+def _build_seeded_mcts(num_layers, eval_stochastic=False, **overrides):
+    """同一シードで決定的に同一 state_dict のモデルと探索駆動を作る"""
+    torch.manual_seed(31)
+    model = _model(num_layers)
+    driver = build_zoom_driver(
+        _mcts_config(mcts_eval_stochastic=eval_stochastic, **overrides), model
+    )
+    return model, driver
+
+
+def _assert_capture_equal(bat, ref):
+    """選択・改良方策・logits・extra_losses が完全一致することを確認する"""
+    assert bat[0] == ref[0]
+    assert len(bat[1]) == len(ref[1])
+    for a, b in zip(bat[1], ref[1]):
+        assert np.array_equal(a, b)
+    assert torch.equal(bat[2], ref[2])
+    assert bat[3].keys() == ref[3].keys()
+    for key in ref[3]:
+        assert bat[3][key] == ref[3][key]
+
+
+def test_prefetch_batch_matches_per_leaf_reference_exactly():
+    """決定論時バッチ葉評価が per-leaf 参照経路と完全一致する（chosen / improved / logits）
+
+    バッチ前向きを無効化した参照経路（``prefetch_batch`` を基底 no-op へ退化させ
+    per-action ``evaluate`` が単体葉評価 ``value_leaf`` を辿る＝改修前と同一）と，
+    バッチ経路（既定）で driver.run の選択・改良方策・logits・全 extra_losses が
+    ビット一致することを確認する価値ネット・射影は候補軸独立のためバッチ各行は
+    単体前向きとビット同一になり報酬列・探索算術が改修前と一致する
+    """
+    base = torch.randn(1, 11, IN_DIM)
+    label = torch.tensor([1])
+
+    model_ref, driver_ref = _build_seeded_mcts(num_layers=3)
+    model_ref.eval()
+    ref = _run_driver_capture(driver_ref, base, MAGS_3, label, force_per_leaf=True)
+
+    model_bat, driver_bat = _build_seeded_mcts(num_layers=3)
+    model_bat.eval()
+    bat = _run_driver_capture(driver_bat, base, MAGS_3, label, force_per_leaf=False)
+
+    _assert_capture_equal(bat, ref)
+
+
+def test_prefetch_batch_rollout_depth_two_matches_per_leaf_reference():
+    """``rollout_depth=2`` でもバッチ葉評価が per-leaf 参照と完全一致する
+
+    最上段は入れ子探索の逐次依存でバッチ化対象外だが，入れ子の葉到達時に同機構で
+    バッチ化される深い木でも選択・改良方策・logits が改修前とビット一致する
+    """
+    base = torch.randn(1, 12, IN_DIM)
+    label = torch.tensor([2])
+
+    model_ref, driver_ref = _build_seeded_mcts(num_layers=3, mcts_rollout_depth=2)
+    model_ref.eval()
+    ref = _run_driver_capture(driver_ref, base, MAGS_3, label, force_per_leaf=True)
+
+    model_bat, driver_bat = _build_seeded_mcts(num_layers=3, mcts_rollout_depth=2)
+    model_bat.eval()
+    bat = _run_driver_capture(driver_bat, base, MAGS_3, label, force_per_leaf=False)
+
+    _assert_capture_equal(bat, ref)
+
+
+def test_prefetch_batch_preserves_gradient_path():
+    """バッチ葉評価は勾配経路を変えない（policy/value/共有ヘッドへの勾配がビット一致）
+
+    葉評価は no_grad で勾配を流さず学習勾配は run 本体の policy/value/select_weight
+    経由のため，バッチ化前後で方策・価値・共有ヘッドへ流れる勾配が一致することを確認する
+    """
+    from unittest import mock
+
+    from foveamil.models.search import mcts as mcts_mod
+    from foveamil.models.search.driver import _ZoomSearchProblem
+
+    base = torch.randn(1, 11, IN_DIM)
+    label = torch.tensor([1])
+
+    def grad_snapshot(force_per_leaf):
+        torch.manual_seed(31)
+        model = _model(3)
+        driver = build_zoom_driver(
+            _mcts_config(mcts_value_target="leaf_ce"), model
+        )
+        model.train()
+        patch = (
+            mock.patch.object(
+                _ZoomSearchProblem,
+                "prefetch_batch",
+                mcts_mod.SearchProblem.prefetch_batch,
+            )
+            if force_per_leaf
+            else None
+        )
+        if patch is not None:
+            patch.start()
+        try:
+            _, _, _, ctx = driver.run(
+                base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+            )
+            model.zero_grad()
+            sum(ctx.extra_losses.values()).backward()
+            return {
+                name: p.grad.detach().clone()
+                for name, p in model.named_parameters()
+                if p.grad is not None
+            }
+        finally:
+            if patch is not None:
+                patch.stop()
+
+    ref = grad_snapshot(force_per_leaf=True)
+    bat = grad_snapshot(force_per_leaf=False)
+    assert ref.keys() == bat.keys()
+    for name in ref:
+        assert torch.equal(ref[name], bat[name]), name
+
+
+def test_mcts_rollout_simulations_default_matches_simulations():
+    """``mcts_rollout_simulations=None``（既定）は ``mcts_simulations`` と同値"""
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(_mcts_config(mcts_simulations=8), model)
+    assert driver.rollout_simulations == driver.simulations == 8
+
+
+def test_mcts_rollout_simulations_knob_sets_rollout_budget():
+    """``mcts_rollout_simulations`` は rollout 段の入れ子予算のみを設定する"""
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(
+        _mcts_config(mcts_simulations=8, mcts_rollout_simulations=3), model
+    )
+    assert driver.simulations == 8
+    assert driver.rollout_simulations == 3

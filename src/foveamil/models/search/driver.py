@@ -26,7 +26,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -141,6 +141,27 @@ class _RolloutContext:
         try:
             with torch.no_grad():
                 return float(self.value_net(x_next).item())
+        finally:
+            self.value_net.train(was_training)
+
+    def value_leaf_batch(self, x_states: List[Tensor]) -> List[float]:
+        """射影済み状態列 ``[m × (1, cpp, D)]`` を価値ネットで葉評価し ``[m]`` を返す
+
+        各候補を ``[1, cpp, D]`` 単体で前向きし（葉評価値を改修前とビット同一に保つ），
+        出力テンソルを ``.item()`` せず保持して末尾で 1 回だけ ``.cpu().tolist()`` する
+        per-leaf の GPU→CPU 同期（律速）を 1 回へ畳む単体前向きは非同期にキューされ
+        最後の同期だけがブロックするため逐次同期待ちが消える``leaf_evals`` は件数で進める
+
+        値の生成は per-leaf 評価と同一前向き・同一縮約順序のため決定論時の報酬列は
+        改修前と完全一致する（バッチ GEMM の縮約順序差による ULP 揺れを持ち込まない）
+        """
+        self.leaf_evals += len(x_states)
+        was_training = self.value_net.training
+        self.value_net.train(self.stochastic)
+        try:
+            with torch.no_grad():
+                outputs = [self.value_net(x).reshape(1) for x in x_states]
+            return torch.cat(outputs, dim=0).cpu().tolist()
         finally:
             self.value_net.train(was_training)
 
@@ -285,6 +306,37 @@ class _ZoomSearchProblem(SearchProblem):
             self._reward_cache[action] = reward
         return reward
 
+    def prefetch_batch(self, actions: Sequence[int]) -> None:
+        """候補集合 ``actions`` の葉評価を先に計算し ``_reward_cache`` を充填する
+
+        確率的でない（既定）ときに限り有効各候補の子を ``[m, cpp, D_in]`` へ stack し
+        射影を 1 回（候補軸独立で batched GEMM は per-row とビット同一）で通したうえで，
+        価値ネットは行ごとに前向きしつつ GPU→CPU 同期を末尾 1 回へ畳む以後の per-action
+        :meth:`evaluate` は全てキャッシュヒットになり，探索算術へ渡る報酬列は per-leaf
+        評価と完全一致する（葉評価値はビット同一・同期回数のみ m→1 へ減る）
+
+        確率的なとき（``stochastic``）は memoize を撤廃し simulation 間に分散を出す
+        設計のため何もしない（per-action 経路の MC dropout 標本化をそのまま使う）
+        ``rollout_depth>1`` で更に展開できる候補は入れ子 planner.run が逐次依存のため
+        バッチ化対象外として何もしない（葉到達時のバッチ化は入れ子側で効く）
+        """
+        if self.ctx.stochastic:
+            return
+        if self.rollout_depth > 1 and self._can_expand():
+            return
+        todo = [int(a) for a in actions if int(a) not in self._reward_cache]
+        if not todo:
+            return
+        # 射影は候補軸独立で batched GEMM が per-row とビット同一のため 1 回で射影し，
+        # value-net は行ごと前向き＋末尾 1 同期で per-leaf 評価とビット同一に保つ
+        feats = torch.cat([self._load_child(a) for a in todo], dim=0)
+        with torch.no_grad():
+            x_next = self.ctx.model.projections[self.layer_idx + 1](feats)
+        states = [x_next[i : i + 1] for i in range(x_next.shape[0])]
+        values = self.ctx.value_leaf_batch(states)
+        for action, value in zip(todo, values):
+            self._reward_cache[action] = value
+
 
 class MCTSZoomDriver(ZoomDriver):
     """探索ベースのズーム駆動
@@ -318,6 +370,7 @@ class MCTSZoomDriver(ZoomDriver):
         entropy_weight: 方策エントロピー損失の重み
         value_target: 価値回帰目標の作り方（``"realised"`` で従来挙動，``"leaf_ce"`` で状態依存 leaf 報酬）
         rollout_depth: 葉評価の rollout 深さ（1 で従来＝1 段評価，>1 で再帰展開）
+        rollout_simulations: rollout 各段の入れ子プランナ模擬予算（``None`` で ``simulations`` に一致＝従来挙動）
         eval_stochastic: 葉評価を MC dropout で確率化するか（False で従来＝eval＋memoize）
         actor_critic_weight: ``leaf_ce`` の actor-critic 項スケール（正規化 advantage × 選択 log 確率の上乗せ重み，0 で無効）
         seed: 乱数シード
@@ -339,6 +392,7 @@ class MCTSZoomDriver(ZoomDriver):
         entropy_weight: float,
         value_target: str = VALUE_TARGET_REALISED,
         rollout_depth: int = 1,
+        rollout_simulations: Optional[int] = None,
         eval_stochastic: bool = False,
         actor_critic_weight: float = 1.0,
         seed: int = 0,
@@ -353,6 +407,12 @@ class MCTSZoomDriver(ZoomDriver):
         self.entropy_weight = entropy_weight
         self.value_target = value_target
         self.rollout_depth = int(rollout_depth)
+        # None なら simulations と同値＝従来挙動（rollout 段の予算を最上層と分離する任意ノブ）
+        self.rollout_simulations = (
+            int(rollout_simulations)
+            if rollout_simulations is not None
+            else int(simulations)
+        )
         self.eval_stochastic = bool(eval_stochastic)
         self.actor_critic_weight = float(actor_critic_weight)
         self.seed = seed
@@ -398,6 +458,7 @@ class MCTSZoomDriver(ZoomDriver):
             entropy_weight=config.policy_entropy_weight,
             value_target=config.mcts_value_target,
             rollout_depth=config.mcts_rollout_depth,
+            rollout_simulations=config.mcts_rollout_simulations,
             eval_stochastic=config.mcts_eval_stochastic,
             actor_critic_weight=config.mcts_actor_critic_weight,
             seed=config.seed,
@@ -435,7 +496,7 @@ class MCTSZoomDriver(ZoomDriver):
             magnifications=magnifications,
             num_layers=self.num_layers,
             planner_name=self.planner_name,
-            rollout_simulations=self.simulations,
+            rollout_simulations=self.rollout_simulations,
             rollout_considered=self.max_considered,
             stochastic=self.eval_stochastic,
             device=device,

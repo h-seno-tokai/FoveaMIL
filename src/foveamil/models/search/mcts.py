@@ -17,7 +17,7 @@ from __future__ import annotations
 import abc
 import math
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import numpy as np
 
@@ -109,6 +109,17 @@ class SearchProblem(abc.ABC):
 
         Returns:
             報酬推定（大きいほど良い）
+        """
+
+    def prefetch_batch(self, actions: Sequence[int]) -> None:
+        """候補集合 ``actions`` の評価を 1 バッチで先に計算しキャッシュへ充填する
+
+        基底は何もしない（後方互換）``evaluate`` をメモ化する実装が，この呼び出しで
+        per-leaf 評価・同期をバッチ 1 回へ畳み，以後の per-action :meth:`evaluate` を
+        キャッシュヒットへ退化させるために override する報酬列・評価順序は不変
+
+        Args:
+            actions: 先に評価する候補 index 列
         """
 
 
@@ -210,6 +221,12 @@ class GumbelAlphaZeroPlanner(Planner):
         considered = max(1, min(self.max_considered, n))
         # Gumbel top-m: logits + gumbel の上位 m を最初の候補集合にする
         candidates = np.argsort(-(logits + gumbel), kind="stable")[:considered]
+
+        # 候補集合は run 冒頭で確定し sequential halving は部分集合のみへ縮む
+        # （新規候補は出ない）ため，ここで全候補の葉評価を先に充填し per-leaf 同期を
+        # 1 回へ畳む以後の evaluate はキャッシュヒットになり報酬列・訪問・スコア順序は
+        # per-leaf 評価と一致する（メモ化実装のみ有効・確率時は no-op）
+        problem.prefetch_batch([int(a) for a in candidates])
 
         visit_counts = np.zeros(n, dtype=np.int64)
         q_sum = np.zeros(n, dtype=np.float64)

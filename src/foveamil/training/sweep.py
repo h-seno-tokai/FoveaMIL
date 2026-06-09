@@ -84,6 +84,7 @@ MCTS_PARAM_KEYS = (
     "mcts_hidden_dim",
     "mcts_value_target",
     "mcts_rollout_depth",
+    "mcts_rollout_simulations",
     "mcts_eval_stochastic",
     "mcts_actor_critic_weight",
 )
