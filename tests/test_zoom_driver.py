@@ -1005,10 +1005,12 @@ def test_prefetch_batch_matches_per_leaf_reference_exactly():
 
 
 def test_prefetch_batch_rollout_depth_two_matches_per_leaf_reference():
-    """``rollout_depth=2`` でもバッチ葉評価が per-leaf 参照と完全一致する
+    """``rollout_depth=2`` でも入れ子群 lockstep が逐次 _rollout と完全一致する
 
-    最上段は入れ子探索の逐次依存でバッチ化対象外だが，入れ子の葉到達時に同機構で
-    バッチ化される深い木でも選択・改良方策・logits が改修前とビット一致する
+    決定論 depth2 では各候補の入れ子探索を並走させ中段 prior と葉評価を候補跨ぎで連結
+    1 同期へ畳む入れ子は逐次 planner.run を経由せず分解メソッドを辿るため captured（入れ子
+    improved）は非対称になる最終出力 chosen・logits・合成損失の一致で bit-exact を検証する
+    （決定論時 logits が一致すれば入れ子 reward まで完全一致している）
     """
     base = torch.randn(1, 12, IN_DIM)
     label = torch.tensor([2])
@@ -1021,7 +1023,66 @@ def test_prefetch_batch_rollout_depth_two_matches_per_leaf_reference():
     model_bat.eval()
     bat = _run_driver_capture(driver_bat, base, MAGS_3, label, force_per_leaf=False)
 
-    _assert_capture_equal(bat, ref)
+    assert bat[0] == ref[0]
+    assert torch.equal(bat[2], ref[2])
+    assert bat[3].keys() == ref[3].keys()
+    for key in ref[3]:
+        assert bat[3][key] == ref[3][key]
+
+
+def test_rollout_depth_two_lockstep_preserves_gradient():
+    """決定論 depth2 入れ子群 lockstep は勾配経路を変えない（policy/value/共有ヘッド bit 一致）
+
+    葉評価・中段 prior は no_grad で勾配を流さず reward は detach されるため学習勾配は run
+    本体（policy/value/select_weight）経由のみ入れ子探索を候補跨ぎで並走させても reward が
+    逐次 _rollout と一致するので方策・価値・共有ヘッドへ流れる勾配がビット一致する
+    """
+    from unittest import mock
+
+    from foveamil.models.search import mcts as mcts_mod
+    from foveamil.models.search.driver import _ZoomSearchProblem
+
+    base = torch.randn(1, 12, IN_DIM)
+    label = torch.tensor([2])
+
+    def grad_snapshot(force_per_leaf):
+        torch.manual_seed(31)
+        model = _model(3)
+        driver = build_zoom_driver(
+            _mcts_config(mcts_value_target="leaf_ce", mcts_rollout_depth=2), model
+        )
+        model.train()
+        patch = (
+            mock.patch.object(
+                _ZoomSearchProblem,
+                "prefetch_batch",
+                mcts_mod.SearchProblem.prefetch_batch,
+            )
+            if force_per_leaf
+            else None
+        )
+        if patch is not None:
+            patch.start()
+        try:
+            _, _, _, ctx = driver.run(
+                base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+            )
+            model.zero_grad()
+            sum(ctx.extra_losses.values()).backward()
+            return {
+                name: p.grad.detach().clone()
+                for name, p in model.named_parameters()
+                if p.grad is not None
+            }
+        finally:
+            if patch is not None:
+                patch.stop()
+
+    ref = grad_snapshot(force_per_leaf=True)
+    bat = grad_snapshot(force_per_leaf=False)
+    assert ref.keys() == bat.keys()
+    for name in ref:
+        assert torch.equal(ref[name], bat[name]), name
 
 
 def test_prefetch_batch_preserves_gradient_path():

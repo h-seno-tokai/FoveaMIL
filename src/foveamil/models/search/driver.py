@@ -205,6 +205,53 @@ class _RolloutContext:
         finally:
             policy_net.train(was_training)
 
+    def value_leaf_batch_multi(
+        self, states_list: List[List[Tensor]]
+    ) -> List[List[float]]:
+        """複数 problem の per-row 状態列を全 problem 跨ぎで連結し葉評価し復元する
+
+        各 problem の per-row ``[1, cpp, D]`` を 1 リストへ連結し行ごと前向きしつつ
+        GPU→CPU 同期を末尾 1 回へ畳む戻りは problem ごとの値リストへ復元する per-row
+        前向き維持で各値は単体評価とビット同一（決定論時の報酬列が standalone と一致する）
+        ``leaf_evals`` は連結した総行数で進める
+        """
+        flat = [x for states in states_list for x in states]
+        self.leaf_evals += len(flat)
+        was_training = self.value_net.training
+        self.value_net.train(self.stochastic)
+        try:
+            with torch.no_grad():
+                outputs = [self.value_net(x).reshape(1) for x in flat]
+            values = (
+                torch.cat(outputs, dim=0).cpu().tolist() if outputs else []
+            )
+        finally:
+            self.value_net.train(was_training)
+        result: List[List[float]] = []
+        offset = 0
+        for states in states_list:
+            result.append(values[offset : offset + len(states)])
+            offset += len(states)
+        return result
+
+    def policy_prior_batch_numpy(self, x_states: List[Tensor]) -> List[np.ndarray]:
+        """複数状態の中段 prior ``π`` を per-row 前向きし numpy 列で返す（1 同期）
+
+        policy ネットを状態ごと ``[1, N, D]`` で前向きし（GEMM 跨ぎ再結合なし）出力を stack
+        して末尾 1 回で cpu 化する確率時は train モードで MC dropout 標本化決定時は eval で
+        決定的各値は単体 :meth:`policy_prior` の ``squeeze(0)`` とビット同一（全状態の N は同一）
+        """
+        policy_net = self.model.search_policy
+        was_training = policy_net.training
+        policy_net.train(self.stochastic)
+        try:
+            with torch.no_grad():
+                outs = [policy_net(x).squeeze(0) for x in x_states]
+            arr = torch.stack(outs, dim=0).cpu().numpy()
+        finally:
+            policy_net.train(was_training)
+        return [arr[i] for i in range(arr.shape[0])]
+
 
 class _ZoomSearchProblem(SearchProblem):
     """1 倍率のズーム決定を解く探索問題
@@ -381,16 +428,100 @@ class _ZoomSearchProblem(SearchProblem):
         :meth:`evaluate` は全てキャッシュヒットになり，探索算術へ渡る報酬列は per-leaf
         評価と完全一致する（葉評価値はビット同一・同期回数のみ m→1 へ減る）
 
+        ``rollout_depth>1`` で更に展開できる候補（決定論・gumbel 時）は各候補の入れ子探索を
+        並走させ中段 prior と葉評価を候補跨ぎで連結 1 同期へ畳む（:meth:`_rollout_batch_deterministic`）
+        報酬は逐次 _rollout とビット一致するgumbel 以外は退化し evaluate が逐次 _rollout を辿る
+
         確率的なとき（``stochastic``）は memoize を撤廃し simulation 間に分散を出す
         設計のため何もしない（per-action 経路の MC dropout 標本化をそのまま使う）
-        ``rollout_depth>1`` で更に展開できる候補は入れ子 planner.run が逐次依存のため
-        バッチ化対象外として何もしない（葉到達時のバッチ化は入れ子側で効く）
         """
+        if not self.ctx.stochastic and self.rollout_depth > 1 and self._can_expand():
+            if self.ctx.planner_name == "gumbel":
+                self._rollout_batch_deterministic(actions)
+            return
         todo, states = self.collect_leaf_states(actions)
         if not todo:
             return
         values = self.ctx.value_leaf_batch(states)
         self.scatter_leaf_values(todo, values)
+
+    def _rollout_batch_deterministic(self, actions: Sequence[int]) -> None:
+        """決定論 ``rollout_depth>1``: 候補群の入れ子探索を並走し ``_reward_cache`` を充填する
+
+        各候補の子を次倍率へ射影し中段 prior を per-row 連結 1 同期で引く各候補の入れ子探索
+        （sub_problem の planner）を同一スケジュールで並走させ葉評価を候補跨ぎで連結 1 同期へ
+        畳む探索算術は候補ごと逐次 _rollout と同一前向きは per-row 維持で各値が単体評価と
+        ビット同一のため reward は逐次 _rollout と完全一致する葉へ未到達の入れ子（``depth>2``）
+        は葉が充填されず後段の evaluate が逐次 _rollout へ退化する（正しさは保たれ速度のみ落ちる）
+        """
+        todo = [int(a) for a in actions if int(a) not in self._reward_cache]
+        if not todo:
+            return
+        next_layer = self.layer_idx + 1
+        sub_next_mag = self.ctx.magnifications[next_layer + 1]
+        sub_cpp = children_per_parent(
+            self.ctx.magnifications[next_layer], sub_next_mag
+        )
+        x_nexts: List[Tensor] = []
+        global_children: List[np.ndarray] = []
+        for action in todo:
+            feats = self._load_child(action)
+            with torch.no_grad():
+                x_nexts.append(self.ctx.model.projections[next_layer](feats))
+            global_children.append(
+                compute_child_indices(
+                    np.asarray([self._global_parent(action)], dtype=np.int64),
+                    None,
+                    children=self.cpp,
+                )
+            )
+        sub_priors = self.ctx.policy_prior_batch_numpy(x_nexts)
+        sub_problems: List["_ZoomSearchProblem"] = []
+        sub_planners: List = []
+        sub_states: List = []
+        for x_next, global_child, prior_np in zip(
+            x_nexts, global_children, sub_priors
+        ):
+            sub = _ZoomSearchProblem(
+                prior_np=prior_np,
+                x_fc=x_next,
+                layer_idx=next_layer,
+                next_mag=sub_next_mag,
+                cpp=sub_cpp,
+                global_idx=global_child,
+                rollout_depth=self.rollout_depth - 1,
+                seed=self.seed,
+                ctx=self.ctx,
+            )
+            planner = build_planner(
+                self.ctx.planner_name,
+                simulations=self.ctx.rollout_simulations,
+                max_considered=self.ctx.rollout_considered,
+                seed=self.seed,
+            )
+            sub_problems.append(sub)
+            sub_planners.append(planner)
+            sub_states.append(planner._prepare_candidates(sub))
+        # 入れ子群の候補葉を候補跨ぎで連結し 1 同期で充填（sub が葉到達のとき有効）
+        collected = [
+            sub.collect_leaf_states([int(c) for c in state.candidates])
+            for sub, state in zip(sub_problems, sub_states)
+        ]
+        values_list = self.ctx.value_leaf_batch_multi(
+            [states for _todo, states in collected]
+        )
+        for (sub_todo, _states), values, sub in zip(
+            collected, values_list, sub_problems
+        ):
+            sub.scatter_leaf_values(sub_todo, values)
+        # 各入れ子のラウンドと finalize で reward を確定（葉はキャッシュヒット）
+        for action, sub, planner, state in zip(
+            todo, sub_problems, sub_planners, sub_states
+        ):
+            for round_width in state.schedule:
+                planner._round_step(sub, state, round_width)
+            result = planner._finalize(state, num_select=1)
+            self._reward_cache[action] = sub.evaluate(int(result.chosen_actions[0]))
 
     def collect_round_states(
         self, action_counts: Dict[int, int]
