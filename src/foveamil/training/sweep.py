@@ -101,6 +101,9 @@ LOSS_TYPE_PARAM_KEYS = {
     "loss_cb_beta": LOSS_CLASS_BALANCED,
     "loss_ldam_max_margin": LOSS_LDAM,
 }
+# ordinal 補助損失の重みキーと 順序チェーンキー（重み 0 では順序チェーンは無関係）
+ORDINAL_AUX_WEIGHT_KEY = "ordinal_aux_weight"
+ORDINAL_CLASS_ORDER_KEY = "ordinal_class_order"
 # 倍率間冗長性罰則の重みキー（多倍率のみ有効）
 DECORRELATION_WEIGHT_KEY = "decorrelation_weight"
 # decorrelation_weight 有効時のみ意味を持つキー（無効時は無関係）
@@ -295,7 +298,8 @@ def _canonicalize_conditional(
     み意味を持つ（無効時は畳む）``decorrelation_weight`` は多倍率のみ有効（単一倍率では畳む）
     ``decorrelation_method`` は ``decorrelation_weight`` が正のときのみ意味を持つ（0 では畳む）
     損失ハイパラ（``loss_tau`` / ``loss_cb_beta`` / ``loss_ldam_max_margin``）は対応する
-    ``loss_type`` 値のときのみ意味を持つ（他では畳む）
+    ``loss_type`` 値のときのみ意味を持つ（他では畳む）``ordinal_class_order`` は
+    ``ordinal_aux_weight`` が正のときのみ意味を持つ（0 では畳む）
     畳んだキーは ``axis_values`` から落とし集計・表に載せない明示値を捨てたキー集合を返す（警告用）
     """
     discarded: set = set()
@@ -352,6 +356,12 @@ def _canonicalize_conditional(
         for key in DECORRELATION_PARAM_KEYS:
             if _disable_param(config, axis_values, defaults, key):
                 discarded.add(key)
+    ordinal_on = (
+        config.get(ORDINAL_AUX_WEIGHT_KEY, defaults[ORDINAL_AUX_WEIGHT_KEY]) > 0.0
+    )
+    if not ordinal_on:
+        if _disable_param(config, axis_values, defaults, ORDINAL_CLASS_ORDER_KEY):
+            discarded.add(ORDINAL_CLASS_ORDER_KEY)
     return discarded
 
 

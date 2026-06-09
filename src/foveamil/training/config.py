@@ -201,6 +201,7 @@ class TrainConfig:
         mixup_alpha: bag 表現 mixup の Beta 形状 α（0 で無効＝従来挙動，バッチサイズ 1 のため直前サンプルと混ぜる）
         sampler_temp: バランスサンプラ重みの温度（1.0 で現行，``<1`` で緩和 ``>1`` で強調，``is_weighted_sampler`` 時のみ有効）
         ordinal_aux_weight: クラス順序を活かす ordinal 補助損失の重み（0 で無効，クラス index の並びを順序とみなす）
+        ordinal_class_order: ordinal で順序を課すクラス index の昇順列（None で全クラス index 順，部分集合を与えると集合内のみ順序ペナルティ・集合外は名義）
         is_weighted_sampler: train で WeightedRandomSampler を使うか
         num_workers: DataLoader ワーカ数
         pin_memory: DataLoader の pin_memory
@@ -283,6 +284,7 @@ class TrainConfig:
     mixup_alpha: float = DEFAULT_MIXUP_ALPHA
     sampler_temp: float = DEFAULT_SAMPLER_TEMP
     ordinal_aux_weight: float = DEFAULT_ORDINAL_AUX_WEIGHT
+    ordinal_class_order: Optional[List[int]] = None
 
     is_weighted_sampler: bool = True
     num_workers: int = DEFAULT_NUM_WORKERS

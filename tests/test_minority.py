@@ -243,6 +243,73 @@ def test_ordinal_single_class_is_safe():
     assert torch.isfinite(out).all()
 
 
+def test_ordinal_class_order_none_matches_default():
+    # class_order=None は明示しない従来挙動と数値完全一致（bit 互換）
+    g = torch.Generator().manual_seed(0)
+    logits = torch.randn(8, 6, generator=g)
+    target = torch.tensor([0, 1, 2, 3, 4, 5, 2, 4])
+    base = OrdinalAuxLoss(n_cls=6)
+    explicit_none = OrdinalAuxLoss(n_cls=6, class_order=None)
+    assert torch.equal(base(logits, target), explicit_none(logits, target))
+
+
+def test_ordinal_class_order_subset_zero_when_perfect():
+    # 集合内クラスへ全質量＝期待ランクが正解ランクに一致し損失 0
+    loss = OrdinalAuxLoss(n_cls=5, class_order=[3, 0, 1])  # 3<0<1 のランク 0/1/2
+    logits = torch.full((1, 5), -10.0)
+    logits[0, 0] = 10.0  # クラス0（ランク1）に全質量
+    assert loss(logits, torch.tensor([0])).item() < 1e-6
+
+
+def test_ordinal_class_order_renormalizes_by_chain_mass():
+    # 集合外クラスへ質量が漏れても 集合内質量で再正規化され期待ランクは不変
+    loss = OrdinalAuxLoss(n_cls=5, class_order=[3, 0, 1])
+    logits = torch.full((1, 5), -10.0)
+    logits[0, 0] = 5.0  # 集合内 クラス0（ランク1・正解）
+    logits[0, 2] = 5.0  # 集合外 クラス2 へ同量漏らす
+    assert loss(logits, torch.tensor([0])).item() < 1e-6
+
+
+def test_ordinal_class_order_ignores_out_of_chain_targets():
+    # 正解が集合外のサンプルのみのバッチは順序信号なし＝寄与 0
+    loss = OrdinalAuxLoss(n_cls=5, class_order=[3, 0, 1])
+    logits = torch.randn(3, 5)
+    out = loss(logits, torch.tensor([2, 4, 2]))  # 2,4 は集合外
+    assert out.item() == 0.0
+
+
+def test_ordinal_class_order_subset_monotonic():
+    # 集合内で 正解ランクが遠いほど損失が大きい
+    loss = OrdinalAuxLoss(n_cls=5, class_order=[3, 0, 1])
+    logits = torch.full((1, 5), -10.0)
+    logits[0, 3] = 10.0  # クラス3（ランク0）に全質量
+    near = loss(logits, torch.tensor([0])).item()  # ランク1
+    far = loss(logits, torch.tensor([1])).item()  # ランク2
+    assert far > near
+
+
+def test_ordinal_class_order_gradient_flows():
+    loss = OrdinalAuxLoss(n_cls=5, class_order=[3, 0, 1])
+    logits = torch.randn(4, 5, requires_grad=True)
+    out = loss(logits, torch.tensor([3, 0, 1, 0]))
+    out.backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+    assert logits.grad.abs().sum() > 0
+
+
+def test_ordinal_class_order_validation():
+    import pytest
+
+    with pytest.raises(ValueError):
+        OrdinalAuxLoss(n_cls=5, class_order=[])
+    with pytest.raises(ValueError):
+        OrdinalAuxLoss(n_cls=5, class_order=[0, 0, 1])
+    with pytest.raises(ValueError):
+        OrdinalAuxLoss(n_cls=5, class_order=[0, 5])
+    with pytest.raises(ValueError):
+        OrdinalAuxLoss(n_cls=5, class_order=3)  # scalar はリスト誤指定＝明確に弾く
+
+
 # --- モデルの分割 forward が従来 forward_final と bit 互換 ---
 
 
