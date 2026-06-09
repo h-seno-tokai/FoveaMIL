@@ -132,6 +132,10 @@ DEFAULT_WARM_START_CHECKPOINT = None
 DEFAULT_FREEZE_BACKBONE_EPOCHS = 0
 # 既定の解凍後 LR スケール（0 で恒久凍結＝背骨は最後まで固定，>0 で相転移後に背骨を base×scale で共適応）
 DEFAULT_UNFREEZE_LR_SCALE = 0.0
+# 既定の探索カリキュラム warmup epoch 数（機構C・0 で無効＝探索予算を最初から full）
+DEFAULT_SEARCH_WARMUP_EPOCHS = 0
+# 既定の探索 warmup 中の模擬予算（warmup 中は depth=1＋この sim で探索を安くする）
+DEFAULT_SEARCH_WARMUP_SIMS = 8
 # 既定の bag 表現 mixup の Beta 形状 α（0 で無効＝従来挙動）
 DEFAULT_MIXUP_ALPHA = 0.0
 # 既定のバランスサンプラ温度（1.0 で現行＝重み不変）
@@ -220,6 +224,8 @@ class TrainConfig:
         warm_start_checkpoint: 機構M の背骨 warm-start チェックポイント（``None`` で無効，差別化版 best の ``.pt`` パス・``{fold}`` プレースホルダで fold 別に展開し背骨 projections/aggregators/head/aux_attentions を流用する search net は新規・CV リーク防止のため fold 一致必須，``mcts`` のみ有効）
         freeze_backbone_epochs: 機構M の背骨凍結 epoch 数（``0`` で無効，``>0`` で先頭 N epoch は背骨を requires_grad=False＋eval 固定し探索ネットのみ学習＝報酬 -CE を定常化する，``warm_start_checkpoint`` と併用）
         unfreeze_lr_scale: 機構M の解凍後 LR スケール（``0`` で恒久凍結＝背骨は最後まで固定，``>0`` で ``freeze_backbone_epochs`` 後に背骨を base×scale の低 LR で共適応させる）
+        search_warmup_epochs: 機構C の探索カリキュラム warmup epoch 数（``0`` で無効＝探索予算を最初から full，``>0`` で先頭 N epoch は depth=1＋``search_warmup_sims`` の安い探索にし後で full へ昇格＝探索ネット未学習の序盤の重い探索を省く，L/M と独立で warm-start 有無に依らず効く，``mcts`` のみ有効）
+        search_warmup_sims: 機構C の探索 warmup 中の模擬予算（``search_warmup_epochs>0`` の warmup 中に使う sim 数・``base`` より小さくして探索を安くする，``mcts`` のみ有効）
     """
 
     seed: int = DEFAULT_SEED
@@ -302,3 +308,5 @@ class TrainConfig:
     warm_start_checkpoint: Optional[str] = DEFAULT_WARM_START_CHECKPOINT
     freeze_backbone_epochs: int = DEFAULT_FREEZE_BACKBONE_EPOCHS
     unfreeze_lr_scale: float = DEFAULT_UNFREEZE_LR_SCALE
+    search_warmup_epochs: int = DEFAULT_SEARCH_WARMUP_EPOCHS
+    search_warmup_sims: int = DEFAULT_SEARCH_WARMUP_SIMS

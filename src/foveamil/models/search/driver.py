@@ -475,6 +475,8 @@ class MCTSZoomDriver(ZoomDriver):
         actor_critic_weight: float = 1.0,
         curriculum_warmup_epochs: int = 0,
         curriculum_value_lead_frac: float = 0.5,
+        search_warmup_epochs: int = 0,
+        search_warmup_sims: int = 8,
         seed: int = 0,
     ) -> None:
         super().__init__(model, num_layers)
@@ -503,6 +505,12 @@ class MCTSZoomDriver(ZoomDriver):
         self.base_actor_critic_weight = float(actor_critic_weight)
         self.curriculum_warmup_epochs = int(curriculum_warmup_epochs)
         self.curriculum_value_lead_frac = float(curriculum_value_lead_frac)
+        # 機構C 探索カリキュラム: warmup中は探索を安く（depth=1・少sim）し後で full へ昇格する
+        # 探索ネット未学習の序盤に重い探索を回す無駄を省く（warm-start の有無に依らず効く）
+        self.base_simulations = int(simulations)
+        self.base_rollout_depth = int(rollout_depth)
+        self.search_warmup_epochs = int(search_warmup_epochs)
+        self.search_warmup_sims = int(search_warmup_sims)
         self.seed = seed
 
         device = next(model.parameters()).device
@@ -514,6 +522,27 @@ class MCTSZoomDriver(ZoomDriver):
         model.add_module(VALUE_ATTR, self.value)
 
     def set_curriculum(self, epoch: int) -> None:
+        """epoch に応じ機構C（探索予算warmup）と機構L（損失重みramp）を適用する"""
+        self._curriculum_search_budget(epoch)
+        self._curriculum_loss_weights(epoch)
+
+    def _curriculum_search_budget(self, epoch: int) -> None:
+        """機構C: ``search_warmup_epochs`` 中は depth=1・少sim で探索を安くし後で full へ昇格する
+
+        ``search_warmup_epochs<=0`` なら base 据置（従来挙動）探索ネットが未学習で探索が
+        信号を持たない序盤に重い木探索を回す無駄を省く（L/M と独立・warm-start 有無に依らず効く）
+        """
+        sw = self.search_warmup_epochs
+        if sw <= 0:
+            return
+        if epoch < sw:
+            self.rollout_depth = 1
+            self.simulations = min(self.search_warmup_sims, self.base_simulations)
+        else:
+            self.rollout_depth = self.base_rollout_depth
+            self.simulations = self.base_simulations
+
+    def _curriculum_loss_weights(self, epoch: int) -> None:
         """機構L: epoch に応じ RL 損失重みを base から ramp する
 
         ``curriculum_warmup_epochs<=0`` なら base 据置（従来挙動）``>0`` なら value→policy→
@@ -574,6 +603,8 @@ class MCTSZoomDriver(ZoomDriver):
             actor_critic_weight=config.mcts_actor_critic_weight,
             curriculum_warmup_epochs=config.curriculum_warmup_epochs,
             curriculum_value_lead_frac=config.curriculum_value_lead_frac,
+            search_warmup_epochs=config.search_warmup_epochs,
+            search_warmup_sims=config.search_warmup_sims,
             seed=config.seed,
         )
 
@@ -681,6 +712,59 @@ class MCTSZoomDriver(ZoomDriver):
             context, logits, label, priors, improved, value_preds, M_list, selections
         )
         return logits, Y_hat, Y_prob, context
+
+    @torch.no_grad()
+    def probe_reward_variance(
+        self,
+        base_feats: Tensor,
+        magnifications: List[float],
+        child_loader: ChildLoader,
+        device: torch.device,
+        label: Tensor,
+        max_candidates: int = 32,
+    ) -> List[float]:
+        """機構M 診断: 各非最終層で候補ごとの leaf_ce を実計算し候補間 std を返す
+
+        凍結 backbone 下で「どの親を選ぶかで報酬（共有ヘッドの -CE）が変わるか」を測る
+        ``std≈0`` ならプーリング飽和＝選択無効でアボート判定に使う候補は層ごとに最大
+        ``max_candidates`` 個を seed 固定で無作為抽出し（policy 未学習バイアスを避ける）
+        降下は prefix 構築のため上位 ``k_sample`` を貪欲に選ぶ返り値は非最終層ごとの std
+        """
+        x = base_feats.to(device)
+        global_idx: Optional[np.ndarray] = None
+        m_list: List[Tensor] = []
+        layer_stds: List[float] = []
+        for layer_idx in range(self.num_layers):
+            M, x_fc = self._project_and_pool(x, layer_idx)
+            m_list.append(M)
+            if layer_idx >= self.num_layers - 1:
+                break
+            next_mag = magnifications[layer_idx + 1]
+            cpp = children_per_parent(magnifications[layer_idx], next_mag)
+            n = x_fc.shape[1]
+            rng = np.random.default_rng(self.seed + layer_idx * _LAYER_SEED_STRIDE)
+            cand = (
+                rng.choice(n, size=max_candidates, replace=False)
+                if n > max_candidates
+                else np.arange(n)
+            )
+            rewards: List[float] = []
+            for action in cand:
+                child = compute_child_indices(
+                    np.array([action]), global_idx, children=cpp
+                )
+                x_cand = child_loader(next_mag, child).to(device)
+                m_cand, _ = self._project_and_pool(x_cand, layer_idx + 1)
+                logits = self.model.classify(self.model.fuse_repr(m_list + [m_cand]))[0]
+                rewards.append(float(-F.cross_entropy(logits, label)))
+            layer_stds.append(float(np.std(rewards)) if len(rewards) > 1 else 0.0)
+            # prefix を進める貪欲降下（prior 上位 k_sample・探索は回さない）
+            prior = self.policy(x_fc).squeeze(0).detach().cpu().numpy()
+            order = np.argsort(-prior, kind="stable")
+            chosen = np.sort(order[: max(1, min(self.k_sample, n))])
+            x = child_loader(next_mag, compute_child_indices(chosen, global_idx, children=cpp)).to(device)
+            global_idx = compute_child_indices(chosen, global_idx, children=cpp)
+        return layer_stds
 
     def _leaf_rewards(
         self,

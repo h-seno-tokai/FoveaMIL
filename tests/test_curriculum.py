@@ -195,3 +195,28 @@ def test_param_groups_scale_without_search_nets_falls_back():
     groups = Trainer._optimizer_param_groups(_StubTrainer(model), lr=1e-4, search_lr_scale=0.1)
     params = list(groups)
     assert len(params) == len(list(model.parameters()))
+
+
+def test_search_curriculum_off_keeps_full_budget():
+    # 機構C off（search_warmup_epochs=0）では探索予算は常に full
+    d = _mcts_driver(search_warmup_epochs=0, mcts_simulations=32, mcts_rollout_depth=2)
+    for e in (0, 5, 99):
+        d.set_curriculum(e)
+        assert d.simulations == 32
+        assert d.rollout_depth == 2
+
+
+def test_search_curriculum_cheap_during_warmup_then_full():
+    # 機構C: warmup中は depth=1＋少sim で安く，warmup後に full へ昇格
+    d = _mcts_driver(
+        search_warmup_epochs=5, search_warmup_sims=4,
+        mcts_simulations=32, mcts_rollout_depth=2,
+    )
+    for e in range(0, 5):
+        d.set_curriculum(e)
+        assert d.simulations == 4
+        assert d.rollout_depth == 1
+    for e in (5, 6, 50):
+        d.set_curriculum(e)
+        assert d.simulations == 32
+        assert d.rollout_depth == 2
