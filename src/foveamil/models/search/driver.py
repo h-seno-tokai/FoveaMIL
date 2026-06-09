@@ -252,6 +252,36 @@ class _RolloutContext:
             policy_net.train(was_training)
         return [arr[i] for i in range(arr.shape[0])]
 
+    def value_leaf_batch_stochastic_multi(
+        self, x_states_list: List[Tensor]
+    ) -> List[List[float]]:
+        """複数入れ子の確率葉入力 ``[K_i, cpp, D]`` を K 軸連結し 1 前向きで標本化し復元する
+
+        各入れ子の ``[K_i, cpp, D]`` を K 軸で連結し train モードで 1 回前向きする行ごと独立な
+        dropout マスクで各標本は独立 MC dropout戻りは入れ子ごとの標本列へ復元する標本数は各
+        入れ子 ``K_i`` で厳密一致（連結は標本数を保存）RNG 配置は逐次と別のため値はビット非一致
+        だが統計的に同値``leaf_evals`` は連結総数で進める
+        """
+        sizes = [int(x.shape[0]) for x in x_states_list]
+        total = sum(sizes)
+        if total == 0:
+            return [[] for _ in x_states_list]
+        cat = torch.cat([x for x in x_states_list if x.shape[0] > 0], dim=0)
+        self.leaf_evals += total
+        was_training = self.value_net.training
+        self.value_net.train(True)
+        try:
+            with torch.no_grad():
+                values = self.value_net(cat).reshape(-1).cpu().tolist()
+        finally:
+            self.value_net.train(was_training)
+        result: List[List[float]] = []
+        offset = 0
+        for k in sizes:
+            result.append(values[offset : offset + k])
+            offset += k
+        return result
+
 
 class _ZoomSearchProblem(SearchProblem):
     """1 倍率のズーム決定を解く探索問題

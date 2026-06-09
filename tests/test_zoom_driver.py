@@ -1403,3 +1403,39 @@ def test_stochastic_prefetch_round_gradient_path_unchanged():
 
     assert grad_sum(model.search_policy) > 0
     assert grad_sum(model.search_value) > 0
+
+
+def test_value_leaf_batch_stochastic_multi_preserves_counts_and_independence():
+    """確率葉 K 軸連結 multi が入れ子ごとの標本数を保存し各標本が独立 MC dropout になる
+
+    複数入れ子の ``[K_i, cpp, D]`` を K 軸連結し 1 前向きした戻りが入れ子ごとに K_i 個へ復元
+    され（標本数厳密保存）leaf_evals が連結総数で進む同一入れ子内の複数行が dropout で変動する
+    ことで各標本が独立 MC dropout であると確認する
+    """
+    _, ctx, _ = _stochastic_problem()
+    cpp = children_per_parent(MAGS_2[0], MAGS_2[1])
+    x_list = [
+        torch.zeros(3, cpp, OUT_DIM),
+        torch.zeros(2, cpp, OUT_DIM),
+        torch.zeros(5, cpp, OUT_DIM),
+    ]
+    before = ctx.leaf_evals
+    result = ctx.value_leaf_batch_stochastic_multi(x_list)
+    assert [len(r) for r in result] == [3, 2, 5]
+    assert ctx.leaf_evals - before == 10
+    # 同一入力でも複数行が dropout で異なる（独立 MC dropout 標本）
+    same = torch.zeros(4, cpp, OUT_DIM)
+    r2 = ctx.value_leaf_batch_stochastic_multi([same])
+    assert len(set(r2[0])) > 1
+
+
+def test_value_leaf_batch_stochastic_multi_empty_returns_empty_per_problem():
+    """全入れ子が空入力なら problem ごとの空列を返し前向きしない"""
+    _, ctx, _ = _stochastic_problem()
+    cpp = children_per_parent(MAGS_2[0], MAGS_2[1])
+    before = ctx.leaf_evals
+    result = ctx.value_leaf_batch_stochastic_multi(
+        [torch.zeros(0, cpp, OUT_DIM), torch.zeros(0, cpp, OUT_DIM)]
+    )
+    assert result == [[], []]
+    assert ctx.leaf_evals == before

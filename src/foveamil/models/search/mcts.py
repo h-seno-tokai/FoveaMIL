@@ -306,9 +306,27 @@ class GumbelAlphaZeroPlanner(Planner):
         ラウンドの全評価（候補 a を per_action 回）を 1 バッチへ畳む確率的実装のみ有効
         （基底 no-op）標本数・独立性・期待値/分散構造は不変で forward/同期のみ畳まれる
         """
+        self._round_prefetch(problem, state, round_width)
+        self._round_consume(problem, state, round_width)
+
+    def _round_prefetch(
+        self, problem: SearchProblem, state: _GumbelRunState, round_width: int
+    ) -> None:
+        """ラウンドの全評価入力（active を per_action 回）を先取り充填する
+
+        ``active`` と ``per_action`` は ``_round_consume`` と同一に確定する（その間 state.active
+        は不変）複数 problem の prefetch を先に済ませ葉前向きを後段で連結 1 同期へ畳む分離点
+        """
         active = state.active[:round_width]
         per_action = max(1, state.sims_per_round // max(1, len(active)))
         problem.prefetch_round({int(a): per_action for a in active})
+
+    def _round_consume(
+        self, problem: SearchProblem, state: _GumbelRunState, round_width: int
+    ) -> None:
+        """先取り済みの評価を消費し Q/訪問を更新し次ラウンドの active を再ソートする"""
+        active = state.active[:round_width]
+        per_action = max(1, state.sims_per_round // max(1, len(active)))
         for action in active:
             for _ in range(per_action):
                 reward = float(problem.evaluate(int(action)))
