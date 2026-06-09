@@ -1078,6 +1078,78 @@ def test_prefetch_batch_preserves_gradient_path():
         assert torch.equal(ref[name], bat[name]), name
 
 
+# --- Phase 0 リファクタの seam 契約（collect/scatter/_batched_root_forward） ---
+
+
+def test_batched_root_forward_single_matches_per_slide():
+    """``_batched_root_forward([x_fc])`` が単体 policy/value 前向きとビット一致する
+
+    root 前向きはスライド毎 ``[1,N,D]`` のまま GEMM を跨ぎ再結合しない（cat バッチ化は
+    GatedAttention の Linear が非 bit-exact）1 要素 list へ factor した経路が従来の
+    ``policy(x_fc)`` / ``value(x_fc)`` と π テンソル・π numpy・v テンソルで一致するか確認する
+    """
+    _, driver = _build_seeded_mcts(num_layers=3)
+    driver.model.eval()
+    x_fc = torch.randn(1, 7, OUT_DIM)
+    ref_prior = driver.policy(x_fc).squeeze(0)
+    ref_value = driver.value(x_fc).squeeze(0)
+    priors, prior_nps, value_preds = driver._batched_root_forward([x_fc])
+    assert len(priors) == len(prior_nps) == len(value_preds) == 1
+    assert torch.equal(priors[0], ref_prior)
+    assert torch.equal(value_preds[0], ref_value)
+    assert np.array_equal(prior_nps[0], ref_prior.detach().cpu().numpy())
+
+
+def test_collect_scatter_leaf_states_compose_to_prefetch_batch():
+    """決定論葉の collect+value_leaf_batch+scatter が一括 prefetch_batch とビット一致する
+
+    収集 states は per-row ``[1,cpp,D]``・todo は未キャッシュ候補のみで，手合成した
+    ``_reward_cache`` が一括 prefetch_batch の ``_reward_cache`` と完全一致することを確認する
+    """
+    from foveamil.models.search.value import ValueNetwork
+
+    torch.manual_seed(3)
+    model = _model(num_layers=2)
+    value_net = ValueNetwork(OUT_DIM, HIDDEN, dropout=None)
+    value_net.eval()
+    actions = [0, 1, 2]
+    prob_a = _zoom_search_problem(model, value_net, stochastic=False)
+    prob_a.prefetch_batch(actions)
+    prob_b = _zoom_search_problem(model, value_net, stochastic=False)
+    todo, states = prob_b.collect_leaf_states(actions)
+    assert todo == actions
+    assert all(tuple(s.shape) == (1, prob_b.cpp, OUT_DIM) for s in states)
+    values = prob_b.ctx.value_leaf_batch(states)
+    prob_b.scatter_leaf_values(todo, values)
+    assert prob_a._reward_cache == prob_b._reward_cache
+
+
+def test_collect_round_states_shapes_and_scatter_compose():
+    """確率葉の collect_round_states が ``[ΣK,cpp,D]`` を返し scatter が FIFO へ正しく積む
+
+    候補ごとの repeat 回数 ``counts`` の総和が K 軸長と一致し，scatter_round_samples が
+    actions/counts 順に標本を切り出し各候補の独立標本キューへ積むことを確認する
+    """
+    from foveamil.models.search.policy import PolicyNetwork
+    from foveamil.models.search.value import ValueNetwork
+
+    torch.manual_seed(4)
+    model = _model(num_layers=2)
+    model.add_module("search_policy", PolicyNetwork(OUT_DIM, HIDDEN, 0.5))
+    value_net = ValueNetwork(OUT_DIM, HIDDEN, dropout=0.5)
+    model.train()
+    value_net.train()
+    problem = _zoom_search_problem(model, value_net, stochastic=True)
+    actions, counts, x_next = problem.collect_round_states({0: 2, 1: 3})
+    assert actions == [0, 1]
+    assert counts == [2, 3]
+    assert tuple(x_next.shape) == (5, problem.cpp, OUT_DIM)
+    samples = problem.ctx.value_leaf_batch_stochastic(x_next)
+    problem.scatter_round_samples(actions, counts, samples)
+    assert [problem.evaluate(0) for _ in range(2)] == samples[:2]
+    assert [problem.evaluate(1) for _ in range(3)] == samples[2:]
+
+
 def test_mcts_rollout_simulations_default_matches_simulations():
     """``mcts_rollout_simulations=None``（既定）は ``mcts_simulations`` と同値"""
     model = _model(num_layers=3)

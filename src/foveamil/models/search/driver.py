@@ -342,6 +342,36 @@ class _ZoomSearchProblem(SearchProblem):
             self._reward_cache[action] = reward
         return reward
 
+    def collect_leaf_states(
+        self, actions: Sequence[int]
+    ) -> Tuple[List[int], List[Tensor]]:
+        """葉到達候補の射影済み状態 ``[1, cpp, D]`` の list を ``(todo, states)`` で返す
+
+        確率時・更に展開できる候補・全キャッシュ済みなら ``([], [])`` を返す未キャッシュ
+        候補のみ子を ``[m, cpp, D_in]`` へ stack し射影を 1 回（候補軸独立で batched GEMM
+        は per-row とビット同一）で通し per-row ``[1, cpp, D]`` へ割って返す価値ネット前向き
+        は行わず射影済み状態のみ返す
+        """
+        if self.ctx.stochastic:
+            return [], []
+        if self.rollout_depth > 1 and self._can_expand():
+            return [], []
+        todo = [int(a) for a in actions if int(a) not in self._reward_cache]
+        if not todo:
+            return [], []
+        feats = torch.cat([self._load_child(a) for a in todo], dim=0)
+        with torch.no_grad():
+            x_next = self.ctx.model.projections[self.layer_idx + 1](feats)
+        states = [x_next[i : i + 1] for i in range(x_next.shape[0])]
+        return todo, states
+
+    def scatter_leaf_values(
+        self, todo: Sequence[int], values: Sequence[float]
+    ) -> None:
+        """葉評価値を ``_reward_cache`` へ書き戻す（``collect_leaf_states`` の対）"""
+        for action, value in zip(todo, values):
+            self._reward_cache[int(action)] = value
+
     def prefetch_batch(self, actions: Sequence[int]) -> None:
         """候補集合 ``actions`` の葉評価を先に計算し ``_reward_cache`` を充填する
 
@@ -356,22 +386,52 @@ class _ZoomSearchProblem(SearchProblem):
         ``rollout_depth>1`` で更に展開できる候補は入れ子 planner.run が逐次依存のため
         バッチ化対象外として何もしない（葉到達時のバッチ化は入れ子側で効く）
         """
-        if self.ctx.stochastic:
-            return
-        if self.rollout_depth > 1 and self._can_expand():
-            return
-        todo = [int(a) for a in actions if int(a) not in self._reward_cache]
+        todo, states = self.collect_leaf_states(actions)
         if not todo:
             return
-        # 射影は候補軸独立で batched GEMM が per-row とビット同一のため 1 回で射影し，
-        # value-net は行ごと前向き＋末尾 1 同期で per-leaf 評価とビット同一に保つ
-        feats = torch.cat([self._load_child(a) for a in todo], dim=0)
+        values = self.ctx.value_leaf_batch(states)
+        self.scatter_leaf_values(todo, values)
+
+    def collect_round_states(
+        self, action_counts: Dict[int, int]
+    ) -> Tuple[List[int], List[int], Optional[Tensor]]:
+        """確率時 1 ラウンドの全葉評価入力 ``[K, cpp, D]`` を ``(actions, counts, x_next)`` で返す
+
+        非確率・葉非到達・候補皆無なら ``([], [], None)`` を返す各候補の子を
+        ``action_counts[a]`` 回 repeat して ``[K, cpp, D_in]`` へ並べ射影を 1 回通すが
+        value-net 前向きは行わず射影済み入力のみ返す repeat は射影前の特徴段で行い
+        per-leaf と同じく行ごと独立な dropout マスクが引かれる（射影は train モードのまま回る）
+        """
+        if not self.ctx.stochastic:
+            return [], [], None
+        if not self._reaches_leaf():
+            return [], [], None
+        actions = [int(a) for a, c in action_counts.items() if int(c) > 0]
+        if not actions:
+            return [], [], None
+        counts = [int(action_counts[a]) for a in actions]
+        feat_rows: List[Tensor] = []
+        for action, count in zip(actions, counts):
+            child = self._load_child(action)
+            feat_rows.append(child.expand(count, -1, -1))
+        feats = torch.cat(feat_rows, dim=0)
         with torch.no_grad():
             x_next = self.ctx.model.projections[self.layer_idx + 1](feats)
-        states = [x_next[i : i + 1] for i in range(x_next.shape[0])]
-        values = self.ctx.value_leaf_batch(states)
-        for action, value in zip(todo, values):
-            self._reward_cache[action] = value
+        return actions, counts, x_next
+
+    def scatter_round_samples(
+        self, actions: Sequence[int], counts: Sequence[int], samples: Sequence[float]
+    ) -> None:
+        """確率標本を候補ごとの FIFO へ積む（``collect_round_states`` の対）
+
+        ``actions``/``counts`` 順に ``samples`` を切り出し各候補の標本キューへ extend する
+        """
+        offset = 0
+        for action, count in zip(actions, counts):
+            self._stochastic_samples.setdefault(int(action), []).extend(
+                samples[offset : offset + count]
+            )
+            offset += count
 
     def prefetch_round(self, action_counts: Dict[int, int]) -> None:
         """確率時 1 ラウンドの全葉評価（候補 ``a`` を ``action_counts[a]`` 回）を一括前向きする
@@ -380,38 +440,16 @@ class _ZoomSearchProblem(SearchProblem):
         最深層手前）のみ対象で，更に展開する候補は入れ子 planner.run が逐次依存のため
         何もしない（葉到達時のバッチ化は入れ子側の prefetch_round で効く）
 
-        各候補の子特徴を ``action_counts[a]`` 回 repeat して ``[K, cpp, D_in]`` へ並べ，
-        射影→value-net を 1 回ずつ前向きする射影・value-net とも train モードのまま回る
-        ため per-leaf 経路と同じく行ごとに独立な dropout マスクが引かれ，候補 ``a`` は
-        ``action_counts[a]`` 個の独立 MC dropout 標本を持つ（標本数・独立性・期待値/分散
-        構造は不変）得た標本は候補ごとの FIFO へ積み，以後の :meth:`evaluate` が 1 個ずつ
-        取り出す forward と GPU→CPU 同期だけがラウンド単位 1 回へ畳まれる（RNG 配置は逐次
-        と別のため値はビット非一致だが統計的に同値）
+        得た標本は候補ごとの FIFO へ積み以後の :meth:`evaluate` が 1 個ずつ取り出す候補
+        ``a`` は依然 ``action_counts[a]`` 個の独立 MC dropout 標本を持つ（標本数・独立性・
+        期待値/分散構造は不変・RNG 配置は逐次と別のため値はビット非一致だが統計的に同値）
+        forward と GPU→CPU 同期だけがラウンド単位 1 回へ畳まれる
         """
-        if not self.ctx.stochastic:
+        actions, counts, x_next = self.collect_round_states(action_counts)
+        if x_next is None:
             return
-        if not self._reaches_leaf():
-            return
-        actions = [int(a) for a, c in action_counts.items() if int(c) > 0]
-        if not actions:
-            return
-        counts = [int(action_counts[a]) for a in actions]
-        # 候補ごとに子を repeat 回数ぶん並べる射影・value-net を行ごと独立 dropout で通すため
-        # repeat は射影前の特徴段で行う（per-leaf と同じく行ごとに独立マスクが引かれる）
-        feat_rows: List[Tensor] = []
-        for action, count in zip(actions, counts):
-            child = self._load_child(action)
-            feat_rows.append(child.expand(count, -1, -1))
-        feats = torch.cat(feat_rows, dim=0)
-        with torch.no_grad():
-            x_next = self.ctx.model.projections[self.layer_idx + 1](feats)
         samples = self.ctx.value_leaf_batch_stochastic(x_next)
-        offset = 0
-        for action, count in zip(actions, counts):
-            self._stochastic_samples.setdefault(action, []).extend(
-                samples[offset : offset + count]
-            )
-            offset += count
+        self.scatter_round_samples(actions, counts, samples)
 
 
 class MCTSZoomDriver(ZoomDriver):
@@ -587,6 +625,30 @@ class MCTSZoomDriver(ZoomDriver):
         M, _ = self.model.aggregators[layer_idx](x_fc)
         return M, x_fc
 
+    def _batched_root_forward(
+        self, x_fc_list: List[Tensor]
+    ) -> Tuple[List[Tensor], List[np.ndarray], List[Tensor]]:
+        """各スライドの射影特徴 ``x_fc`` ``[1, N, D]`` の list から root の π・v を前向きする
+
+        policy/value はスライド毎に ``[1, N, D]`` で前向きし GEMM をスライド跨ぎで再結合
+        しない（GatedAttention の Linear が cat バッチで再結合し非 bit-exact になる）生成
+        した π テンソルを保持し末尾で 1 回だけ ``.cpu().numpy()`` して GPU→CPU 同期を要素数
+        ``B→1`` へ畳む（``B=1`` は従来と完全一致）順序は per-slide 参照と同じくスライド毎に
+        policy→value を引き末尾で π を一括 cpu 化する
+
+        Returns:
+            priors: 各スライドの π テンソル ``[N]``（squeeze 済み・勾配経路維持）
+            prior_nps: 各スライドの π の numpy ``[N]``（planner 入力・1 同期で取得）
+            value_preds: 各スライドの v テンソル ``[1]``（squeeze 済み・勾配経路維持）
+        """
+        priors: List[Tensor] = []
+        value_preds: List[Tensor] = []
+        for x_fc in x_fc_list:
+            priors.append(self.policy(x_fc).squeeze(0))
+            value_preds.append(self.value(x_fc).squeeze(0))
+        prior_nps = [p.detach().cpu().numpy() for p in priors]
+        return priors, prior_nps, value_preds
+
     def run(
         self,
         base_feats: Tensor,
@@ -628,13 +690,18 @@ class MCTSZoomDriver(ZoomDriver):
             next_mag = magnifications[layer_idx + 1]
             cpp = children_per_parent(cur_mag, next_mag)
 
-            prior = self.policy(x_fc).squeeze(0)
-            value_preds.append(self.value(x_fc).squeeze(0))
+            # root の π・v はスライド毎 [1,N,D] 前向き（GEMM 跨ぎ再結合なし）
+            layer_priors, layer_prior_nps, layer_value_preds = (
+                self._batched_root_forward([x_fc])
+            )
+            prior = layer_priors[0]
+            prior_np = layer_prior_nps[0]
+            value_preds.append(layer_value_preds[0])
             priors.append(prior)
 
             layer_seed = self.seed + layer_idx * _LAYER_SEED_STRIDE
             problem = _ZoomSearchProblem(
-                prior_np=prior.detach().cpu().numpy(),
+                prior_np=prior_np,
                 x_fc=x_fc,
                 layer_idx=layer_idx,
                 next_mag=next_mag,
