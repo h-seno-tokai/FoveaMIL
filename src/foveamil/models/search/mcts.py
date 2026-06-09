@@ -122,6 +122,20 @@ class SearchProblem(abc.ABC):
             actions: 先に評価する候補 index 列
         """
 
+    def prefetch_round(self, action_counts: Dict[int, int]) -> None:
+        """1 ラウンドで候補 ``a`` を ``action_counts[a]`` 回評価する分を先に一括計算する
+
+        基底は何もしない（後方互換）確率的葉評価をする実装が，この呼び出しで候補 ``a``
+        を ``action_counts[a]`` 回 repeat した状態を 1 テンソルへ並べ value-net を 1 回だけ
+        前向き（train モード＝dropout 有効）し，得た独立標本を候補ごとの FIFO へ積む
+        以後の per-action :meth:`evaluate` はこの FIFO から 1 標本ずつ取り出す各候補は
+        依然 ``action_counts[a]`` 個の独立標本を持ち（標本数・独立性・分散構造は不変）
+        forward と GPU→CPU 同期だけがラウンド単位 1 回へ畳まれる
+
+        Args:
+            action_counts: 候補 index → このラウンドでの評価回数
+        """
+
 
 @dataclass
 class PlannerResult:
@@ -238,8 +252,12 @@ class GumbelAlphaZeroPlanner(Planner):
         active = list(candidates)
         for round_width in schedule:
             active = active[:round_width]
+            per_action = max(1, sims_per_round // max(1, len(active)))
+            # ラウンドの全評価（候補 a を per_action 回）を 1 バッチへ畳む確率的実装のみ有効
+            # （基底 no-op）標本数・独立性・期待値/分散構造は不変で forward/同期のみ畳まれる
+            problem.prefetch_round({int(a): per_action for a in active})
             for action in active:
-                for _ in range(max(1, sims_per_round // max(1, len(active)))):
+                for _ in range(per_action):
                     reward = float(problem.evaluate(int(action)))
                     q_sum[action] += reward
                     visit_counts[action] += 1

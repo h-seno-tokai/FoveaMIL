@@ -165,6 +165,31 @@ class _RolloutContext:
         finally:
             self.value_net.train(was_training)
 
+    def value_leaf_batch_stochastic(self, x_states: Tensor) -> List[float]:
+        """確率的葉評価を ``[K, cpp, D]`` の 1 バッチで前向きし ``[K]`` を返す
+
+        train モード（dropout 有効）で value-net を 1 回だけ前向きする各行は独立な
+        MC dropout 標本（dropout マスクはバッチ軸も独立に引かれる）であり，per-leaf を
+        K 回個別に前向きしたのと同じ標本数・独立性・期待値/分散構造を持つ（RNG 配置は
+        逐次と別のためビット非一致だが統計的に同値）末尾で 1 回だけ ``.cpu().tolist()``
+        し per-leaf の GPU→CPU 同期 K 回をラウンド単位 1 回へ畳む``leaf_evals`` は件数で進める
+
+        Args:
+            x_states: 射影済み状態 ``[K, cpp, D]``（candidate を repeat 済み）
+
+        Returns:
+            各行のスカラ価値 ``[K]``
+        """
+        self.leaf_evals += int(x_states.shape[0])
+        was_training = self.value_net.training
+        self.value_net.train(True)
+        try:
+            with torch.no_grad():
+                values = self.value_net(x_states).reshape(-1)
+            return values.cpu().tolist()
+        finally:
+            self.value_net.train(was_training)
+
     def policy_prior(self, x_next: Tensor) -> Tensor:
         """rollout 中段の方策事前 ``π(a|state)`` を勾配なしで返す（探索シグナル）
 
@@ -224,6 +249,8 @@ class _ZoomSearchProblem(SearchProblem):
         self.seed = int(seed)
         self.ctx = ctx
         self._reward_cache: Dict[int, float] = {}
+        # 確率時のラウンド先取り標本（候補 index → 独立標本の FIFO）
+        self._stochastic_samples: Dict[int, List[float]] = {}
 
     def num_actions(self) -> int:
         return self._prior.shape[0]
@@ -246,6 +273,10 @@ class _ZoomSearchProblem(SearchProblem):
     def _can_expand(self) -> bool:
         """次倍率の子を更に展開できるか（最深層手前まで）を返す"""
         return self.layer_idx + 1 < self.ctx.num_layers - 1
+
+    def _reaches_leaf(self) -> bool:
+        """``evaluate`` が再帰せず直接価値ネットの葉評価へ到達するかを返す"""
+        return not (self.rollout_depth > 1 and self._can_expand())
 
     def _rollout(self, x_next: Tensor, global_child: np.ndarray) -> float:
         """子状態 ``x_next`` を 1 段深く展開し最深状態の価値を返す（再帰）
@@ -290,6 +321,11 @@ class _ZoomSearchProblem(SearchProblem):
             cached = self._reward_cache.get(action)
             if cached is not None:
                 return cached
+        else:
+            queued = self._stochastic_samples.get(action)
+            if queued:
+                # ラウンド先取りで一括前向き済みの独立標本を 1 個取り出す（FIFO）
+                return queued.pop(0)
         feats = self._load_child(action)
         with torch.no_grad():
             x_next = self.ctx.model.projections[self.layer_idx + 1](feats)
@@ -336,6 +372,46 @@ class _ZoomSearchProblem(SearchProblem):
         values = self.ctx.value_leaf_batch(states)
         for action, value in zip(todo, values):
             self._reward_cache[action] = value
+
+    def prefetch_round(self, action_counts: Dict[int, int]) -> None:
+        """確率時 1 ラウンドの全葉評価（候補 ``a`` を ``action_counts[a]`` 回）を一括前向きする
+
+        確率的なときに限り有効（既定 no-op）葉へ直接到達する問題（``rollout_depth<=1`` か
+        最深層手前）のみ対象で，更に展開する候補は入れ子 planner.run が逐次依存のため
+        何もしない（葉到達時のバッチ化は入れ子側の prefetch_round で効く）
+
+        各候補の子特徴を ``action_counts[a]`` 回 repeat して ``[K, cpp, D_in]`` へ並べ，
+        射影→value-net を 1 回ずつ前向きする射影・value-net とも train モードのまま回る
+        ため per-leaf 経路と同じく行ごとに独立な dropout マスクが引かれ，候補 ``a`` は
+        ``action_counts[a]`` 個の独立 MC dropout 標本を持つ（標本数・独立性・期待値/分散
+        構造は不変）得た標本は候補ごとの FIFO へ積み，以後の :meth:`evaluate` が 1 個ずつ
+        取り出す forward と GPU→CPU 同期だけがラウンド単位 1 回へ畳まれる（RNG 配置は逐次
+        と別のため値はビット非一致だが統計的に同値）
+        """
+        if not self.ctx.stochastic:
+            return
+        if not self._reaches_leaf():
+            return
+        actions = [int(a) for a, c in action_counts.items() if int(c) > 0]
+        if not actions:
+            return
+        counts = [int(action_counts[a]) for a in actions]
+        # 候補ごとに子を repeat 回数ぶん並べる射影・value-net を行ごと独立 dropout で通すため
+        # repeat は射影前の特徴段で行う（per-leaf と同じく行ごとに独立マスクが引かれる）
+        feat_rows: List[Tensor] = []
+        for action, count in zip(actions, counts):
+            child = self._load_child(action)
+            feat_rows.append(child.expand(count, -1, -1))
+        feats = torch.cat(feat_rows, dim=0)
+        with torch.no_grad():
+            x_next = self.ctx.model.projections[self.layer_idx + 1](feats)
+        samples = self.ctx.value_leaf_batch_stochastic(x_next)
+        offset = 0
+        for action, count in zip(actions, counts):
+            self._stochastic_samples.setdefault(action, []).extend(
+                samples[offset : offset + count]
+            )
+            offset += count
 
 
 class MCTSZoomDriver(ZoomDriver):

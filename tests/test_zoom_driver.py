@@ -1093,3 +1093,180 @@ def test_mcts_rollout_simulations_knob_sets_rollout_budget():
     )
     assert driver.simulations == 8
     assert driver.rollout_simulations == 3
+
+
+# --- 確率時葉評価バッチ化の統計的同値（per-leaf 参照との標本数一致・分布近接） ---
+
+
+def _stochastic_problem(num_actions=6, dropout=0.5):
+    """確率設定の ``_ZoomSearchProblem`` と共有 ``_RolloutContext`` を作る
+
+    確率時バッチ化（``prefetch_round`` 経由）と per-leaf 参照の標本数・分布を比べる
+    最小木で価値ネット・方策ネットを ``dropout`` 付きにし MC dropout で標本化する
+    """
+    from foveamil.models.search.driver import _RolloutContext, _ZoomSearchProblem
+    from foveamil.models.search.policy import PolicyNetwork
+    from foveamil.models.search.value import ValueNetwork
+
+    torch.manual_seed(5)
+    model = _model(num_layers=2)
+    value_net = ValueNetwork(OUT_DIM, HIDDEN, dropout=dropout)
+    model.add_module("search_policy", PolicyNetwork(OUT_DIM, HIDDEN, dropout))
+    model.train()
+    value_net.train()
+    ctx = _RolloutContext(
+        model=model,
+        value_net=value_net,
+        child_loader=_seeded_child_loader(),
+        magnifications=MAGS_2,
+        num_layers=2,
+        planner_name="gumbel",
+        rollout_simulations=4,
+        rollout_considered=4,
+        stochastic=True,
+        device=torch.device("cpu"),
+    )
+    problem = _ZoomSearchProblem(
+        prior_np=np.full(num_actions, 1.0 / num_actions),
+        x_fc=torch.zeros(1, num_actions, OUT_DIM),
+        layer_idx=0,
+        next_mag=MAGS_2[1],
+        cpp=children_per_parent(MAGS_2[0], MAGS_2[1]),
+        global_idx=None,
+        rollout_depth=1,
+        seed=0,
+        ctx=ctx,
+    )
+    return model, ctx, problem
+
+
+def _run_stochastic_planner(force_per_leaf, run_seed, simulations=32):
+    """確率時 planner を回し ``(result, leaf_evals)`` を返す
+
+    ``force_per_leaf=True`` で ``prefetch_round`` を基底 no-op へ退化させ per-action
+    ``evaluate`` を単体 MC dropout 葉評価へ強制する（＝改修前と同一の per-leaf 経路）
+    """
+    from unittest import mock
+
+    from foveamil.models.search import mcts as mcts_mod
+    from foveamil.models.search.driver import _ZoomSearchProblem
+    from foveamil.models.search.mcts import build_planner
+
+    _, ctx, problem = _stochastic_problem()
+    patches = []
+    if force_per_leaf:
+        patches.append(
+            mock.patch.object(
+                _ZoomSearchProblem,
+                "prefetch_round",
+                mcts_mod.SearchProblem.prefetch_round,
+            )
+        )
+    for patch in patches:
+        patch.start()
+    try:
+        planner = build_planner(
+            "gumbel", simulations=simulations, max_considered=8, seed=0
+        )
+        torch.manual_seed(run_seed)
+        result = planner.run(problem, num_select=1)
+        return result, ctx.leaf_evals
+    finally:
+        for patch in patches:
+            patch.stop()
+
+
+def test_stochastic_prefetch_round_preserves_sample_count():
+    """確率時バッチ化が per-leaf 参照と同一の葉評価件数（独立標本数）を引く
+
+    Gumbel sequential-halving のラウンド予算 Σn_i は経路に依らず固定であり，バッチ化は
+    その予算を 1 forward へ畳むだけで標本数・独立性を変えない``leaf_evals`` と訪問総数が
+    per-leaf 参照と完全一致することで，candidate ごとの独立標本数が保存されると確認する
+    """
+    ref, ev_ref = _run_stochastic_planner(force_per_leaf=True, run_seed=1)
+    bat, ev_bat = _run_stochastic_planner(force_per_leaf=False, run_seed=1)
+    assert ev_ref == ev_bat
+    assert int(ref.visit_counts.sum()) == int(bat.visit_counts.sum())
+
+
+def test_stochastic_prefetch_round_value_distribution_matches_per_leaf():
+    """確率時バッチ化の Q 推定分布が per-leaf 参照と統計的に一致する（平均・分散近接）
+
+    バッチ dropout マスクは逐次と別配置のため値はビット非一致だが，期待値/分散構造は
+    不変である多シードで Q 値の平均・標準偏差を集め，両経路で近接することを確認する
+    """
+    seeds = range(2000, 2120)
+    q_ref = np.array(
+        [_run_stochastic_planner(True, s)[0].q_values for s in seeds]
+    )
+    q_bat = np.array(
+        [_run_stochastic_planner(False, s)[0].q_values for s in seeds]
+    )
+    # 平均・標準偏差が近接（MC dropout の有限標本ゆらぎを許容する緩い閾値）
+    assert abs(q_ref.mean() - q_bat.mean()) < 0.03
+    assert abs(q_ref.std() - q_bat.std()) < 0.03
+
+
+def test_stochastic_prefetch_round_independent_samples_vary():
+    """確率時バッチ化でも同一候補の複数評価が独立標本で値が変動する（memoize 撤廃を維持）
+
+    ラウンド先取りで一括前向きした標本も candidate ごとの独立標本であり，同一候補を
+    複数回評価すると MC dropout で値が異なる（バッチ化が標本独立性を壊さない）
+    """
+    _, _, problem = _stochastic_problem()
+    torch.manual_seed(7)
+    # 1 ラウンド分の先取りを張り同一候補から複数標本を取り出す
+    problem.prefetch_round({0: 3})
+    samples = [problem.evaluate(0) for _ in range(3)]
+    assert len(set(samples)) > 1
+
+
+def test_stochastic_prefetch_round_noop_when_deterministic():
+    """非確率（既定）では ``prefetch_round`` は no-op で標本キューを張らない"""
+    from foveamil.models.search.driver import _RolloutContext, _ZoomSearchProblem
+    from foveamil.models.search.value import ValueNetwork
+
+    torch.manual_seed(0)
+    model = _model(num_layers=2)
+    value_net = ValueNetwork(OUT_DIM, HIDDEN, dropout=0.5)
+    problem = _zoom_search_problem(model, value_net, stochastic=False)
+    problem.prefetch_round({0: 4, 1: 4})
+    assert problem._stochastic_samples == {}
+
+
+def test_stochastic_prefetch_round_gradient_path_unchanged():
+    """確率時バッチ化は学習勾配経路を変えない（policy/value/共有ヘッドへ勾配が流れる）
+
+    葉評価は no_grad で勾配を流さず学習勾配は run 本体の policy/value/select_weight 経由
+    のため，確率時バッチ化でも方策・価値・共有ヘッドへ勾配が流れる（>0）ことを確認する
+    """
+    torch.manual_seed(0)
+    model = _model(num_layers=3)
+    driver = build_zoom_driver(
+        _mcts_config(
+            mcts_eval_stochastic=True,
+            drop_out=0.5,
+            mcts_value_target="leaf_ce",
+            mcts_simulations=16,
+            mcts_max_considered=8,
+        ),
+        model,
+    )
+    model.train()
+    base = torch.randn(1, 12, IN_DIM)
+    label = torch.tensor([1])
+    _, _, _, ctx = driver.run(
+        base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+    )
+    model.zero_grad()
+    sum(ctx.extra_losses.values()).backward()
+
+    def grad_sum(module):
+        return sum(
+            p.grad.abs().sum().item()
+            for p in module.parameters()
+            if p.grad is not None
+        )
+
+    assert grad_sum(model.search_policy) > 0
+    assert grad_sum(model.search_value) > 0
