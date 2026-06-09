@@ -310,19 +310,29 @@ class Trainer:
             beta=config.loss_cb_beta,
             ldam_max_margin=config.loss_ldam_max_margin,
         ).to(self.device)
+        # 機構M(freeze_backbone_epochs>0)では背骨を別 group(unfreeze_lr_scale)に分け相転移で
+        # 解凍する恒久凍結(unfreeze=0)なら group LR=0＋requires_grad=False で背骨は静止する
+        self._base_lr = config.lr
+        self._unfrozen = False
+        self._backbone_group_idx = None
+        backbone_params, search_params = self._split_backbone_search_params()
+        if config.freeze_backbone_epochs > 0 and search_params:
+            self._backbone_group_idx = 0
+            param_groups = [
+                {"params": backbone_params, "lr": config.lr * config.unfreeze_lr_scale},
+                {"params": search_params, "lr": config.lr * config.search_lr_scale},
+            ]
+        else:
+            # 機構M off または探索ネット無し(非mcts＝Mは warm-start+MCTS 前提)では単一/L group に畳む
+            param_groups = self._optimizer_param_groups(config.lr, config.search_lr_scale)
         self.optimizer = optim.Adam(
-            self._optimizer_param_groups(config.lr, config.search_lr_scale),
+            param_groups,
             lr=config.lr,
             betas=ADAM_BETAS,
             eps=ADAM_EPS,
             weight_decay=config.reg,
         )
-        self.scheduler = ReduceLROnPlateau(
-            self.optimizer,
-            mode=SCHEDULER_MODE,
-            factor=config.scheduler_decay_rate,
-            patience=config.scheduler_patience,
-        )
+        self.scheduler = self._build_scheduler()
         self.model_saver = ModelSaver(
             self.save_path, config.save_metric, weights_dir=self.weights_dir
         )
@@ -393,6 +403,59 @@ class Trainer:
             module.requires_grad_(not frozen)
             module.train(not frozen)
 
+    def _split_backbone_search_params(self):
+        """背骨(非search)と探索ネット(search_policy/value)のパラメータ列を分けて返す"""
+        from foveamil.models.search.driver import POLICY_ATTR, VALUE_ATTR
+
+        search_params = [
+            param
+            for attr in (POLICY_ATTR, VALUE_ATTR)
+            for module in [getattr(self.model, attr, None)]
+            if module is not None
+            for param in module.parameters()
+        ]
+        search_ids = {id(param) for param in search_params}
+        backbone_params = [
+            param for param in self.model.parameters() if id(param) not in search_ids
+        ]
+        return backbone_params, search_params
+
+    def _build_scheduler(self):
+        """``ReduceLROnPlateau`` を構築する（機構M の相転移で作り直すため factor 化）"""
+        return ReduceLROnPlateau(
+            self.optimizer,
+            mode=SCHEDULER_MODE,
+            factor=self.config.scheduler_decay_rate,
+            patience=self.config.scheduler_patience,
+        )
+
+    def _maybe_unfreeze_transition(self, epoch: int) -> None:
+        """機構M: ``freeze_backbone_epochs`` 到達時に背骨を解凍し co-adapt 相へ移る
+
+        ``unfreeze_lr_scale>0`` のときのみ作動し背骨・探索の両 group LR を base×scale へ復元（凍結相の
+        ReduceLROnPlateau 減衰を打ち消し clean な共適応 LR で始める探索は warm な Adam 状態を保つが
+        LR は復元する）＋scheduler を作り直す（凍結相の val 停滞で patience が早期発火し共適応相の LR を
+        絞る罠を避ける）一度だけ実行する
+        """
+        if self._unfrozen or self._backbone_group_idx is None:
+            return
+        if self.config.unfreeze_lr_scale <= 0.0 or epoch < self.config.freeze_backbone_epochs:
+            return
+        self._unfrozen = True
+        self._set_backbone_frozen(False)
+        self.optimizer.param_groups[self._backbone_group_idx]["lr"] = (
+            self._base_lr * self.config.unfreeze_lr_scale
+        )
+        self.optimizer.param_groups[1 - self._backbone_group_idx]["lr"] = (
+            self._base_lr * self.config.search_lr_scale
+        )
+        self.scheduler = self._build_scheduler()
+        logger.info(
+            "機構M: epoch %d で背骨を解凍 co-adapt 相へ（背骨LR=base×%.4f）",
+            epoch,
+            self.config.unfreeze_lr_scale,
+        )
+
     def _load_warm_start(self) -> None:
         """機構M: 差別化版 best の背骨を流用する（search net は新規・fold 一致で CV リーク防止）
 
@@ -400,11 +463,7 @@ class Trainer:
         背骨をロードする欠損キーが search net 以外にある・余剰キーがある場合は流用契約違反として
         fail-fast する（背骨アーキ不一致の早期検出）
         """
-        # 機構M の config 整合性: co-adapt 相は未実装＝恒久凍結のみ・機構L とは排他
-        if self.config.freeze_backbone_epochs > 0 and self.config.unfreeze_lr_scale != 0.0:
-            raise NotImplementedError(
-                "unfreeze_lr_scale>0 の co-adapt 相は未実装＝現状は恒久凍結 unfreeze_lr_scale=0 のみ"
-            )
+        # 機構M の config 整合性: 機構L とは排他（二重の非定常制御を避ける）
         ckpt = self.config.warm_start_checkpoint
         if not ckpt:
             return
@@ -560,9 +619,12 @@ class Trainer:
         bag 表現レベルの補間・順序補助損失を分類損失へ織り込む（既定 off で従来と一致）
         """
         self.model.train()
-        # 機構M: model.train() が全 module を train へ戻すので凍結相は背骨を eval＋requires_grad=False へ再適用する
+        # 機構M: model.train() が全 module を train へ戻すので凍結相は背骨を eval＋requires_grad=False へ
+        # 再適用する co-adapt 相は requires_grad=True を保つ
         if self._is_backbone_frozen(epoch):
             self._set_backbone_frozen(True)
+        elif self.config.freeze_backbone_epochs > 0:
+            self._set_backbone_frozen(False)
         self.optimizer.zero_grad()
         total_loss = 0.0
         for base_feats, slide_id, label in self.train_loader:
@@ -621,6 +683,7 @@ class Trainer:
         for epoch in range(self.config.max_epochs):
             # 機構L: epoch 依存で RL 損失重みを ramp する（mcts 以外は no-op）
             self.zoom_driver.set_curriculum(epoch)
+            self._maybe_unfreeze_transition(epoch)
             train_loss = self._train_one_epoch(epoch)
             val_loss, val_metrics, _, _ = self._evaluate(self.val_loader)
 

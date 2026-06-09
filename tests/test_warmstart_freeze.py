@@ -133,8 +133,11 @@ def test_set_backbone_frozen_toggles_requires_grad_and_mode():
         (0, 0.0, 0, False),    # M off
         (30, 0.0, 0, True),    # freeze 相
         (30, 0.0, 29, True),
-        (30, 0.0, 30, True),   # 恒久凍結
+        (30, 0.0, 30, True),   # 恒久凍結(unfreeze=0)
         (30, 0.0, 49, True),
+        (30, 0.1, 29, True),   # co-adapt: freeze 相は凍結
+        (30, 0.1, 30, False),  # co-adapt: 相転移で解凍
+        (30, 0.1, 49, False),
     ],
 )
 def test_is_backbone_frozen_schedule(fb, unfreeze, epoch, expected):
@@ -158,12 +161,72 @@ def test_l_and_m_mutually_exclusive(tmp_path):
         Trainer._load_warm_start(stub)
 
 
-def test_unfreeze_phase_not_implemented(tmp_path):
+class _MStub:
+    """co-adapt 相転移テスト用 stub（optimizer/_base_lr/group index を持つ）"""
+
+    def __init__(self, model, config):
+        import torch.optim as optim
+
+        self.model = model
+        self.config = config
+        self._base_lr = config.lr
+        self._unfrozen = False
+        self._backbone_group_idx = 0
+        backbone, search = Trainer._split_backbone_search_params(self)
+        self.optimizer = optim.Adam(
+            [
+                {"params": backbone, "lr": config.lr * config.unfreeze_lr_scale},
+                {"params": search, "lr": config.lr},
+            ],
+            lr=config.lr,
+        )
+        self.scheduler = None
+
+    def _backbone_modules(self):
+        return Trainer._backbone_modules(self)
+
+    def _set_backbone_frozen(self, frozen):
+        return Trainer._set_backbone_frozen(self, frozen)
+
+    def _split_backbone_search_params(self):
+        return Trainer._split_backbone_search_params(self)
+
+    def _build_scheduler(self):
+        return Trainer._build_scheduler(self)
+
+
+def test_maybe_unfreeze_transition_unfreezes_and_restores_lr():
     model, _ = _mcts_model()
     cfg = TrainConfig(
-        in_feat_dim=IN_DIM, n_cls=N_CLS,
-        freeze_backbone_epochs=30, unfreeze_lr_scale=0.05,  # co-adapt＝未実装
+        in_feat_dim=IN_DIM, n_cls=N_CLS, lr=1e-4,
+        freeze_backbone_epochs=30, unfreeze_lr_scale=0.1,
+        scheduler_decay_rate=0.8, scheduler_patience=10,
     )
-    stub = _Stub(model, cfg, str(tmp_path / "fold1"), torch.device("cpu"))
-    with pytest.raises(NotImplementedError):
-        Trainer._load_warm_start(stub)
+    stub = _MStub(model, cfg)
+    Trainer._set_backbone_frozen(stub, True)  # freeze 相
+    assert all(not p.requires_grad for p in model.head.parameters())
+    # 相転移前は no-op
+    Trainer._maybe_unfreeze_transition(stub, 29)
+    assert stub._unfrozen is False
+    # epoch==freeze で解凍＋背骨LRを base×unfreeze へ復元＋scheduler 作り直し
+    Trainer._maybe_unfreeze_transition(stub, 30)
+    assert stub._unfrozen is True
+    assert all(p.requires_grad for p in model.head.parameters())
+    assert stub.optimizer.param_groups[0]["lr"] == pytest.approx(1e-4 * 0.1)
+    assert stub.scheduler is not None
+    # 二度目は no-op（_unfrozen 済）
+    stub.optimizer.param_groups[0]["lr"] = 999.0
+    Trainer._maybe_unfreeze_transition(stub, 31)
+    assert stub.optimizer.param_groups[0]["lr"] == 999.0
+
+
+def test_permanent_freeze_no_transition():
+    # 恒久凍結(unfreeze=0)では相転移しない
+    model, _ = _mcts_model()
+    cfg = TrainConfig(
+        in_feat_dim=IN_DIM, n_cls=N_CLS, lr=1e-4,
+        freeze_backbone_epochs=30, unfreeze_lr_scale=0.0,
+    )
+    stub = _MStub(model, cfg)
+    Trainer._maybe_unfreeze_transition(stub, 30)
+    assert stub._unfrozen is False
