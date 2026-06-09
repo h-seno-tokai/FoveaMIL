@@ -1505,3 +1505,64 @@ def test_rollout_depth_two_stochastic_lockstep_preserves_sample_count():
     seq = value_rows(force_per_leaf=True)
     bat = value_rows(force_per_leaf=False)
     assert seq == bat and seq > 0
+
+
+def test_rollout_depth_two_stochastic_lockstep_distribution_matches():
+    """確率 depth2 lockstep の価値回帰損失分布が逐次 _rollout と統計的に近接する
+
+    入れ子の MC dropout 標本は逐次と別配置のため値はビット非一致だが標本数・独立性・期待値
+    /分散構造は不変多シードで mcts_value 損失を集め両経路で平均・標準偏差が近接すると確認する
+    """
+    from unittest import mock
+
+    from foveamil.models.search import mcts as mcts_mod
+    from foveamil.models.search.driver import _ZoomSearchProblem
+
+    base = torch.randn(1, 12, IN_DIM)
+    label = torch.tensor([2])
+
+    def value_losses(force_per_leaf, seeds):
+        out = []
+        for s in seeds:
+            torch.manual_seed(31)
+            model = _model(3)
+            driver = build_zoom_driver(
+                _mcts_config(
+                    mcts_eval_stochastic=True, mcts_rollout_depth=2, drop_out=0.5,
+                    mcts_value_target="leaf_ce",
+                ),
+                model,
+            )
+            model.train()
+            patches = []
+            if force_per_leaf:
+                patches = [
+                    mock.patch.object(
+                        _ZoomSearchProblem, "prefetch_round",
+                        mcts_mod.SearchProblem.prefetch_round,
+                    ),
+                    mock.patch.object(
+                        _ZoomSearchProblem, "prefetch_batch",
+                        mcts_mod.SearchProblem.prefetch_batch,
+                    ),
+                ]
+            for patch in patches:
+                patch.start()
+            try:
+                torch.manual_seed(s)
+                _, _, _, ctx = driver.run(
+                    base, MAGS_3, _seeded_child_loader(),
+                    torch.device("cpu"), label=label,
+                )
+                out.append(float(ctx.extra_losses["mcts_value"].detach()))
+            finally:
+                for patch in patches:
+                    patch.stop()
+        return np.array(out)
+
+    seeds = range(200, 240)
+    seq = value_losses(force_per_leaf=True, seeds=seeds)
+    bat = value_losses(force_per_leaf=False, seeds=seeds)
+    pooled_std = 0.5 * (seq.std() + bat.std()) + 1e-6
+    assert abs(seq.mean() - bat.mean()) < pooled_std
+    assert abs(seq.std() - bat.std()) < 0.5 * pooled_std + 0.05
