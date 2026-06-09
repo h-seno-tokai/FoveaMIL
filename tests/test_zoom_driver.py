@@ -1439,3 +1439,69 @@ def test_value_leaf_batch_stochastic_multi_empty_returns_empty_per_problem():
     )
     assert result == [[], []]
     assert ctx.leaf_evals == before
+
+
+def test_rollout_depth_two_stochastic_lockstep_preserves_sample_count():
+    """確率 depth2 入れ子群 lockstep が逐次 _rollout と同一の葉評価標本数を引く
+
+    Gumbel sequential-halving のラウンド予算と入れ子の最終評価はデータ非依存で経路に依らず
+    固定でありバッチ化は value-net 前向き行数（独立 MC dropout 標本数）を変えず forward/同期
+    のみ畳む value-net の前向き総行数が逐次（prefetch 退化）と lockstep で厳密一致する
+    """
+    from unittest import mock
+
+    from foveamil.models.search import mcts as mcts_mod
+    from foveamil.models.search.driver import _ZoomSearchProblem
+
+    base = torch.randn(1, 12, IN_DIM)
+    label = torch.tensor([2])
+
+    def value_rows(force_per_leaf):
+        torch.manual_seed(31)
+        model = _model(3)
+        driver = build_zoom_driver(
+            _mcts_config(
+                mcts_eval_stochastic=True, mcts_rollout_depth=2, drop_out=0.5
+            ),
+            model,
+        )
+        model.train()
+        counter = {"rows": 0}
+        value_net = model.search_value
+        orig = value_net.forward
+
+        def counting(x):
+            counter["rows"] += int(x.shape[0])
+            return orig(x)
+
+        value_net.forward = counting
+        patches = []
+        if force_per_leaf:
+            patches = [
+                mock.patch.object(
+                    _ZoomSearchProblem,
+                    "prefetch_round",
+                    mcts_mod.SearchProblem.prefetch_round,
+                ),
+                mock.patch.object(
+                    _ZoomSearchProblem,
+                    "prefetch_batch",
+                    mcts_mod.SearchProblem.prefetch_batch,
+                ),
+            ]
+        for patch in patches:
+            patch.start()
+        try:
+            torch.manual_seed(7)
+            driver.run(
+                base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+            )
+        finally:
+            for patch in patches:
+                patch.stop()
+            value_net.forward = orig
+        return counter["rows"]
+
+    seq = value_rows(force_per_leaf=True)
+    bat = value_rows(force_per_leaf=False)
+    assert seq == bat and seq > 0

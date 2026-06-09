@@ -475,50 +475,48 @@ class _ZoomSearchProblem(SearchProblem):
         values = self.ctx.value_leaf_batch(states)
         self.scatter_leaf_values(todo, values)
 
-    def _rollout_batch_deterministic(self, actions: Sequence[int]) -> None:
-        """決定論 ``rollout_depth>1``: 候補群の入れ子探索を並走し ``_reward_cache`` を充填する
+    def _build_nested(
+        self, request_actions: Sequence[int]
+    ) -> Tuple[List["_ZoomSearchProblem"], List, List]:
+        """候補列（同一 action の繰返し可）の入れ子 sub_problem/planner/state を構築する
 
-        各候補の子を次倍率へ射影し中段 prior を per-row 連結 1 同期で引く各候補の入れ子探索
-        （sub_problem の planner）を同一スケジュールで並走させ葉評価を候補跨ぎで連結 1 同期へ
-        畳む探索算術は候補ごと逐次 _rollout と同一前向きは per-row 維持で各値が単体評価と
-        ビット同一のため reward は逐次 _rollout と完全一致する葉へ未到達の入れ子（``depth>2``）
-        は葉が充填されず後段の evaluate が逐次 _rollout へ退化する（正しさは保たれ速度のみ落ちる）
+        各 action の子を次倍率へ射影し（同一 action は x_next 共有）中段 prior を per-row 連結
+        1 同期で引く要求ごとに sub_problem（``layer+1``・``depth-1``）と planner と
+        ``_prepare_candidates`` 済み state を作る確率時は同一 action の繰返しが行ごと独立な
+        dropout 標本の prior を持つ（per-row 前向きで各行独立）戻りは要求順に並ぶ
         """
-        todo = [int(a) for a in actions if int(a) not in self._reward_cache]
-        if not todo:
-            return
         next_layer = self.layer_idx + 1
         sub_next_mag = self.ctx.magnifications[next_layer + 1]
         sub_cpp = children_per_parent(
             self.ctx.magnifications[next_layer], sub_next_mag
         )
-        x_nexts: List[Tensor] = []
-        global_children: List[np.ndarray] = []
-        for action in todo:
+        x_by_action: Dict[int, Tensor] = {}
+        gc_by_action: Dict[int, np.ndarray] = {}
+        for action in request_actions:
+            if action in x_by_action:
+                continue
             feats = self._load_child(action)
             with torch.no_grad():
-                x_nexts.append(self.ctx.model.projections[next_layer](feats))
-            global_children.append(
-                compute_child_indices(
-                    np.asarray([self._global_parent(action)], dtype=np.int64),
-                    None,
-                    children=self.cpp,
-                )
+                x_by_action[action] = self.ctx.model.projections[next_layer](feats)
+            gc_by_action[action] = compute_child_indices(
+                np.asarray([self._global_parent(action)], dtype=np.int64),
+                None,
+                children=self.cpp,
             )
-        sub_priors = self.ctx.policy_prior_batch_numpy(x_nexts)
+        sub_priors = self.ctx.policy_prior_batch_numpy(
+            [x_by_action[a] for a in request_actions]
+        )
         sub_problems: List["_ZoomSearchProblem"] = []
         sub_planners: List = []
         sub_states: List = []
-        for x_next, global_child, prior_np in zip(
-            x_nexts, global_children, sub_priors
-        ):
+        for action, prior_np in zip(request_actions, sub_priors):
             sub = _ZoomSearchProblem(
                 prior_np=prior_np,
-                x_fc=x_next,
+                x_fc=x_by_action[action],
                 layer_idx=next_layer,
                 next_mag=sub_next_mag,
                 cpp=sub_cpp,
-                global_idx=global_child,
+                global_idx=gc_by_action[action],
                 rollout_depth=self.rollout_depth - 1,
                 seed=self.seed,
                 ctx=self.ctx,
@@ -532,6 +530,21 @@ class _ZoomSearchProblem(SearchProblem):
             sub_problems.append(sub)
             sub_planners.append(planner)
             sub_states.append(planner._prepare_candidates(sub))
+        return sub_problems, sub_planners, sub_states
+
+    def _rollout_batch_deterministic(self, actions: Sequence[int]) -> None:
+        """決定論 ``rollout_depth>1``: 候補群の入れ子探索を並走し ``_reward_cache`` を充填する
+
+        各候補の子を次倍率へ射影し中段 prior を per-row 連結 1 同期で引く各候補の入れ子探索
+        （sub_problem の planner）を同一スケジュールで並走させ葉評価を候補跨ぎで連結 1 同期へ
+        畳む探索算術は候補ごと逐次 _rollout と同一前向きは per-row 維持で各値が単体評価と
+        ビット同一のため reward は逐次 _rollout と完全一致する葉へ未到達の入れ子（``depth>2``）
+        は葉が充填されず後段の evaluate が逐次 _rollout へ退化する（正しさは保たれ速度のみ落ちる）
+        """
+        todo = [int(a) for a in actions if int(a) not in self._reward_cache]
+        if not todo:
+            return
+        sub_problems, sub_planners, sub_states = self._build_nested(todo)
         # 入れ子群の候補葉を候補跨ぎで連結し 1 同期で充填（sub が葉到達のとき有効）
         collected = [
             sub.collect_leaf_states([int(c) for c in state.candidates])
@@ -552,6 +565,102 @@ class _ZoomSearchProblem(SearchProblem):
                 planner._round_step(sub, state, round_width)
             result = planner._finalize(state, num_select=1)
             self._reward_cache[action] = sub.evaluate(int(result.chosen_actions[0]))
+
+    def _rollout_batch_stochastic(self, action_counts: Dict[int, int]) -> None:
+        """確率 ``rollout_depth>1``: 候補群の入れ子探索を並走し標本 FIFO を充填する
+
+        各候補 ``a`` を ``action_counts[a]`` 回（独立 MC dropout 標本）入れ子探索する全要求の
+        入れ子を同一スケジュールで並走させ各ラウンドの葉を K 軸連結 1 前向きで標本化し中段
+        prior も per-row 連結 1 同期で引く最終評価は各入れ子 chosen の FIFO が空なら新規 1 標本
+        を連結充填してから evaluate で pop する標本数は要求ごと逐次 _rollout と厳密一致し（連結
+        は標本数を保存・最終評価も同数の新規標本）独立性も保つ（RNG 配置は別のため値はビット
+        非一致だが統計的に同値）``depth>2`` の入れ子は退化し後段が逐次評価へ落ちる
+        """
+        requests = [
+            int(a)
+            for a, count in action_counts.items()
+            if int(count) > 0
+            for _ in range(int(count))
+        ]
+        if not requests:
+            return
+        sub_problems, sub_planners, sub_states = self._build_nested(requests)
+        for round_width in sub_states[0].schedule:
+            self._lockstep_round_stochastic(
+                sub_problems, sub_planners, sub_states, round_width
+            )
+        chosens = [
+            int(planner._finalize(state, num_select=1).chosen_actions[0])
+            for planner, state in zip(sub_planners, sub_states)
+        ]
+        self._fill_final_stochastic(sub_problems, chosens)
+        rewards = [
+            sub.evaluate(chosen) for sub, chosen in zip(sub_problems, chosens)
+        ]
+        offset = 0
+        for action, count in action_counts.items():
+            count = int(count)
+            if count <= 0:
+                continue
+            self._stochastic_samples.setdefault(int(action), []).extend(
+                rewards[offset : offset + count]
+            )
+            offset += count
+
+    def _lockstep_round_stochastic(
+        self,
+        sub_problems: List["_ZoomSearchProblem"],
+        sub_planners: List,
+        sub_states: List,
+        round_width: int,
+    ) -> None:
+        """入れ子群の 1 ラウンドを並走する（葉を K 軸連結 1 前向きし各入れ子で消費する）
+
+        各入れ子の active 候補の葉入力を ``collect_round_states`` で集め K 軸連結 1 前向きで
+        標本化し各入れ子へ scatter したうえで ``_round_consume`` で評価・Q 更新・再ソートする
+        各入れ子の標本数・独立性は per-leaf と不変で forward/同期のみ畳まれる
+        """
+        collected = []
+        for sub, state in zip(sub_problems, sub_states):
+            active = state.active[:round_width]
+            per_action = max(1, state.sims_per_round // max(1, len(active)))
+            collected.append(
+                sub.collect_round_states({int(a): per_action for a in active})
+            )
+        values_multi = self.ctx.value_leaf_batch_stochastic_multi(
+            [x_next for _acts, _counts, x_next in collected]
+        )
+        for (acts, counts, _x), values, sub in zip(
+            collected, values_multi, sub_problems
+        ):
+            sub.scatter_round_samples(acts, counts, values)
+        for planner, sub, state in zip(sub_planners, sub_problems, sub_states):
+            planner._round_consume(sub, state, round_width)
+
+    def _fill_final_stochastic(
+        self, sub_problems: List["_ZoomSearchProblem"], chosens: Sequence[int]
+    ) -> None:
+        """各入れ子 chosen の最終評価標本を確保する（FIFO 空のみ新規 1 標本を連結充填）
+
+        逐次 _rollout の最終 ``sub.evaluate(chosen)`` は chosen の FIFO が空なら新規 1 標本を引く
+        lockstep でも FIFO 空の入れ子のみ chosen の子を 1 回 repeat し K 軸連結 1 前向きで新規
+        標本を作り FIFO へ積む残標本がある入れ子は触らない（後段 evaluate が pop する）標本数は
+        逐次と厳密一致する
+        """
+        fresh = []
+        for idx, (sub, chosen) in enumerate(zip(sub_problems, chosens)):
+            if sub._stochastic_samples.get(chosen):
+                continue
+            acts, counts, x_next = sub.collect_round_states({int(chosen): 1})
+            if x_next is not None:
+                fresh.append((idx, acts, counts, x_next))
+        if not fresh:
+            return
+        values_multi = self.ctx.value_leaf_batch_stochastic_multi(
+            [x_next for _idx, _acts, _counts, x_next in fresh]
+        )
+        for (idx, acts, counts, _x), values in zip(fresh, values_multi):
+            sub_problems[idx].scatter_round_samples(acts, counts, values)
 
     def collect_round_states(
         self, action_counts: Dict[int, int]
@@ -598,14 +707,21 @@ class _ZoomSearchProblem(SearchProblem):
         """確率時 1 ラウンドの全葉評価（候補 ``a`` を ``action_counts[a]`` 回）を一括前向きする
 
         確率的なときに限り有効（既定 no-op）葉へ直接到達する問題（``rollout_depth<=1`` か
-        最深層手前）のみ対象で，更に展開する候補は入れ子 planner.run が逐次依存のため
-        何もしない（葉到達時のバッチ化は入れ子側の prefetch_round で効く）
+        最深層手前）は各候補の子を ``action_counts[a]`` 回 repeat し 1 前向きで標本化する
+
+        ``rollout_depth>1`` で更に展開できる候補（gumbel 時）は各要求の入れ子探索を並走させ
+        中段 prior と葉評価を要求跨ぎで連結し同期を畳む（:meth:`_rollout_batch_stochastic`）
+        標本数は要求ごと逐次 _rollout と厳密一致gumbel 以外は退化し evaluate が逐次 _rollout を辿る
 
         得た標本は候補ごとの FIFO へ積み以後の :meth:`evaluate` が 1 個ずつ取り出す候補
         ``a`` は依然 ``action_counts[a]`` 個の独立 MC dropout 標本を持つ（標本数・独立性・
         期待値/分散構造は不変・RNG 配置は逐次と別のため値はビット非一致だが統計的に同値）
         forward と GPU→CPU 同期だけがラウンド単位 1 回へ畳まれる
         """
+        if self.ctx.stochastic and self.rollout_depth > 1 and self._can_expand():
+            if self.ctx.planner_name == "gumbel":
+                self._rollout_batch_stochastic(action_counts)
+            return
         actions, counts, x_next = self.collect_round_states(action_counts)
         if x_next is None:
             return
