@@ -346,7 +346,7 @@ class Trainer:
         )
         self.ordinal_aux_weight = config.ordinal_aux_weight
         self.ordinal_aux = (
-            OrdinalAuxLoss(self.n_cls).to(self.device)
+            OrdinalAuxLoss(self.n_cls, config.ordinal_class_order).to(self.device)
             if config.ordinal_aux_weight > 0
             else None
         )

@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -190,23 +190,53 @@ class BagMixup:
 class OrdinalAuxLoss(nn.Module):
     """クラス順序を活かす ordinal 補助損失
 
-    クラス index の並び（``0 < 1 < ... < n_cls-1``）を順序とみなし softmax 確率の
-    期待ランク ``E[r] = Σ_k k·p_k`` と正解ランクの二乗距離を罰する 順序が遠い誤りほど
+    softmax 確率の期待ランクと正解ランクの正規化二乗距離を罰する 順序が遠い誤りほど
     大きく罰し 近い誤りは小さく罰する（順序の単調性）``weight`` で寄与をスケールし
     ``weight=0`` なら学習ループ側が呼ばないため寄与 0 とする
 
-    ランクの絶対尺度を ``n_cls-1`` で割り正規化する（クラス数に依らず比較可能）
+    ``class_order`` で**順序のあるクラス部分集合**を与えられる その index 列の並びを
+    昇順ランク（0,1,...）とし 集合に属するクラスのみで期待ランクを測り（集合内質量で
+    再正規化）正解が集合に属するサンプルにのみペナルティを課す 集合外クラスは名義として
+    順序の対象外（分類 CE が扱う）``class_order=None`` は全クラスを index 順の全順序と
+    みなす従来挙動で数値一致する
+
+    ランクの絶対尺度を ``len-1`` で割り正規化する（集合長に依らず比較可能）
 
     Args:
         n_cls: クラス数
+        class_order: 順序を課すクラス index の昇順列（``None`` で全クラス index 順）
     """
 
-    def __init__(self, n_cls: int) -> None:
+    def __init__(self, n_cls: int, class_order: Optional[Sequence[int]] = None) -> None:
         super().__init__()
-        ranks = torch.arange(n_cls, dtype=torch.float32)
+        if class_order is not None and not isinstance(class_order, (list, tuple)):
+            raise ValueError(
+                "class_order は list/tuple のクラス index 列を渡す"
+                f"（sweep では list-of-lists にする）: {class_order!r}"
+            )
+        self.subset = class_order is not None
+        if class_order is None:
+            ranks = torch.arange(n_cls, dtype=torch.float32)
+            in_chain = torch.ones(n_cls, dtype=torch.bool)
+            # 単一クラスでは順序が無いため正規化を恒等にする
+            self.scale = float(max(n_cls - 1, 1))
+        else:
+            order = [int(c) for c in class_order]
+            if not order:
+                raise ValueError("class_order が空")
+            if len(set(order)) != len(order):
+                raise ValueError(f"class_order に重複 index: {order}")
+            if any(c < 0 or c >= n_cls for c in order):
+                raise ValueError(f"class_order の index が範囲外(0..{n_cls-1}): {order}")
+            # クラスごとのチェーン内昇順ランク（集合外は 0・マスクで無効化）
+            ranks = torch.zeros(n_cls, dtype=torch.float32)
+            in_chain = torch.zeros(n_cls, dtype=torch.bool)
+            for rank, cls_idx in enumerate(order):
+                ranks[cls_idx] = float(rank)
+                in_chain[cls_idx] = True
+            self.scale = float(max(len(order) - 1, 1))
         self.register_buffer("ranks", ranks)
-        # 単一クラスでは順序が無いため正規化を恒等にする
-        self.scale = float(max(n_cls - 1, 1))
+        self.register_buffer("in_chain", in_chain)
 
     def forward(self, logits: Tensor, target: Tensor) -> Tensor:
         """期待ランクと正解ランクの正規化二乗距離（平均）を返す
@@ -216,10 +246,22 @@ class OrdinalAuxLoss(nn.Module):
             target: 正解クラス ``[B]``
 
         Returns:
-            平均二乗距離スカラ
+            平均二乗距離スカラ（部分集合時は集合内サンプルが無ければ寄与 0）
         """
         probs = F.softmax(logits, dim=-1)
-        expected_rank = probs @ self.ranks
+        if not self.subset:
+            expected_rank = probs @ self.ranks
+            true_rank = self.ranks[target]
+            diff = (expected_rank - true_rank) / self.scale
+            return (diff * diff).mean()
+        # 部分集合: 集合内質量で再正規化した期待ランクを 集合内サンプルにのみ課す
+        chain_mass = probs[:, self.in_chain].sum(dim=-1)
+        weighted = probs @ (self.ranks * self.in_chain.to(self.ranks.dtype))
+        expected_rank = weighted / chain_mass.clamp_min(1e-8)
+        sample_mask = self.in_chain[target]
+        if not bool(sample_mask.any()):
+            # 集合内サンプルが無いバッチは順序信号なし＝寄与 0（grad graph は保持）
+            return logits.sum() * 0.0
         true_rank = self.ranks[target]
-        diff = (expected_rank - true_rank) / self.scale
+        diff = (expected_rank[sample_mask] - true_rank[sample_mask]) / self.scale
         return (diff * diff).mean()
