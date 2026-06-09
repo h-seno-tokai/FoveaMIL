@@ -126,6 +126,12 @@ DEFAULT_CURRICULUM_WARMUP_EPOCHS = 0
 DEFAULT_CURRICULUM_VALUE_LEAD_FRAC = 0.5
 # 既定の探索ネット LR スケール（1.0 で無効＝policy/value も主 LR と同一の単一 param group＝従来挙動）
 DEFAULT_SEARCH_LR_SCALE = 1.0
+# 既定の warm-start チェックポイント（機構M・None で無効＝差別化版背骨の流用なし＝従来挙動）
+DEFAULT_WARM_START_CHECKPOINT = None
+# 既定の背骨凍結 epoch 数（機構M・0 で無効＝凍結相なし）
+DEFAULT_FREEZE_BACKBONE_EPOCHS = 0
+# 既定の解凍後 LR スケール（0 で恒久凍結＝背骨は最後まで固定，>0 で相転移後に背骨を base×scale で共適応）
+DEFAULT_UNFREEZE_LR_SCALE = 0.0
 # 既定の bag 表現 mixup の Beta 形状 α（0 で無効＝従来挙動）
 DEFAULT_MIXUP_ALPHA = 0.0
 # 既定のバランスサンプラ温度（1.0 で現行＝重み不変）
@@ -211,6 +217,9 @@ class TrainConfig:
         curriculum_warmup_epochs: 機構 L のカリキュラム warmup epoch 数（``0`` で無効＝RL 損失重みを epoch0 から定数＝従来挙動，``>0`` で value→policy→actor-critic の順に重みを 0 から目標へ ramp し分類器の報酬が安定してから探索の学習を立ち上げる，``mcts`` のみ有効）
         curriculum_value_lead_frac: value_weight が full に達する warmup 内の割合（``0.5`` で warmup の半分で value が full＝critic を actor に先行させ actor-critic 項はそこから ramp 開始，``curriculum_warmup_epochs>0`` のときのみ意味を持つ）
         search_lr_scale: 探索ネット（policy/value）専用 param group の LR 倍率（``1.0`` で無効＝単一 param group で従来挙動，``<1`` で探索ネットだけ学習を遅くし共有ヘッド・融合の立ち上がりを先行させる）
+        warm_start_checkpoint: 機構M の背骨 warm-start チェックポイント（``None`` で無効，差別化版 best の ``.pt`` パス・``{fold}`` プレースホルダで fold 別に展開し背骨 projections/aggregators/head/aux_attentions を流用する search net は新規・CV リーク防止のため fold 一致必須，``mcts`` のみ有効）
+        freeze_backbone_epochs: 機構M の背骨凍結 epoch 数（``0`` で無効，``>0`` で先頭 N epoch は背骨を requires_grad=False＋eval 固定し探索ネットのみ学習＝報酬 -CE を定常化する，``warm_start_checkpoint`` と併用）
+        unfreeze_lr_scale: 機構M の解凍後 LR スケール（``0`` で恒久凍結＝背骨は最後まで固定，``>0`` で ``freeze_backbone_epochs`` 後に背骨を base×scale の低 LR で共適応させる）
     """
 
     seed: int = DEFAULT_SEED
@@ -290,3 +299,6 @@ class TrainConfig:
     curriculum_warmup_epochs: int = DEFAULT_CURRICULUM_WARMUP_EPOCHS
     curriculum_value_lead_frac: float = DEFAULT_CURRICULUM_VALUE_LEAD_FRAC
     search_lr_scale: float = DEFAULT_SEARCH_LR_SCALE
+    warm_start_checkpoint: Optional[str] = DEFAULT_WARM_START_CHECKPOINT
+    freeze_backbone_epochs: int = DEFAULT_FREEZE_BACKBONE_EPOCHS
+    unfreeze_lr_scale: float = DEFAULT_UNFREEZE_LR_SCALE

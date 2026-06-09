@@ -288,6 +288,7 @@ class Trainer:
             self.device
         )
         self.zoom_driver = build_zoom_driver(config, self.model)
+        self._load_warm_start()
         self.instance_enabled = config.instance_loss
         self.bag_weight = config.bag_weight
         self.regularizers = iter_active_regularizers(config)
@@ -369,6 +370,66 @@ class Trainer:
             {"params": other_params},
             {"params": search_params, "lr": lr * search_lr_scale},
         ]
+
+    def _backbone_modules(self):
+        """機構M の凍結対象＝背骨（探索ネット以外の全 module）
+
+        報酬 -CE を作る projections/aggregators/fusion/head/aux_attentions 等で
+        ``search_policy`` / ``search_value``（mcts のみ存在）は除く
+        """
+        from foveamil.models.search.driver import POLICY_ATTR, VALUE_ATTR
+
+        search = {POLICY_ATTR, VALUE_ATTR}
+        return [m for name, m in self.model.named_children() if name not in search]
+
+    def _set_backbone_frozen(self, frozen: bool) -> None:
+        """機構M: 背骨を凍結/解凍する（requires_grad と eval/train の両方を切替）
+
+        ``frozen=True`` で requires_grad=False＋eval＝凍結背骨の dropout/LayerNorm を固定し
+        報酬 -CE を定常化する（requires_grad だけでは train モードの dropout/LN で毎step揺れ
+        定常化が未達）``False`` で requires_grad=True＋train に戻す
+        """
+        for module in self._backbone_modules():
+            module.requires_grad_(not frozen)
+            module.train(not frozen)
+
+    def _load_warm_start(self) -> None:
+        """機構M: 差別化版 best の背骨を流用する（search net は新規・fold 一致で CV リーク防止）
+
+        ``warm_start_checkpoint`` の ``{fold}`` を save_path の fold 添字で展開し strict=False で
+        背骨をロードする欠損キーが search net 以外にある・余剰キーがある場合は流用契約違反として
+        fail-fast する（背骨アーキ不一致の早期検出）
+        """
+        # 機構M の config 整合性: co-adapt 相は未実装＝恒久凍結のみ・機構L とは排他
+        if self.config.freeze_backbone_epochs > 0 and self.config.unfreeze_lr_scale != 0.0:
+            raise NotImplementedError(
+                "unfreeze_lr_scale>0 の co-adapt 相は未実装＝現状は恒久凍結 unfreeze_lr_scale=0 のみ"
+            )
+        ckpt = self.config.warm_start_checkpoint
+        if not ckpt:
+            return
+        if self.config.curriculum_warmup_epochs > 0:
+            raise ValueError(
+                "機構M(warm_start_checkpoint)と機構L(curriculum_warmup_epochs)は排他＝二重の非定常制御を避ける"
+            )
+        from foveamil.models.search.driver import POLICY_ATTR, VALUE_ATTR
+
+        fold = os.path.basename(os.path.normpath(self.save_path))
+        path = ckpt.replace("{fold}", fold)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"warm_start_checkpoint not found: {path}")
+        state = torch.load(path, map_location=self.device)
+        state = state.get("state_dict", state) if isinstance(state, dict) else state
+        result = self.model.load_state_dict(state, strict=False)
+        non_search_missing = [
+            k for k in result.missing_keys if not k.startswith((POLICY_ATTR, VALUE_ATTR))
+        ]
+        if non_search_missing or result.unexpected_keys:
+            raise RuntimeError(
+                "warm-start 流用契約違反: "
+                f"欠損(非search)={non_search_missing} 余剰={list(result.unexpected_keys)}"
+            )
+        logger.info("warm-start: %s から背骨を流用（search net は新規）", path)
 
     def _build_train_loader(self, train_ds) -> DataLoader:
         """学習用 DataLoader を作る（重み付き or ランダムサンプラ）"""
@@ -480,7 +541,16 @@ class Trainer:
             )
         return loss
 
-    def _train_one_epoch(self) -> float:
+    def _is_backbone_frozen(self, epoch: int) -> bool:
+        """機構M: この epoch で背骨を凍結するか（freeze 相 or ``unfreeze_lr_scale==0`` の恒久凍結）"""
+        fb = self.config.freeze_backbone_epochs
+        if fb <= 0:
+            return False
+        if epoch < fb:
+            return True
+        return self.config.unfreeze_lr_scale == 0.0
+
+    def _train_one_epoch(self, epoch: int = 0) -> float:
         """1 エポック学習し平均損失を返す
 
         分類損失は ``config.loss_type`` で選ぶ損失（既定は素 CE）``instance_enabled`` なら
@@ -490,6 +560,9 @@ class Trainer:
         bag 表現レベルの補間・順序補助損失を分類損失へ織り込む（既定 off で従来と一致）
         """
         self.model.train()
+        # 機構M: model.train() が全 module を train へ戻すので凍結相は背骨を eval＋requires_grad=False へ再適用する
+        if self._is_backbone_frozen(epoch):
+            self._set_backbone_frozen(True)
         self.optimizer.zero_grad()
         total_loss = 0.0
         for base_feats, slide_id, label in self.train_loader:
@@ -548,7 +621,7 @@ class Trainer:
         for epoch in range(self.config.max_epochs):
             # 機構L: epoch 依存で RL 損失重みを ramp する（mcts 以外は no-op）
             self.zoom_driver.set_curriculum(epoch)
-            train_loss = self._train_one_epoch()
+            train_loss = self._train_one_epoch(epoch)
             val_loss, val_metrics, _, _ = self._evaluate(self.val_loader)
 
             current_lr = self.optimizer.param_groups[0]["lr"]
