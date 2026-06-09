@@ -196,6 +196,27 @@ class Planner(abc.ABC):
         return np.sort(order)
 
 
+@dataclass
+class _GumbelRunState:
+    """``GumbelAlphaZeroPlanner.run`` の途中状態をラウンド単位で持ち越す
+
+    スライド跨ぎバッチ化（lockstep）で複数プランナを同一ラウンドまで進めるため
+    ``run`` を ``_prepare`` / ``_round_step`` / ``_finalize`` に分けて駆動する容器
+    """
+
+    n: int
+    prior: np.ndarray
+    logits: np.ndarray
+    gumbel: np.ndarray
+    candidates: np.ndarray
+    schedule: List[int]
+    sims_per_round: int
+    visit_counts: np.ndarray
+    q_sum: np.ndarray
+    evaluated: Dict[int, float]
+    active: List[int]
+
+
 class GumbelAlphaZeroPlanner(Planner):
     """Gumbel-AlphaZero 流のアクション選択を行うプランナ
 
@@ -221,6 +242,31 @@ class GumbelAlphaZeroPlanner(Planner):
         self.c_scale = float(c_scale)
 
     def run(self, problem: SearchProblem, num_select: int) -> PlannerResult:
+        # ラウンド単位の駆動に分割（挙動は分割前と完全一致・スライド跨ぎ lockstep の土台）
+        state = self._prepare(problem)
+        for round_width in state.schedule:
+            self._round_step(problem, state, round_width)
+        return self._finalize(state, num_select)
+
+    def _prepare(self, problem: SearchProblem) -> _GumbelRunState:
+        """候補集合・スケジュールを確定し全候補の葉評価を先に充填する
+
+        候補集合は run 冒頭で確定し sequential halving は部分集合のみへ縮む（新規候補は
+        出ない）ため全候補の葉評価を先に充填し per-leaf 同期を 1 回へ畳む以後の evaluate は
+        キャッシュヒットになり報酬列・訪問・スコア順序は per-leaf 評価と一致する
+        （メモ化実装のみ有効・確率時は no-op）
+        """
+        state = self._prepare_candidates(problem)
+        problem.prefetch_batch([int(a) for a in state.candidates])
+        return state
+
+    def _prepare_candidates(self, problem: SearchProblem) -> _GumbelRunState:
+        """葉充填を行わず候補集合・gumbel・スケジュールのみ確定して状態を返す
+
+        Gumbel top-m で初期候補集合を決め sequential halving の各ラウンド幅を確定する
+        葉評価の充填（prefetch）は呼ばず numpy 算術のみ行う（:meth:`_prepare` は本メソッド
+        の後に prefetch_batch を 1 回呼ぶ＝挙動は分離前と完全一致）
+        """
         n = problem.num_actions()
         prior = np.asarray(problem.prior(), dtype=np.float64).reshape(-1)
         if prior.shape[0] != n:
@@ -236,50 +282,80 @@ class GumbelAlphaZeroPlanner(Planner):
         # Gumbel top-m: logits + gumbel の上位 m を最初の候補集合にする
         candidates = np.argsort(-(logits + gumbel), kind="stable")[:considered]
 
-        # 候補集合は run 冒頭で確定し sequential halving は部分集合のみへ縮む
-        # （新規候補は出ない）ため，ここで全候補の葉評価を先に充填し per-leaf 同期を
-        # 1 回へ畳む以後の evaluate はキャッシュヒットになり報酬列・訪問・スコア順序は
-        # per-leaf 評価と一致する（メモ化実装のみ有効・確率時は no-op）
-        problem.prefetch_batch([int(a) for a in candidates])
-
-        visit_counts = np.zeros(n, dtype=np.int64)
-        q_sum = np.zeros(n, dtype=np.float64)
-        evaluated: Dict[int, float] = {}
-
         schedule = _sequential_halving_schedule(considered, self.simulations)
         sims_per_round = max(1, self.simulations // max(1, len(schedule)))
+        return _GumbelRunState(
+            n=n,
+            prior=prior,
+            logits=logits,
+            gumbel=gumbel,
+            candidates=candidates,
+            schedule=schedule,
+            sims_per_round=sims_per_round,
+            visit_counts=np.zeros(n, dtype=np.int64),
+            q_sum=np.zeros(n, dtype=np.float64),
+            evaluated={},
+            active=list(candidates),
+        )
 
-        active = list(candidates)
-        for round_width in schedule:
-            active = active[:round_width]
-            per_action = max(1, sims_per_round // max(1, len(active)))
-            # ラウンドの全評価（候補 a を per_action 回）を 1 バッチへ畳む確率的実装のみ有効
-            # （基底 no-op）標本数・独立性・期待値/分散構造は不変で forward/同期のみ畳まれる
-            problem.prefetch_round({int(a): per_action for a in active})
-            for action in active:
-                for _ in range(per_action):
-                    reward = float(problem.evaluate(int(action)))
-                    q_sum[action] += reward
-                    visit_counts[action] += 1
-                    evaluated[int(action)] = reward
-            # 各候補の平均 Q で次ラウンドへ残す上位を選ぶ（Gumbel 補正込み）
-            scored = sorted(
-                active,
-                key=lambda a: -(
-                    logits[a]
-                    + gumbel[a]
-                    + _sigma(
-                        np.asarray([_safe_mean(q_sum[a], visit_counts[a])]),
-                        int(visit_counts.max()),
-                        self.c_scale,
-                    )[0]
-                ),
-            )
-            active = scored
+    def _round_step(
+        self, problem: SearchProblem, state: _GumbelRunState, round_width: int
+    ) -> None:
+        """1 ラウンドぶん（上位 ``round_width`` 候補を per_action 回評価し再ソート）進める
 
-        q_values = _completed_q(prior, q_sum, visit_counts, evaluated)
-        improved_logits = logits + _sigma(
-            q_values, int(visit_counts.max(initial=0)), self.c_scale
+        ラウンドの全評価（候補 a を per_action 回）を 1 バッチへ畳む確率的実装のみ有効
+        （基底 no-op）標本数・独立性・期待値/分散構造は不変で forward/同期のみ畳まれる
+        """
+        self._round_prefetch(problem, state, round_width)
+        self._round_consume(problem, state, round_width)
+
+    def _round_prefetch(
+        self, problem: SearchProblem, state: _GumbelRunState, round_width: int
+    ) -> None:
+        """ラウンドの全評価入力（active を per_action 回）を先取り充填する
+
+        ``active`` と ``per_action`` は ``_round_consume`` と同一に確定する（その間 state.active
+        は不変）複数 problem の prefetch を先に済ませ葉前向きを後段で連結 1 同期へ畳む分離点
+        """
+        active = state.active[:round_width]
+        per_action = max(1, state.sims_per_round // max(1, len(active)))
+        problem.prefetch_round({int(a): per_action for a in active})
+
+    def _round_consume(
+        self, problem: SearchProblem, state: _GumbelRunState, round_width: int
+    ) -> None:
+        """先取り済みの評価を消費し Q/訪問を更新し次ラウンドの active を再ソートする"""
+        active = state.active[:round_width]
+        per_action = max(1, state.sims_per_round // max(1, len(active)))
+        for action in active:
+            for _ in range(per_action):
+                reward = float(problem.evaluate(int(action)))
+                state.q_sum[action] += reward
+                state.visit_counts[action] += 1
+                state.evaluated[int(action)] = reward
+        # 各候補の平均 Q で次ラウンドへ残す上位を選ぶ（Gumbel 補正込み）
+        state.active = sorted(
+            active,
+            key=lambda a: -(
+                state.logits[a]
+                + state.gumbel[a]
+                + _sigma(
+                    np.asarray([_safe_mean(state.q_sum[a], state.visit_counts[a])]),
+                    int(state.visit_counts.max()),
+                    self.c_scale,
+                )[0]
+            ),
+        )
+
+    def _finalize(
+        self, state: _GumbelRunState, num_select: int
+    ) -> PlannerResult:
+        """完了 Q から改良方策と選択アクションを作る"""
+        q_values = _completed_q(
+            state.prior, state.q_sum, state.visit_counts, state.evaluated
+        )
+        improved_logits = state.logits + _sigma(
+            q_values, int(state.visit_counts.max(initial=0)), self.c_scale
         )
         improved_policy = _softmax(improved_logits)
         chosen = self._top_actions(improved_policy, num_select)
@@ -287,8 +363,8 @@ class GumbelAlphaZeroPlanner(Planner):
             improved_policy=improved_policy,
             chosen_actions=chosen,
             q_values=q_values,
-            visit_counts=visit_counts,
-            prior=prior,
+            visit_counts=state.visit_counts,
+            prior=state.prior,
         )
 
 

@@ -1005,10 +1005,12 @@ def test_prefetch_batch_matches_per_leaf_reference_exactly():
 
 
 def test_prefetch_batch_rollout_depth_two_matches_per_leaf_reference():
-    """``rollout_depth=2`` でもバッチ葉評価が per-leaf 参照と完全一致する
+    """``rollout_depth=2`` でも入れ子群 lockstep が逐次 _rollout と完全一致する
 
-    最上段は入れ子探索の逐次依存でバッチ化対象外だが，入れ子の葉到達時に同機構で
-    バッチ化される深い木でも選択・改良方策・logits が改修前とビット一致する
+    決定論 depth2 では各候補の入れ子探索を並走させ中段 prior と葉評価を候補跨ぎで連結
+    1 同期へ畳む入れ子は逐次 planner.run を経由せず分解メソッドを辿るため captured（入れ子
+    improved）は非対称になる最終出力 chosen・logits・合成損失の一致で bit-exact を検証する
+    （決定論時 logits が一致すれば入れ子 reward まで完全一致している）
     """
     base = torch.randn(1, 12, IN_DIM)
     label = torch.tensor([2])
@@ -1021,7 +1023,66 @@ def test_prefetch_batch_rollout_depth_two_matches_per_leaf_reference():
     model_bat.eval()
     bat = _run_driver_capture(driver_bat, base, MAGS_3, label, force_per_leaf=False)
 
-    _assert_capture_equal(bat, ref)
+    assert bat[0] == ref[0]
+    assert torch.equal(bat[2], ref[2])
+    assert bat[3].keys() == ref[3].keys()
+    for key in ref[3]:
+        assert bat[3][key] == ref[3][key]
+
+
+def test_rollout_depth_two_lockstep_preserves_gradient():
+    """決定論 depth2 入れ子群 lockstep は勾配経路を変えない（policy/value/共有ヘッド bit 一致）
+
+    葉評価・中段 prior は no_grad で勾配を流さず reward は detach されるため学習勾配は run
+    本体（policy/value/select_weight）経由のみ入れ子探索を候補跨ぎで並走させても reward が
+    逐次 _rollout と一致するので方策・価値・共有ヘッドへ流れる勾配がビット一致する
+    """
+    from unittest import mock
+
+    from foveamil.models.search import mcts as mcts_mod
+    from foveamil.models.search.driver import _ZoomSearchProblem
+
+    base = torch.randn(1, 12, IN_DIM)
+    label = torch.tensor([2])
+
+    def grad_snapshot(force_per_leaf):
+        torch.manual_seed(31)
+        model = _model(3)
+        driver = build_zoom_driver(
+            _mcts_config(mcts_value_target="leaf_ce", mcts_rollout_depth=2), model
+        )
+        model.train()
+        patch = (
+            mock.patch.object(
+                _ZoomSearchProblem,
+                "prefetch_batch",
+                mcts_mod.SearchProblem.prefetch_batch,
+            )
+            if force_per_leaf
+            else None
+        )
+        if patch is not None:
+            patch.start()
+        try:
+            _, _, _, ctx = driver.run(
+                base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+            )
+            model.zero_grad()
+            sum(ctx.extra_losses.values()).backward()
+            return {
+                name: p.grad.detach().clone()
+                for name, p in model.named_parameters()
+                if p.grad is not None
+            }
+        finally:
+            if patch is not None:
+                patch.stop()
+
+    ref = grad_snapshot(force_per_leaf=True)
+    bat = grad_snapshot(force_per_leaf=False)
+    assert ref.keys() == bat.keys()
+    for name in ref:
+        assert torch.equal(ref[name], bat[name]), name
 
 
 def test_prefetch_batch_preserves_gradient_path():
@@ -1076,6 +1137,78 @@ def test_prefetch_batch_preserves_gradient_path():
     assert ref.keys() == bat.keys()
     for name in ref:
         assert torch.equal(ref[name], bat[name]), name
+
+
+# --- Phase 0 リファクタの seam 契約（collect/scatter/_batched_root_forward） ---
+
+
+def test_batched_root_forward_single_matches_per_slide():
+    """``_batched_root_forward([x_fc])`` が単体 policy/value 前向きとビット一致する
+
+    root 前向きはスライド毎 ``[1,N,D]`` のまま GEMM を跨ぎ再結合しない（cat バッチ化は
+    GatedAttention の Linear が非 bit-exact）1 要素 list へ factor した経路が従来の
+    ``policy(x_fc)`` / ``value(x_fc)`` と π テンソル・π numpy・v テンソルで一致するか確認する
+    """
+    _, driver = _build_seeded_mcts(num_layers=3)
+    driver.model.eval()
+    x_fc = torch.randn(1, 7, OUT_DIM)
+    ref_prior = driver.policy(x_fc).squeeze(0)
+    ref_value = driver.value(x_fc).squeeze(0)
+    priors, prior_nps, value_preds = driver._batched_root_forward([x_fc])
+    assert len(priors) == len(prior_nps) == len(value_preds) == 1
+    assert torch.equal(priors[0], ref_prior)
+    assert torch.equal(value_preds[0], ref_value)
+    assert np.array_equal(prior_nps[0], ref_prior.detach().cpu().numpy())
+
+
+def test_collect_scatter_leaf_states_compose_to_prefetch_batch():
+    """決定論葉の collect+value_leaf_batch+scatter が一括 prefetch_batch とビット一致する
+
+    収集 states は per-row ``[1,cpp,D]``・todo は未キャッシュ候補のみで，手合成した
+    ``_reward_cache`` が一括 prefetch_batch の ``_reward_cache`` と完全一致することを確認する
+    """
+    from foveamil.models.search.value import ValueNetwork
+
+    torch.manual_seed(3)
+    model = _model(num_layers=2)
+    value_net = ValueNetwork(OUT_DIM, HIDDEN, dropout=None)
+    value_net.eval()
+    actions = [0, 1, 2]
+    prob_a = _zoom_search_problem(model, value_net, stochastic=False)
+    prob_a.prefetch_batch(actions)
+    prob_b = _zoom_search_problem(model, value_net, stochastic=False)
+    todo, states = prob_b.collect_leaf_states(actions)
+    assert todo == actions
+    assert all(tuple(s.shape) == (1, prob_b.cpp, OUT_DIM) for s in states)
+    values = prob_b.ctx.value_leaf_batch(states)
+    prob_b.scatter_leaf_values(todo, values)
+    assert prob_a._reward_cache == prob_b._reward_cache
+
+
+def test_collect_round_states_shapes_and_scatter_compose():
+    """確率葉の collect_round_states が ``[ΣK,cpp,D]`` を返し scatter が FIFO へ正しく積む
+
+    候補ごとの repeat 回数 ``counts`` の総和が K 軸長と一致し，scatter_round_samples が
+    actions/counts 順に標本を切り出し各候補の独立標本キューへ積むことを確認する
+    """
+    from foveamil.models.search.policy import PolicyNetwork
+    from foveamil.models.search.value import ValueNetwork
+
+    torch.manual_seed(4)
+    model = _model(num_layers=2)
+    model.add_module("search_policy", PolicyNetwork(OUT_DIM, HIDDEN, 0.5))
+    value_net = ValueNetwork(OUT_DIM, HIDDEN, dropout=0.5)
+    model.train()
+    value_net.train()
+    problem = _zoom_search_problem(model, value_net, stochastic=True)
+    actions, counts, x_next = problem.collect_round_states({0: 2, 1: 3})
+    assert actions == [0, 1]
+    assert counts == [2, 3]
+    assert tuple(x_next.shape) == (5, problem.cpp, OUT_DIM)
+    samples = problem.ctx.value_leaf_batch_stochastic(x_next)
+    problem.scatter_round_samples(actions, counts, samples)
+    assert [problem.evaluate(0) for _ in range(2)] == samples[:2]
+    assert [problem.evaluate(1) for _ in range(3)] == samples[2:]
 
 
 def test_mcts_rollout_simulations_default_matches_simulations():
@@ -1270,3 +1403,166 @@ def test_stochastic_prefetch_round_gradient_path_unchanged():
 
     assert grad_sum(model.search_policy) > 0
     assert grad_sum(model.search_value) > 0
+
+
+def test_value_leaf_batch_stochastic_multi_preserves_counts_and_independence():
+    """確率葉 K 軸連結 multi が入れ子ごとの標本数を保存し各標本が独立 MC dropout になる
+
+    複数入れ子の ``[K_i, cpp, D]`` を K 軸連結し 1 前向きした戻りが入れ子ごとに K_i 個へ復元
+    され（標本数厳密保存）leaf_evals が連結総数で進む同一入れ子内の複数行が dropout で変動する
+    ことで各標本が独立 MC dropout であると確認する
+    """
+    _, ctx, _ = _stochastic_problem()
+    cpp = children_per_parent(MAGS_2[0], MAGS_2[1])
+    x_list = [
+        torch.zeros(3, cpp, OUT_DIM),
+        torch.zeros(2, cpp, OUT_DIM),
+        torch.zeros(5, cpp, OUT_DIM),
+    ]
+    before = ctx.leaf_evals
+    result = ctx.value_leaf_batch_stochastic_multi(x_list)
+    assert [len(r) for r in result] == [3, 2, 5]
+    assert ctx.leaf_evals - before == 10
+    # 同一入力でも複数行が dropout で異なる（独立 MC dropout 標本）
+    same = torch.zeros(4, cpp, OUT_DIM)
+    r2 = ctx.value_leaf_batch_stochastic_multi([same])
+    assert len(set(r2[0])) > 1
+
+
+def test_value_leaf_batch_stochastic_multi_empty_returns_empty_per_problem():
+    """全入れ子が空入力なら problem ごとの空列を返し前向きしない"""
+    _, ctx, _ = _stochastic_problem()
+    cpp = children_per_parent(MAGS_2[0], MAGS_2[1])
+    before = ctx.leaf_evals
+    result = ctx.value_leaf_batch_stochastic_multi(
+        [torch.zeros(0, cpp, OUT_DIM), torch.zeros(0, cpp, OUT_DIM)]
+    )
+    assert result == [[], []]
+    assert ctx.leaf_evals == before
+
+
+def test_rollout_depth_two_stochastic_lockstep_preserves_sample_count():
+    """確率 depth2 入れ子群 lockstep が逐次 _rollout と同一の葉評価標本数を引く
+
+    Gumbel sequential-halving のラウンド予算と入れ子の最終評価はデータ非依存で経路に依らず
+    固定でありバッチ化は value-net 前向き行数（独立 MC dropout 標本数）を変えず forward/同期
+    のみ畳む value-net の前向き総行数が逐次（prefetch 退化）と lockstep で厳密一致する
+    """
+    from unittest import mock
+
+    from foveamil.models.search import mcts as mcts_mod
+    from foveamil.models.search.driver import _ZoomSearchProblem
+
+    base = torch.randn(1, 12, IN_DIM)
+    label = torch.tensor([2])
+
+    def value_rows(force_per_leaf):
+        torch.manual_seed(31)
+        model = _model(3)
+        driver = build_zoom_driver(
+            _mcts_config(
+                mcts_eval_stochastic=True, mcts_rollout_depth=2, drop_out=0.5
+            ),
+            model,
+        )
+        model.train()
+        counter = {"rows": 0}
+        value_net = model.search_value
+        orig = value_net.forward
+
+        def counting(x):
+            counter["rows"] += int(x.shape[0])
+            return orig(x)
+
+        value_net.forward = counting
+        patches = []
+        if force_per_leaf:
+            patches = [
+                mock.patch.object(
+                    _ZoomSearchProblem,
+                    "prefetch_round",
+                    mcts_mod.SearchProblem.prefetch_round,
+                ),
+                mock.patch.object(
+                    _ZoomSearchProblem,
+                    "prefetch_batch",
+                    mcts_mod.SearchProblem.prefetch_batch,
+                ),
+            ]
+        for patch in patches:
+            patch.start()
+        try:
+            torch.manual_seed(7)
+            driver.run(
+                base, MAGS_3, _seeded_child_loader(), torch.device("cpu"), label=label
+            )
+        finally:
+            for patch in patches:
+                patch.stop()
+            value_net.forward = orig
+        return counter["rows"]
+
+    seq = value_rows(force_per_leaf=True)
+    bat = value_rows(force_per_leaf=False)
+    assert seq == bat and seq > 0
+
+
+def test_rollout_depth_two_stochastic_lockstep_distribution_matches():
+    """確率 depth2 lockstep の価値回帰損失分布が逐次 _rollout と統計的に近接する
+
+    入れ子の MC dropout 標本は逐次と別配置のため値はビット非一致だが標本数・独立性・期待値
+    /分散構造は不変多シードで mcts_value 損失を集め両経路で平均・標準偏差が近接すると確認する
+    """
+    from unittest import mock
+
+    from foveamil.models.search import mcts as mcts_mod
+    from foveamil.models.search.driver import _ZoomSearchProblem
+
+    base = torch.randn(1, 12, IN_DIM)
+    label = torch.tensor([2])
+
+    def value_losses(force_per_leaf, seeds):
+        out = []
+        for s in seeds:
+            torch.manual_seed(31)
+            model = _model(3)
+            driver = build_zoom_driver(
+                _mcts_config(
+                    mcts_eval_stochastic=True, mcts_rollout_depth=2, drop_out=0.5,
+                    mcts_value_target="leaf_ce",
+                ),
+                model,
+            )
+            model.train()
+            patches = []
+            if force_per_leaf:
+                patches = [
+                    mock.patch.object(
+                        _ZoomSearchProblem, "prefetch_round",
+                        mcts_mod.SearchProblem.prefetch_round,
+                    ),
+                    mock.patch.object(
+                        _ZoomSearchProblem, "prefetch_batch",
+                        mcts_mod.SearchProblem.prefetch_batch,
+                    ),
+                ]
+            for patch in patches:
+                patch.start()
+            try:
+                torch.manual_seed(s)
+                _, _, _, ctx = driver.run(
+                    base, MAGS_3, _seeded_child_loader(),
+                    torch.device("cpu"), label=label,
+                )
+                out.append(float(ctx.extra_losses["mcts_value"].detach()))
+            finally:
+                for patch in patches:
+                    patch.stop()
+        return np.array(out)
+
+    seeds = range(200, 240)
+    seq = value_losses(force_per_leaf=True, seeds=seeds)
+    bat = value_losses(force_per_leaf=False, seeds=seeds)
+    pooled_std = 0.5 * (seq.std() + bat.std()) + 1e-6
+    assert abs(seq.mean() - bat.mean()) < pooled_std
+    assert abs(seq.std() - bat.std()) < 0.5 * pooled_std + 0.05
