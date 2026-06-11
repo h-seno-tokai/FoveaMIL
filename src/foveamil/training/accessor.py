@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Dict
 
 import h5py
@@ -39,6 +40,10 @@ COORDS_DTYPE = np.int64
 FEATURE_DTYPE = np.float32
 # concat 時の特徴次元連結軸
 CONCAT_AXIS = 1
+# h5 open の再試行回数（NAS の一時 I/O 障害対策）
+OPEN_RETRIES = 5
+# 再試行間隔の基準秒（試行ごとに線形に伸ばす）
+OPEN_BACKOFF_SEC = 0.5
 
 
 def _format_mag(magnification: float) -> str:
@@ -86,9 +91,27 @@ class FeatureAccessor:
         """倍率のファイルハンドルを返す（キャッシュし無ければ開く）"""
         handle = self._handles.get(magnification)
         if handle is None:
-            handle = h5py.File(self._path(magnification), "r")
+            handle = self._open_retry(self._path(magnification))
             self._handles[magnification] = handle
         return handle
+
+    def _open_retry(self, path: str) -> h5py.File:
+        """h5 を開く NAS の一時 I/O エラーは線形バックオフで再試行する
+
+        ファイルが存在しない場合は再試行せず即送出する（欠損は空として扱われる）
+        存在するのに開けない一時障害のみ再試行し 全試行失敗で最後の例外を送出する
+        高並列で大きな h5 を NAS から同時に開くと一時的に OSError になり得るため
+        """
+        last_exc = None
+        for attempt in range(OPEN_RETRIES):
+            try:
+                return h5py.File(path, "r")
+            except OSError as exc:
+                if not os.path.exists(path):
+                    raise
+                last_exc = exc
+                time.sleep(OPEN_BACKOFF_SEC * (attempt + 1))
+        raise last_exc
 
     def _read_all(self, magnification: float) -> np.ndarray:
         """``feature_type`` に応じた全特徴配列 ``(N, dim) float32`` を読む"""
